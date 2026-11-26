@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const maxBytes = 1_048_576;
-const deadlineMs = 18_000;
+const deadlineMs = 30_000;
 const deniedIPv4 = new BlockList();
 for (const [ip, prefix] of [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10],
@@ -158,7 +158,7 @@ async function render(document, signal) {
       executablePath: process.env.PEROTTINO_CHROMIUM_PATH || undefined,
       chromiumSandbox: process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX !== '1',
       env: { HOME: home, PATH: '/usr/bin:/bin', TMPDIR: home },
-      timeout: 5000,
+      timeout: 15_000,
       args: ['--disable-background-networking', '--disable-dev-shm-usage',
         '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>'],
     });
@@ -179,9 +179,9 @@ async function render(document, signal) {
         headers: { 'Content-Security-Policy': "default-src 'none'; form-action 'none'; base-uri 'none'; sandbox" },
         body: document.body });
     });
-    await page.goto(internal, { waitUntil: 'domcontentloaded', timeout: 4000 });
+    await page.goto(internal, { waitUntil: 'domcontentloaded', timeout: 8000 });
     const title = (await page.title()).trim().slice(0, 240);
-    const text = (await page.locator('body').innerText({ timeout: 1500 })).trim().slice(0, 8000);
+    const text = (await page.locator('body').innerText({ timeout: 4000 })).trim().slice(0, 8000);
     return { title, text };
   } finally {
     if (abort) signal.removeEventListener('abort', abort);
@@ -201,9 +201,9 @@ export async function browse(input, { signal: externalSignal, fixtureOrigin } = 
     if (!document.redirect) {
       try {
         return { url: url.href, ...await render(document, signal) };
-      } catch {
+      } catch (cause) {
         signal.throwIfAborted();
-        throw new Error('Browser could not render this page. Check the Chromium worker configuration.');
+        throw new Error('Browser could not render this page. Check the Chromium worker configuration.', { cause });
       }
     }
     if (redirects === 4) throw new Error('Too many redirects.');

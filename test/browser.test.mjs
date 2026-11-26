@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import http from 'node:http';
 import { once } from 'node:events';
-import { existsSync } from 'node:fs';
 import { makeBrowser } from '../src/browser.mjs';
 
 test('browser enforces URL and private-address boundaries before a request', async () => {
@@ -19,14 +18,10 @@ test('real Chromium reads the approved document, blocks subresources, and handle
   // This fixture is checked-in markup. CI containers commonly prohibit Chromium user
   // namespaces. Limit the override to this test process and this document.
   const oldSandbox = process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX;
-  const oldBinary = process.env.PEROTTINO_CHROMIUM_PATH;
   process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX = '1';
-  if (!oldBinary && existsSync('/usr/bin/chromium')) process.env.PEROTTINO_CHROMIUM_PATH = '/usr/bin/chromium';
   t.after(() => {
     if (oldSandbox === undefined) delete process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX;
     else process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX = oldSandbox;
-    if (oldBinary === undefined) delete process.env.PEROTTINO_CHROMIUM_PATH;
-    else process.env.PEROTTINO_CHROMIUM_PATH = oldBinary;
   });
   let secondaryRequests = 0;
   const server = http.createServer((req, res) => {
