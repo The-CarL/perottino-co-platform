@@ -51,6 +51,7 @@
       </header>
       <div id="notice" class="notice" role="status" hidden></div>
       <div id="history" class="history" aria-label="Message history" tabindex="0">
+        <button class="page-button" id="earlierMessages" type="button" hidden>Load earlier messages</button>
         <div id="timeline" class="timeline"></div>
         <div id="welcome" class="welcome" hidden>
           <div class="welcome-avatar avatar" id="welcomeAvatar" aria-hidden="true"></div>
@@ -74,13 +75,17 @@
     <button type="button" class="memory-shade shade" id="memoryShade" aria-label="Close memory" hidden></button>
     <aside class="memory-panel" id="memoryPanel" aria-labelledby="memoryHeading" hidden>
       <header><div class="panel-heading"><svg><use href="#i-memory"/></svg><h2 id="memoryHeading">Memory</h2></div><button type="button" class="icon-button" id="closeMemory" aria-label="Close memory panel"><svg><use href="#i-close"/></svg></button></header>
-      <div class="memory-body"><h3 id="memoryOwner"></h3><p class="muted">Saved notes from this employee’s conversations.</p><div id="memories"></div></div>
+      <div class="memory-body"><h3 id="memoryOwner"></h3><p class="muted">Saved notes from this employee’s conversations.</p><div id="memories"></div><button class="page-button" id="moreNotes" type="button" hidden>More notes</button></div>
     </aside>
   </div>
   <dialog id="picker" aria-labelledby="pickerTitle">
     <div class="dialog-heading"><h2 id="pickerTitle">Directory</h2><button type="button" class="icon-button" id="closePicker" aria-label="Close directory"><svg><use href="#i-close"/></svg></button></div>
     <label class="search-field"><svg><use href="#i-search"/></svg><span class="sr-only">Search employees by name, handle, or role</span><input id="search" type="search" autocomplete="off" placeholder="Search by name, handle, or role"></label>
     <div id="results" class="results" aria-label="Employee results"></div>
+  </dialog>
+  <dialog id="sourceDialog" aria-labelledby="sourceTitle">
+    <div class="dialog-heading"><h2 id="sourceTitle">Source message</h2><button type="button" class="icon-button" id="closeSource" aria-label="Close source message"><svg><use href="#i-close"/></svg></button></div>
+    <p id="sourceMeta" class="muted"></p><p id="sourceBody" role="status"></p>
   </dialog>
   <dialog id="noteEditor" aria-labelledby="noteTitle">
     <form id="noteForm">

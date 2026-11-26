@@ -1,56 +1,53 @@
-# Releasing the platform into another AWS account
+# Release into a target AWS account
 
-Use this procedure from a release runner with Git, Node and npm at the repository pins, Docker Buildx and AWS CLI v2. PR validation needs only a Linux runner, Docker and access to public dependency registries. The owner does not need development software or a running copy of the platform.
+The release runner builds the images and prepares the CloudFormation change set. The owner needs no development machine. The active hosted stack uses a managed HTTPS API, Lambda functions, DynamoDB Streams, Step Functions Standard, and one-shot AWS Fargate tasks. The target supplies its own account, public subnet, permissions boundary and Bedrock access. [Architecture, cost and recovery](HOSTED.md)
 
 ## Select the target
 
-Use an AWS commercial-region deployment role in the **destination account**. Pin the release to a reviewed Git commit. Supply the account's private provenance tags, approved VPC, public subnet and AZ, ECS-optimized AL2023 x86_64 AMI, delegated hostname, permissions boundary and permitted Bedrock model resources. DNS ownership, public internet access and access to the selected Bedrock model are deployment prerequisites. Verify that the chosen subnet has a route to an internet gateway and that the VPC has DNS enabled. Region-specific inference profiles can have destination-region IAM requirements. Keep private target data in the deployment inventory. [Hosted configuration and recovery](HOSTED.md)
+Use a reviewed source revision and a scoped AWS commercial-region deployment identity. Confirm its account and region with STS before creating resources. Use a private copy of the [provenance example](example-provenance.json) and retain the original creation metadata on updates. The derived scope is the project UUID, a hyphen and the environment name. Supply the complete resulting tag set, including `factory:s`, as a private CloudFormation JSON array of `Key` and `Value` records. Stack and function names, model access, browser availability and image digests are specific to the target.
 
-## Bootstrap account-owned resources
+Select public IPv4 subnets in the specified VPC with working DNS and an internet-gateway default route. Fargate assigns a temporary public IPv4 address to the running task for ECR, Bedrock and permitted outbound requests. Its security group has no inbound rules. The API and orchestration Lambdas use the Lambda-managed network. The standard API Gateway HTTPS URL works without a custom domain, hosted zone, certificate, load balancer or NAT gateway.
 
-Use the two asset-free CloudFormation templates with the target role and project tags. Use a distinct stack name in the project namespace for each template. Use the same project and environment scope as the hosted stack, including the derived `factory:s` tag on the runtime bootstrap. The bootstrap declares separate `perottino:purpose` tags on the owner verifier, worker token and image repository. The runtime permissions use these tags. Enable termination protection for these retained resources. Inspect any existing stack and resource inventory before creation.
+## Bootstrap once per target
 
-| Template | Scope and lifecycle |
+| Template | What it provisions |
 | --- | --- |
-| [Git credential](github-pat.yaml) | One retained `/perottino-co/github/pat` slot per account and region. Same name, new ARN in the destination account. A new slot has zero versions. The owner supplies the projects-repo PAT later. CloudFormation never receives its value. Only the future Git worker needs read access. In the original account, continue using the already deployed owning stack. |
-| [Runtime bootstrap](runtime-bootstrap.yaml) | Provider-named immutable ECR repository, empty owner-verifier secret, and a separate generated worker authentication token. The template emits names, URI and ARNs. The console and model worker can launch while the Git credential is empty. |
+| [Runtime bootstrap](runtime-bootstrap.yaml) | A provider-named ECR repository with immutable tags and permission for the four project-scoped Lambda functions to pull their image, and an empty Secrets Manager slot for the owner verifier. |
+| [Git credential](github-pat.yaml) | The retained projects Git credential slot at `/perottino-co/github/pat`. The owner supplies the value separately. The current runtime has no grant to read it. Reuse its owning stack if it already exists in the destination account and region. |
 
-The following commands illustrate initial creation in a fresh target with an approved role. For existing resources, review a change set against their owning stack. Do not blindly recreate or import a secret with the same name. Use `PRIVATE_TAG_FILE` for the target's private CloudFormation array of `Key` and `Value` records.
+For a fresh target, create the runtime bootstrap stack with the scope used in hosted synthesis. The Git credential template takes no parameters. Use a distinct stack name for each. For existing stacks, review a change set against the recorded stack instead of creating another copy.
 
 ```sh
 aws cloudformation create-stack --region "$AWS_REGION" --stack-name "$BOOTSTRAP_STACK" \
   --template-body file://infra/runtime-bootstrap.yaml --enable-termination-protection \
-  --tags file://"$PRIVATE_TAG_FILE"
+  --parameters "ParameterKey=ProjectScope,ParameterValue=$PROJECT_SCOPE" --tags file://"$PRIVATE_TAG_FILE"
 aws cloudformation wait stack-create-complete --region "$AWS_REGION" --stack-name "$BOOTSTRAP_STACK"
-aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$BOOTSTRAP_STACK" \
-  --query 'Stacks[0].Outputs'
+aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$BOOTSTRAP_STACK" --query 'Stacks[0].Outputs'
 ```
 
-Initialize the owner verifier on a protected release runner. `npm run setup:owner -- --password-stdin` reads a password from a protected input and writes a JSON verifier to `DATA_DIR/owner.json`. Populate the empty `OwnerSecretArn` with that file using Secrets Manager's `put-secret-value --secret-string file://…`. Inspect version metadata first and preserve an existing value on subsequent releases. The generated worker token is injected into the designated tasks by ECS. Each account owns its secret values and encryption context independently. Credential rotation is a separate operation.
+Before initializing owner access, check the owner slot's version metadata. For a new installation, use the owner setup command with a temporary protected `DATA_DIR` and a password supplied on stdin. Save the resulting `owner.json` as the bootstrap `OwnerSecretArn`'s value from a protected file. This JSON contains only `username` and the salted Argon2id `passwordHash`. Preserve existing secrets across ordinary releases. The PAT is independent of sign-in, browser and model access.
 
-## Publish immutable images
+## Publish and synthesize
 
-Run the checked-in image publisher with the target account ID, Region and owning runtime bootstrap stack. It verifies the caller's account and the registry returned by that stack, logs in with a temporary Docker config, and builds for Linux x86_64 from the Git commit. Use a system-installed Docker Buildx plugin on the runner and its default engine or an explicitly configured `DOCKER_HOST`. A release runner with a TLS-inspecting package proxy can mount its public CA with `BUILD_CA_FILE`. The release runner needs ECR authorization and push/pull access to the selected repository. An existing immutable tag is reused on a retry. The command emits the target ECR digest URIs for the console/worker and TLS proxy. Record both in the private release config.
+Run the [publisher](../scripts/publish-images.sh) with Git, AWS CLI v2 and Docker Buildx on the release runner. It verifies the destination account and registry, publishes Linux x86_64 worker and Lambda images from the selected commit, and prints the destination manifest digests. Account for ECR storage when retaining older images for rollback. Use a system-installed Buildx plugin and the default engine or an explicit `DOCKER_HOST`. For a TLS-intercepting build environment the public trust certificate can be supplied through `BUILD_CA_FILE`.
 
 ```sh
 TARGET_ACCOUNT="$DESTINATION_ACCOUNT" AWS_REGION="$DESTINATION_REGION" \
   BOOTSTRAP_STACK="$BOOTSTRAP_STACK" bash scripts/publish-images.sh > "$PRIVATE_IMAGES_JSON"
+npm ci
+npm run synth:hosted -- --config "$HOSTED_CONFIG" --provenance "$PRIVATE_PROVENANCE" --outdir "$PRIVATE_ASSEMBLY"
 ```
 
-The upstream Caddy manifest and app base images are pinned. Record private-registry digests returned by the target registry. A new account gets its own repository URIs even when it runs the same source revision. [Image publisher](../scripts/publish-images.sh) · [Application image](../Dockerfile) · [Proxy image](Proxy.Dockerfile)
+Fill the private hosted configuration with `workerImage` and `lambdaImage` from the publisher, the owner secret ARN, matching subnet and role configuration, and the permitted model and browser resources. See [the synthetic example](example-hosted.json). The release runner needs permission to push to the specific ECR repository. The deployer needs scoped creation rights for the resources in the synthesized template, including `iam:PassRole` for the declared roles. Prepare the ECS service-linked role in accounts that restrict AWS service-linked role creation.
 
-## Review a release
+## Review and execute the change set
 
-Build a private hosted JSON configuration from the example with the two published image URIs and the bootstrap secret ARNs. Run `npm run synth:hosted -- --config "$HOSTED_CONFIG" --provenance "$PRIVATE_PROVENANCE" --outdir "$PRIVATE_ASSEMBLY"`. Review the resulting hosted template, IAM, snapshots/retention, cost, DNS change and replacement behavior in a CloudFormation change set for the selected account. Supply the stack tags and appropriate IAM capability when preparing that change set. Approve and execute it in the target account when ready to release. [Configuration example](example-hosted.json) · [Hosted stack](HOSTED.md)
-
-For a private CloudFormation change set, serialize the generated template without indentation. The hosted stack name comes from `artifacts.Hosted.properties.stackName` in the assembly's `manifest.json`. Use that same stack on subsequent releases. For a new stack set `CHANGE_TYPE=CREATE`, or use `UPDATE` for an existing one. The tags file for this operation must match the hosted stack's synthesized provenance. An operator with deployment authority can prepare and inspect a change set using these commands.
+Use `artifacts.Hosted.properties.stackName` from the generated assembly manifest as `HOSTED_STACK`, and supply its tags. Choose `CREATE` for a fresh stack and `UPDATE` for a subsequent release. Preserve the production table identity, stream mapping and stored conversations. Do not execute a template that would inadvertently replace durable state.
 
 ```sh
-node -e 'const fs=require("node:fs"); fs.writeFileSync(process.argv[2], JSON.stringify(JSON.parse(fs.readFileSync(process.argv[1]))))' \
-  "$PRIVATE_ASSEMBLY/Hosted.template.json" "$PRIVATE_ASSEMBLY/hosted.compact.json"
 aws cloudformation create-change-set --region "$AWS_REGION" --stack-name "$HOSTED_STACK" \
   --change-set-name "$RELEASE_ID" --change-set-type "$CHANGE_TYPE" \
-  --template-body file://"$PRIVATE_ASSEMBLY/hosted.compact.json" \
+  --template-body file://"$PRIVATE_ASSEMBLY/Hosted.template.json" \
   --capabilities CAPABILITY_NAMED_IAM --tags file://"$PRIVATE_TAG_FILE"
 aws cloudformation wait change-set-create-complete --region "$AWS_REGION" \
   --stack-name "$HOSTED_STACK" --change-set-name "$RELEASE_ID"
@@ -58,8 +55,21 @@ aws cloudformation describe-change-set --region "$AWS_REGION" \
   --stack-name "$HOSTED_STACK" --change-set-name "$RELEASE_ID"
 ```
 
-If the private template exceeds CloudFormation's 51,200-byte inline limit, stage it under a versioned key in the destination account's private release bucket and use its HTTPS S3 URL via `--template-url`. After the release is approved, execute the named change set, wait for stack completion, and enable stack termination protection. Review changes to IAM, host, EBS and DNS before execution. Maintain a tested snapshot for host or storage replacement.
+If the private template exceeds CloudFormation's 51,200-byte inline limit, stage it under a versioned key in the account's private release bucket and supply its HTTPS S3 URL with `--template-url`. Execute the reviewed named change set when a deployment is authorized. Wait for stack completion, enable termination protection, and keep stack IDs, target configuration, secret references, source SHA and image digests in the private inventory.
 
-The single-host release keeps SQLite on an encrypted block device. The HTTP console, model inference and offline browser rendering run under separate ECS task definitions. The renderer receives document bytes through a Unix socket, shares no application data or credentials, and has no network interface beyond loopback. The services share the host kernel. Host replacement requires controlled downtime and volume reattachment or snapshot recovery. The separate DynamoDB/S3/SQS foundation is for a future distributed runtime. It can be synthesized independently. [Durable foundation](README.md)
+The new hosted stack has a different name from the earlier single-host design. The original account has only the separate Git credential stack. If another installation ran the old stack, its SQLite data and suspended work require a separately verified migration before traffic cutover. Preserve the source and backup, and test import and rollback before switching DNS. This release does not perform an automatic cross-store migration or delete existing resources.
 
-After deployment, verify the HTTPS sign-in, send a free-form DM through the actual target-account Bedrock role, open a public page, save and correct a memory, and restart the workload to check recovery. Record the commit, registry digests, stack outputs, secret **references**, test results and rollback snapshot in the private inventory. Source tests, container tests and account-specific template synthesis run before this provider acceptance check.
+## Cost at pilot scale
+
+These are US East (N. Virginia) public on-demand rates checked on November 26, 2026, before credits or taxes. The number of directory entries does not set the compute bill. With the console closed and no queued jobs, the system runs zero employee tasks and starts zero browser sessions.
+
+| Usage driver | How to estimate |
+| --- | --- |
+| Fargate worker | The lean Linux x86 size is 0.25 vCPU and 1 GB. At $0.000011244 per vCPU-second and $0.000001235 per GB-second, compute costs about $0.01457 per task-hour. Billing starts at image download, with a one-minute minimum. [Fargate pricing](https://aws.amazon.com/fargate/pricing/) |
+| Temporary public IPv4 | Budget $0.005 per address-hour during the task's IP allocation, with a one-minute minimum. A simple estimate for 1,000 tasks using **five billed minutes each** is **$1.63 for worker compute plus IPv4**. Retries add billable launches. [VPC pricing](https://aws.amazon.com/vpc/pricing/) |
+| Control plane | HTTP API starts at $1 per million requests. Lambda x86 charges $0.20 per million requests plus duration. Step Functions Standard charges $0.000025 per transition. Its waits release compute. Rechecking a busy employee adds transitions, Lambda calls and DynamoDB reads. A foreground owner tab polls every minute when idle and every 2.5 seconds while work is pending. Hidden tabs suspend polling. [API Gateway](https://aws.amazon.com/api-gateway/pricing/) · [Lambda](https://aws.amazon.com/lambda/pricing/) · [Step Functions](https://aws.amazon.com/step-functions/pricing/) |
+| Durable records and images | Budget $0.40 per retained Secrets Manager secret per month, or $0.80 for the owner and Git slots together, plus read charges. Private ECR storage is $0.10 per GB-month. DynamoDB on-demand reads and writes, storage, point-in-time recovery, S3 failure archives and log storage depend on usage. [Secrets Manager](https://aws.amazon.com/secrets-manager/pricing/) · [ECR](https://aws.amazon.com/ecr/pricing/) · [DynamoDB](https://aws.amazon.com/dynamodb/pricing/) |
+| Model and browser | Price actual Bedrock input/output tokens for the selected model, and actual AgentCore Browser session memory and active CPU. These are separate from the $1.63 example. [Bedrock pricing](https://aws.amazon.com/bedrock/pricing/) · [AgentCore pricing](https://aws.amazon.com/bedrock/agentcore/pricing/) |
+| Domain and network | The default execute-api hostname is included. An existing Route 53 zone adds no second hosted-zone fee. A new standard hosted zone generally starts at $0.50 per month. Account for applicable egress, DNS and log ingestion. [Route 53 pricing](https://aws.amazon.com/route53/pricing/) |
+
+A first chat reply includes workflow and Fargate cold-start time. Record time to first reply, billed task seconds, token counts and browser usage in a live pilot before forecasting a company-wide monthly total.

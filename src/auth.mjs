@@ -98,6 +98,17 @@ function deny(res, status, message) {
   return false;
 }
 
+export function preflightOwnerRequest(req, res, publicOrigin) {
+  const origin = requestOrigin(req, publicOrigin);
+  if (!origin) return deny(res, 403, 'A secure connection is required.');
+  if (!allowedRequest(req, origin)) return deny(res, 403, 'Request origin denied.');
+  const auth = req.headers.authorization;
+  if (typeof auth !== 'string' || auth.length > 512 || !/^Basic [A-Za-z0-9+/]+=*$/i.test(auth)) {
+    return deny(res, 401, 'Owner sign-in required.');
+  }
+  return true;
+}
+
 export function createOwnerAuth({ username, passwordHash, publicOrigin }) {
   validateUsername(username);
   const { salt, tag } = parseHash(passwordHash);
@@ -116,14 +127,8 @@ export function createOwnerAuth({ username, passwordHash, publicOrigin }) {
   let activeChecks = 0;
 
   return async function requireOwner(req, res) {
-    const origin = requestOrigin(req, configuredOrigin);
-    if (!origin) return deny(res, 403, 'A secure connection is required.');
-    if (!allowedRequest(req, origin)) return deny(res, 403, 'Request origin denied.');
-    const auth = req.headers.authorization;
-    if (typeof auth !== 'string' || auth.length > 512 || !/^Basic [A-Za-z0-9+/]+=*$/i.test(auth)) {
-      return deny(res, 401, 'Owner sign-in required.');
-    }
-    const credentials = Buffer.from(auth.slice(6), 'base64');
+    if (!preflightOwnerRequest(req, res, configuredOrigin)) return false;
+    const credentials = Buffer.from(req.headers.authorization.slice(6), 'base64');
     const colon = credentials.indexOf(58);
     if (colon < 1 || colon > 64 || credentials.length - colon - 1 > 256) {
       return deny(res, 401, 'Owner sign-in required.');

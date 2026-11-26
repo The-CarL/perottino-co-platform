@@ -180,7 +180,7 @@ function renderViaSocket(socketPath, document, signal) {
   });
 }
 
-export async function browse(input, { signal: externalSignal, fixtureOrigin } = {}) {
+export async function browse(input, { signal: externalSignal, fixtureOrigin, render } = {}) {
   const timeout = AbortSignal.timeout(deadlineMs);
   const signal = externalSignal ? AbortSignal.any([externalSignal, timeout]) : timeout;
   let url = validatedUrl(input);
@@ -191,11 +191,14 @@ export async function browse(input, { signal: externalSignal, fixtureOrigin } = 
     if (!document.redirect) {
       try {
         const socket = process.env.PEROTTINO_BROWSER_RENDER_SOCKET;
-        const result = socket ? await renderViaSocket(socket, document, signal) : await renderDocument(document, signal);
+        const renderer = render ?? (socket ? (doc, sig) => renderViaSocket(socket, doc, sig) : renderDocument);
+        const result = await renderer(document, signal);
         return { url: url.href, ...result };
       } catch (cause) {
         signal.throwIfAborted();
-        throw new Error('Browser could not render this page. Check the Chromium worker configuration.', { cause });
+        const failure = new Error('Browser could not render this page. Check the Chromium worker configuration.', { cause });
+        failure.code = 'BROWSER_RENDER_FAILED';
+        throw failure;
       }
     }
     if (redirects === 4) throw new Error('Too many redirects.');
@@ -203,6 +206,6 @@ export async function browse(input, { signal: externalSignal, fixtureOrigin } = 
   }
 }
 
-export function makeBrowser({ fixtureOrigin } = {}) {
-  return (url, { signal } = {}) => browse(url, { signal, fixtureOrigin });
+export function makeBrowser({ fixtureOrigin, render } = {}) {
+  return (url, { signal } = {}) => browse(url, { signal, fixtureOrigin, render });
 }

@@ -37,29 +37,33 @@ export async function renderDocument(document, signal) {
     abort = () => { browser.close().catch(() => {}); };
     signal.addEventListener('abort', abort, { once: true });
     signal.throwIfAborted();
-    const ctx = await browser.newContext({ javaScriptEnabled: false, serviceWorkers: 'block',
-      acceptDownloads: false, offline: true });
-    const page = await ctx.newPage();
-    const internal = 'https://reader.invalid/';
-    let served = false;
-    await ctx.route('**/*', route => {
-      if (served || route.request().url() !== internal || !route.request().isNavigationRequest()) {
-        return route.abort();
-      }
-      served = true;
-      return route.fulfill({ status: 200, contentType: document.type + '; charset=utf-8',
-        headers: { 'Content-Security-Policy': "default-src 'none'; form-action 'none'; base-uri 'none'; sandbox" },
-        body: document.body });
-    });
-    await page.goto(internal, { waitUntil: 'domcontentloaded', timeout: 8000 });
-    const title = (await page.title()).trim().slice(0, maxTitleChars);
-    const text = (await page.locator('body').innerText({ timeout: 4000 })).trim().slice(0, maxTextChars);
-    return { title, text };
+    return await readBrowserDocument(browser, document);
   } finally {
     if (abort) signal.removeEventListener('abort', abort);
     await browser?.close().catch(() => {});
     await rm(home, { recursive: true, force: true });
   }
+}
+
+export async function readBrowserDocument(browser, document) {
+  const ctx = await browser.newContext({ javaScriptEnabled: false, serviceWorkers: 'block',
+    acceptDownloads: false, offline: true });
+  const page = await ctx.newPage();
+  const internal = 'https://reader.invalid/';
+  let served = false;
+  await ctx.route('**/*', route => {
+    if (served || route.request().url() !== internal || !route.request().isNavigationRequest()) {
+      return route.abort();
+    }
+    served = true;
+    return route.fulfill({ status: 200, contentType: document.type + '; charset=utf-8',
+      headers: { 'Content-Security-Policy': "default-src 'none'; form-action 'none'; base-uri 'none'; sandbox" },
+      body: document.body });
+  });
+  await page.goto(internal, { waitUntil: 'domcontentloaded', timeout: 8000 });
+  const title = (await page.title()).trim().slice(0, maxTitleChars);
+  const text = (await page.locator('body').innerText({ timeout: 4000 })).trim().slice(0, maxTextChars);
+  return { title, text };
 }
 
 export async function listenRenderer(socket, render = renderDocument) {

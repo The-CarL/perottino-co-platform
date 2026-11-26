@@ -11,11 +11,95 @@ const dayLabel = new Intl.DateTimeFormat(undefined, {month:'long', day:'numeric'
 const state = {
   agents: [], agent: null, recent: [], messages: [], memories: [], status: 'idle',
   drafts: new Map(), requests: new Map(), sending: new Set(), sendErrors: new Map(),
-  loaded: false, directoryLoaded: false, readError: '', memoryError: '', pollVersion: 0, refreshes: 0
+  loaded: false, directoryLoaded: false, readError: '', memoryError: '', pollVersion: 0
 };
 let directoryRequest = null;
+let pollTimer;
+let directoryCheckedAt = 0;
 let lastFocus = null;
 let noteAction = null;
+let sourceRequest = 0;
+const pages = {
+  messages:{button:get('earlierMessages'),label:'Load earlier messages',items:'messages'},
+  memory:{button:get('moreNotes'),label:'More notes',items:'memories'}
+};
+function resetPages() {
+  for (const page of Object.values(pages)) {
+    page.cursor = null;
+    page.expanded = false;
+    page.button.hidden = true;
+    page.button.disabled = false;
+    page.button.textContent = page.label;
+  }
+}
+function uniqueRows(rows) {
+  return Array.from(new Map(rows.map(row => [row.id,row])).values());
+}
+function applyLatest(kind, data) {
+  const page = pages[kind];
+  const previous = state[page.items];
+  const head = data[page.items];
+  let rows = head;
+  if (page.expanded && data.nextCursor && head.length) {
+    const boundary = kind === 'messages' ? head[0] : head.at(-1);
+    const at = previous.findIndex(row => row.id === boundary.id);
+    if (at >= 0) rows = kind === 'messages' ? [...previous.slice(0,at),...head] : [...head,...previous.slice(at+1)];
+    else page.expanded = false;
+  } else page.expanded = false;
+  if (!page.expanded) page.cursor = data.nextCursor;
+  page.button.hidden = !page.cursor;
+  state[page.items] = rows;
+  return JSON.stringify(previous) !== JSON.stringify(rows);
+}
+async function loadEarlier(kind) {
+  const page = pages[kind];
+  const agent = state.agent;
+  const cursor = page.cursor;
+  if (!agent || !cursor || page.button.disabled) return;
+  page.button.disabled = true;
+  try {
+    const response = await api(url(agent.id,kind) + '?cursor=' + encodeURIComponent(cursor));
+    const data = await response.json();
+    if (state.agent?.id !== agent.id || page.cursor !== cursor) return;
+    const older = data[page.items];
+    const previous = state[page.items];
+    state[page.items] = uniqueRows(kind === 'messages' ? [...older,...previous] : [...previous,...older]);
+    page.expanded = true;
+    page.cursor = data.nextCursor;
+    page.button.hidden = !page.cursor;
+    page.button.textContent = page.label;
+    if (kind === 'messages') {
+      renderTimeline(false);
+      historyPane.scrollTop = 0;
+    } else renderMemory();
+  } catch {
+    if (state.agent?.id === agent.id) page.button.textContent = 'Retry loading ' + (kind === 'messages' ? 'messages' : 'notes');
+  } finally { page.button.disabled = false; }
+}
+async function openSource(messageId) {
+  const source = get('message-' + messageId);
+  if (source) {
+    if (overlayMemory.matches) toggleMemory(false);
+    source.focus({preventScroll:true});
+    source.scrollIntoView({block:'center'});
+    return;
+  }
+  const version = ++sourceRequest;
+  get('sourceMeta').textContent = '';
+  get('sourceBody').textContent = 'Loading source message…';
+  get('sourceDialog').showModal();
+  try {
+    const response = await api(url(state.agent.id,'messages/' + encodeURIComponent(messageId)));
+    const {message} = await response.json();
+    if (version !== sourceRequest) return;
+    const stamp = new Date(message.createdAt);
+    const date = Number.isNaN(stamp.getTime()) ? '' : dayLabel.format(stamp);
+    get('sourceMeta').textContent = [message.author === 'owner' ? 'You' : state.agent.name,date].filter(Boolean).join(' · ');
+    get('sourceBody').textContent = message.text;
+  } catch {
+    if (version === sourceRequest) get('sourceBody').textContent = 'The source message is unavailable.';
+  }
+}
 
 function element(tag, className, content) {
   const result = document.createElement(tag);
@@ -143,6 +227,7 @@ function selectAgent(agent, focus = false) {
   const changed = state.agent?.id !== agent.id;
   if (changed) {
     state.agent = agent;
+    resetPages();
     state.messages = [];
     state.memories = [];
     state.loaded = false;
@@ -219,6 +304,7 @@ function renderTimeline(scrollToBottom) {
       meta.append(time);
     }
     body.append(meta,element('div','bubble',msg.text));
+    if (owner && msg.status === 'error') body.append(element('small','failed-message','Reply failed'));
     if (!owner) row.append(avatar(state.agent));
     row.append(body);
     fragment.append(row);
@@ -244,16 +330,7 @@ function renderMemory() {
       const link = element('button','source','Source message');
       link.type = 'button';
       link.append(icon('arrow'));
-      link.addEventListener('click', () => {
-        const source = get('message-' + note.sourceMessageId);
-        if (!source) {
-          link.textContent = 'Source unavailable in this conversation';
-          return;
-        }
-        if (overlayMemory.matches) toggleMemory(false);
-        source.focus({preventScroll:true});
-        source.scrollIntoView({block:'center'});
-      });
+      link.addEventListener('click', () => void openSource(note.sourceMessageId));
       card.append(link);
     }
     const controls = element('div','memory-controls');
@@ -303,7 +380,12 @@ async function saveNote(event) {
       body:JSON.stringify(action.request)
     });
     if (noteAction === action) get('noteEditor').close();
-    if (state.agent?.id === action.agentId) await refresh(false);
+    if (state.agent?.id === action.agentId) {
+      if (edit) state.memories = state.memories.map(row => row.id === action.noteId ? {...row,text:value,updatedAt:new Date().toISOString(),updatedBy:'owner'} : row);
+      else state.memories = state.memories.filter(row => row.id !== action.noteId);
+      renderMemory();
+      await refresh(false);
+    }
     get('announcer').textContent = edit ? 'Memory note updated.' : 'Memory note removed.';
   } catch (error) {
     if (noteAction === action) {
@@ -326,12 +408,13 @@ async function refresh(scrollToBottom) {
   if (version !== state.pollVersion) return;
   if (messages.status === 'fulfilled') {
     const data = messages.value;
-    const changed = !state.loaded || JSON.stringify(state.messages) !== JSON.stringify(data.messages);
     const before = state.messages.at(-1)?.id;
+    const changed = applyLatest('messages',data) || !state.loaded;
     state.loaded = true;
     state.readError = '';
-    state.messages = data.messages;
+    const statusChanged = state.status !== data.status;
     state.status = data.status;
+    if (statusChanged) schedulePoll();
     renderStatus();
     if (changed) {
       renderTimeline(scrollToBottom);
@@ -343,10 +426,9 @@ async function refresh(scrollToBottom) {
     renderStatus();
   }
   if (notes) {
-    const changed = notes.status === 'fulfilled' && JSON.stringify(state.memories) !== JSON.stringify(notes.value.memories);
+    const changed = notes.status === 'fulfilled' && applyLatest('memory',notes.value);
     const oldError = state.memoryError;
     state.memoryError = notes.status === 'fulfilled' ? '' : 'Notes are unavailable. Reconnecting…';
-    if (changed) state.memories = notes.value.memories;
     if (changed || oldError !== state.memoryError) renderMemory();
   }
 }
@@ -370,6 +452,7 @@ async function loadDirectory() {
       } else {
         state.pollVersion++;
         state.agent = null;
+        resetPages();
         state.messages = [];
         state.memories = [];
         state.status = 'idle';
@@ -438,6 +521,7 @@ async function send(event) {
       if (input.value.trim() === text) input.value = '';
       get('announcer').textContent = 'Message sent to ' + agent.name;
       await refresh(true);
+      schedulePoll();
     }
   } catch (error) {
     state.sendErrors.set(agent.id,
@@ -456,6 +540,10 @@ function setDraft(text) {
 }
 get('newMessage').addEventListener('click', () => showPicker('New message'));
 get('directory').addEventListener('click', () => showPicker('Directory'));
+get('earlierMessages').addEventListener('click',() => void loadEarlier('messages'));
+get('moreNotes').addEventListener('click',() => void loadEarlier('memory'));
+get('closeSource').addEventListener('click',() => get('sourceDialog').close());
+get('sourceDialog').addEventListener('close',() => { sourceRequest++; });
 get('closePicker').addEventListener('click', () => picker.close());
 picker.addEventListener('click', event => {
   if (event.target !== picker) return;
@@ -472,7 +560,7 @@ get('memoryShade').addEventListener('click', () => toggleMemory(false));
 narrow.addEventListener('change', () => { if (!narrow.matches) closeNavigation(); updateOverlay(); });
 overlayMemory.addEventListener('change', updateOverlay);
 document.addEventListener('keydown', event => {
-  if (event.key !== 'Escape' || picker.open || get('noteEditor').open) return;
+  if (event.key !== 'Escape' || picker.open || get('noteEditor').open || get('sourceDialog').open) return;
   if (!get('memoryPanel').hidden) toggleMemory(false);
   else closeNavigation();
 });
@@ -494,15 +582,25 @@ input.addEventListener('keydown', event => {
 get('intro').addEventListener('click', () => setDraft('Introduce yourself and tell me how we can work together.'));
 get('brief').addEventListener('click', () => setDraft('I’d like your help with '));
 
-async function poll() {
-  if (!document.hidden) {
-    if (!state.agent || ++state.refreshes % 12 === 0) await loadDirectory();
-    if (state.agent) await refresh(false);
-  }
-  window.setTimeout(poll, 2500);
+function schedulePoll(delay) {
+  clearTimeout(pollTimer);
+  if (document.hidden) return;
+  const busy = state.status === 'queued' || state.status === 'working';
+  const retry = !state.agent || state.readError;
+  pollTimer = window.setTimeout(poll, delay ?? (busy ? 2500 : retry ? 10000 : 60000));
 }
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) { void loadDirectory(); void refresh(false); }
-});
+async function poll() {
+  if (document.hidden) return;
+  const selected = state.agent?.id;
+  try {
+    if (!selected || Date.now() - directoryCheckedAt >= 300000) {
+      await loadDirectory();
+      directoryCheckedAt = Date.now();
+    }
+    // Selecting an employee in loadDirectory already fetches the first message page.
+    if (selected && state.agent?.id === selected) await refresh(false);
+  } finally { schedulePoll(); }
+}
+document.addEventListener('visibilitychange', () => schedulePoll(0));
 renderStatus();
 void poll();

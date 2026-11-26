@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { listenPrivateSocket, listenServer } from './private-socket.mjs';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -54,6 +54,7 @@ async function toolAction({ action, value }, job) {
       return [page.title || 'Untitled page', page.url, page.text.slice(0, 8000)].filter(Boolean).join('\n\n');
     } catch (error) {
       job.signal?.throwIfAborted();
+      if (job.retryBrowserFailure && error.code === 'BROWSER_RENDER_FAILED') throw error;
       // Only known adapter errors can be shown. Browser/transport/OS error text may contain private details.
       const publicError = /^(Browsing is limited to public web destinations\.|Only HTTP or HTTPS pages without embedded credentials are supported\.|Enter a complete HTTP or HTTPS URL\.|Invalid page URL\.|Too many redirects\.|This page did not return a readable HTML or text document\.|Page exceeds the browser size limit\.|Browser could not render this page\. Check the Chromium worker configuration\.)$/.test(error.message);
       return publicError ? error.message : 'I could not read that page. Check the URL or try another public page.';
@@ -138,10 +139,36 @@ async function requestDecision(context, signal) {
   return checkDecision(await response.json());
 }
 
-export async function runTurn(job) {
+export function createTurnTools(job, browser, signal) {
+  const pending = [];
+  function remember(text) {
+    signal.throwIfAborted();
+    if (typeof text !== 'string' || !text.trim() || text.length > 16000) throw new Error('Invalid memory.');
+    text = text.trim();
+    const existing = [...job.memories, ...pending].find(item => item.text === text);
+    if (existing) return existing;
+    if (pending.length >= 32) throw new Error('Memory limit reached for this turn.');
+    const item = { id: randomUUID(), text, sourceMessageId: job.message.id, createdAt: new Date().toISOString() };
+    pending.push(item);
+    return item;
+  }
+  function recall(query = '') {
+    signal.throwIfAborted();
+    const needle = String(query).trim().toLowerCase();
+    return [...job.memories, ...pending].filter(item => item.text.toLowerCase().includes(needle));
+  }
+  async function browse(url) {
+    signal.throwIfAborted();
+    const page = await browser(url, { signal });
+    signal.throwIfAborted();
+    return page;
+  }
+  return { pending, remember, recall, browse };
+}
+
+export async function runTurn(job, { mode = process.env.PEROTTINO_AGENT_MODE || 'local', decide = requestDecision } = {}) {
   const { agent, message, history = [], memories = [], signal } = job;
   signal?.throwIfAborted();
-  const mode = process.env.PEROTTINO_AGENT_MODE || 'local';
   if (!['local', 'bedrock'].includes(mode)) throw new Error('Unknown agent mode.');
   const text = message.text.trim();
   // Explicit owner commands are deterministic in both modes and require no inference.
@@ -165,7 +192,7 @@ export async function runTurn(job) {
   const turnSignal = signal ? AbortSignal.any([deadline, signal]) : deadline;
   for (let i = 0; i < 4; i++) {
     turnSignal.throwIfAborted();
-    const decision = await requestDecision(context, turnSignal);
+    const decision = checkDecision(await decide(context, turnSignal));
     if (decision.action === 'reply') return decision.value;
     if (i === 3) return 'I reached the tool limit for this turn. Please send a follow-up to continue.';
     const result = await toolAction(decision, job);
@@ -173,8 +200,8 @@ export async function runTurn(job) {
   }
 }
 
-// Runs only in the separately deployed inference worker. Its task role may invoke the
-// selected Bedrock model. Do not mount the application store or give this worker owner credentials.
+// Runs inside the trusted model worker, including the on-demand Fargate employee task.
+// Keep owner credentials out of this task; model-callable filesystem tools are confined below.
 export async function sdkDecision(context, signal, CodexImplementation) {
   const model = process.env.PEROTTINO_BEDROCK_MODEL || 'us.openai.gpt-6-sol';
   const region = process.env.AWS_REGION || 'us-east-1';

@@ -1,5 +1,6 @@
 **
 !Dockerfile
+!Dockerfile.lambda
 !package.json
 !package-lock.json
 !src/

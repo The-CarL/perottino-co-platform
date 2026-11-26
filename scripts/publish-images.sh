@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish tracked source and the pinned TLS proxy into one selected target account.
+# Publish the Lambda and Fargate images from tracked source into one selected target account.
 set -euo pipefail
 
 : "${TARGET_ACCOUNT:?Set the intended twelve-digit AWS account ID}"
@@ -39,15 +39,14 @@ publish() {
   if ! out=$(aws ecr describe-images --region "$AWS_REGION" --repository-name "$repo" --image-ids "imageTag=$tag" \
       --query 'imageDetails[0].imageDigest' --output text 2>"$work/lookup-error"); then
     if ! grep -q '(ImageNotFoundException)' "$work/lookup-error"; then cat "$work/lookup-error" >&2; return 1; fi
-    docker buildx build "${build_options[@]}" --platform linux/amd64 --file "$work/source/$dockerfile" --tag "$uri:$tag" --push "$work/source" >&2 || return 1
+    docker buildx build "${build_options[@]}" --platform linux/amd64 --provenance=false --file "$work/source/$dockerfile" --tag "$uri:$tag" --push "$work/source" >&2 || return 1
     out=$(aws ecr describe-images --region "$AWS_REGION" --repository-name "$repo" --image-ids "imageTag=$tag" \
       --query 'imageDetails[0].imageDigest' --output text) || return 1
   fi
   [[ "$out" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "ECR returned an invalid manifest digest." >&2; return 1; }
   printf '%s@%s\n' "$uri" "$out"
 }
-proxy_id=$(git rev-parse "$commit:infra/Proxy.Dockerfile")
-# An immutable target tag allows a retry to reuse an image after a partial publication.
-app_image=$(publish "platform-$commit" Dockerfile)
-proxy_image=$(publish "proxy-$proxy_id" infra/Proxy.Dockerfile)
-printf '{"appImage":"%s","proxyImage":"%s"}\n' "$app_image" "$proxy_image"
+# Lambda accepts a single Linux image manifest. Pin both artifacts to the whole source commit.
+worker_image=$(publish "worker-$commit" Dockerfile)
+lambda_image=$(publish "lambda-$commit" Dockerfile.lambda)
+printf '{"workerImage":"%s","lambdaImage":"%s"}\n' "$worker_image" "$lambda_image"

@@ -1,5 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Per-account image registry and credentials for the hosted owner console.
+Description: Per-account image registry for Lambda and Fargate and an owner verifier slot.
+Parameters:
+  ProjectScope:
+    Type: String
+    MinLength: 38
+    MaxLength: 52
+    AllowedPattern: '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}-[a-z][a-z0-9-]*'
+    Description: Value of factory:s in the target deployment provenance.
 Resources:
   Images:
     Type: AWS::ECR::Repository
@@ -11,6 +18,23 @@ Resources:
       Tags:
         - Key: perottino:purpose
           Value: runtime-images
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaImageRetrieval
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-a'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-d'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-i'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-t'
       ImageTagMutability: IMMUTABLE
       ImageScanningConfiguration:
         ScanOnPush: true
@@ -23,18 +47,6 @@ Resources:
         - Key: perottino:purpose
           Value: owner-verifier
       Description: Separately populated owner verifier JSON containing username and passwordHash.
-  WorkerToken:
-    Type: AWS::SecretsManager::Secret
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      Description: Private authentication token shared only by the console and decision worker.
-      Tags:
-        - Key: perottino:purpose
-          Value: worker-token
-      GenerateSecretString:
-        PasswordLength: 48
-        ExcludePunctuation: true
 Outputs:
   ImageRepositoryUri:
     Value: !GetAtt [Images, RepositoryUri]
@@ -42,5 +54,3 @@ Outputs:
     Value: !Ref Images
   OwnerSecretArn:
     Value: !Ref ConsoleOwner
-  WorkerSecretArn:
-    Value: !Ref WorkerToken

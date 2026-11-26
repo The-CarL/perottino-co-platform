@@ -56,15 +56,15 @@ if (a[0] === 'login') {
   const context = a.at(-1);
   const dockerfile = a[a.indexOf('--file') + 1];
   const tag = a[a.indexOf('--tag') + 1];
-  if (!a.includes('--push') || a[a.indexOf('--platform') + 1] !== 'linux/amd64' ||
+  if (!a.includes('--push') || !a.includes('--provenance=false') || a[a.indexOf('--platform') + 1] !== 'linux/amd64' ||
       !tag.startsWith(uri + ':') || !dockerfile.startsWith(context + '/') ||
       fs.existsSync(path.join(context, 'untracked-secret'))) process.exit(90);
   const key = tag.slice(uri.length + 1);
   fs.appendFileSync(state + '/calls', 'build ' + key + '\\n');
-  const proxy = key.startsWith('proxy-');
-  if (proxy && process.env.FAIL_PROXY) process.exit(72);
+  const lambda = key.startsWith('lambda-');
+  if (lambda && process.env.FAIL_LAMBDA) process.exit(72);
   const manifest = fs.readFileSync(dockerfile, 'utf8') +
-    (proxy ? '' : fs.readFileSync(path.join(context, 'payload.txt'), 'utf8'));
+    fs.readFileSync(path.join(context, 'payload.txt'), 'utf8');
   const digest = 'sha256:' + createHash('sha256').update(manifest).digest('hex');
   fs.writeFileSync(path.join(state, key), digest, {flag:'wx'});
 } else process.exit(90);
@@ -76,32 +76,32 @@ async function fixture(t) {
   const repo = join(base, 'worktree');
   const bin = join(base, 'bin');
   const state = join(base, 'registry');
-  await Promise.all([mkdir(join(repo, 'infra'), { recursive: true }), mkdir(bin), mkdir(state)]);
+  await Promise.all([mkdir(repo), mkdir(bin), mkdir(state)]);
   const env = { PATH: [bin, dirname(process.execPath), '/usr/bin', '/bin'].join(':'), HOME: base,
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', IDENTITY: account, TARGET_ACCOUNT: account,
     AWS_REGION: 'us-east-1', BOOTSTRAP_STACK: 'fixture-stack', REGISTRY_URI: uri, FIXTURE: state };
   const git = async (...args) => (await run('git', args, { cwd: repo, env })).stdout.trim();
   const appSource = 'FROM scratch\n';
-  const proxySource = 'FROM scratch AS proxy\n';
+  const lambdaSource = 'FROM scratch AS lambda\n';
   const payload = 'committed platform content\n';
   await Promise.all([
     writeFile(join(bin, 'aws'), fakeAws, { mode: 0o700 }),
     writeFile(join(bin, 'docker'), fakeDocker, { mode: 0o700 }),
     writeFile(join(repo, 'Dockerfile'), appSource),
-    writeFile(join(repo, 'infra/Proxy.Dockerfile'), proxySource),
+    writeFile(join(repo, 'Dockerfile.lambda'), lambdaSource),
     writeFile(join(repo, 'payload.txt'), payload),
   ]);
   await git('init', '--quiet');
   await git('add', '.');
   await git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'fixture');
-  const appTag = 'platform-' + await git('rev-parse', 'HEAD');
-  const proxyTag = 'proxy-' + await git('rev-parse', 'HEAD:infra/Proxy.Dockerfile');
+  const appTag = 'worker-' + await git('rev-parse', 'HEAD');
+  const lambdaTag = 'lambda-' + await git('rev-parse', 'HEAD');
   await Promise.all([
     writeFile(join(repo, 'payload.txt'), 'dirty application files'),
-    writeFile(join(repo, 'infra/Proxy.Dockerfile'), 'dirty proxy instructions'),
+    writeFile(join(repo, 'Dockerfile.lambda'), 'dirty lambda instructions'),
     writeFile(join(repo, 'untracked-secret'), 'synthetic material to exclude'),
   ]);
-  return { appTag, proxyTag, state, expected: { appImage: image(appSource + payload), proxyImage: image(proxySource) },
+  return { appTag, lambdaTag, state, expected: { workerImage: image(appSource + payload), lambdaImage: image(lambdaSource + payload) },
     publish: (overrides = {}) => run('bash', [script], { cwd: repo, env: { ...env, ...overrides } }),
     calls: async () => (await readFile(join(state, 'calls'), 'utf8')).trim().split('\n') };
 }
@@ -115,14 +115,14 @@ test('publisher stops before lookup or login when the selected account differs',
 
 test('publisher builds committed files, emits registry digests, and resumes a partial publication', async t => {
   const f = await fixture(t);
-  await assert.rejects(f.publish({ FAIL_PROXY: '1' }), error => error.code !== 0 && error.stdout === '');
-  assert.equal(await readFile(join(f.state, f.appTag), 'utf8'), f.expected.appImage.split('@')[1]);
+  await assert.rejects(f.publish({ FAIL_LAMBDA: '1' }), error => error.code !== 0 && error.stdout === '');
+  assert.equal(await readFile(join(f.state, f.appTag), 'utf8'), f.expected.workerImage.split('@')[1]);
   const recovered = await f.publish();
   assert.deepEqual(JSON.parse(recovered.stdout), f.expected);
   const repeated = await f.publish();
   assert.deepEqual(JSON.parse(repeated.stdout), f.expected);
   assert.deepEqual((await f.calls()).filter(op => op.startsWith('build ')), [
-    'build ' + f.appTag, 'build ' + f.proxyTag, 'build ' + f.proxyTag,
+    'build ' + f.appTag, 'build ' + f.lambdaTag, 'build ' + f.lambdaTag,
   ]);
 });
 

@@ -51,15 +51,28 @@ The GitHub Actions workflow performs the same check on Ubuntu with read-only rep
 | `DATA_DIR` | Local SQLite database and owner verifier. Defaults to `.local/`. Use the same directory across restarts. |
 | `HOST`, `PORT` | Local HTTP listener. Defaults to `127.0.0.1` and `3000`. |
 | `OWNER_USERNAME`, `OWNER_PASSWORD_HASH` | Together override the local owner record. Production mode requires both. The hash uses the Argon2id verifier format emitted by the owner setup command. |
-| `PUBLIC_ORIGIN` | Exact public HTTPS origin for a deployment with trusted TLS ingress. Limit access to the backend and configure the proxy to replace forwarded protocol and preserve the host. |
+| `PUBLIC_ORIGIN` | Exact HTTPS origin. In AWS the stack derives it from the HTTP API or optional custom domain. |
 | `PEROTTINO_AGENT_MODE` | `local` by default. `bedrock` sends free-form requests to the separately configured inference worker. |
 | `PEROTTINO_CHROMIUM_PATH` | Optional absolute path to a compatible system Chromium. The pinned Playwright browser is the normal setup. |
 
 For noninteractive owner setup, pipe the password from a protected source into `npm run setup:owner -- --password-stdin`. The setup command writes a salted verifier with owner-only permissions. It refuses to overwrite an existing identity. Chat and notes live in `company.sqlite` alongside the verifier. For a consistent local backup, stop the service cleanly and copy the entire data directory to protected storage.
 
-### Bedrock worker
+### Hosted execution
 
-The optional inference process uses the pinned Codex SDK and the native Amazon Bedrock provider. Run `npm run start:model-worker` in the isolated worker environment with its ECS task-role credentials, an authorized model or inference profile in `PEROTTINO_BEDROCK_MODEL`, and `AWS_REGION`. Set `PEROTTINO_BEDROCK_WORKER_TOKEN` to the same private random value of at least 32 bytes in the worker and the console. The worker defaults to `127.0.0.1:3101`. Configure the console with `PEROTTINO_AGENT_MODE=bedrock` and `PEROTTINO_BEDROCK_WORKER_URL` pointed at the worker. The single-host AWS deployment uses the shared `PEROTTINO_BEDROCK_WORKER_SOCKET` Unix socket and worker token. A separately networked worker requires HTTPS and a private, authenticated route. Keep the owner credential and application storage out of the model worker. The worker contract is tested with a simulated response. Live model access and hosted routing still require a deployment check.
+An API Gateway HTTP API and an on-demand Lambda serve the owner console and directory. A DM is committed to DynamoDB before the console acknowledges it. DynamoDB Streams triggers a dispatcher, Step Functions waits for the employee to be available, and ECS starts a Fargate task for that turn. The task loads the employee’s history and memory, uses Bedrock when inference is needed, commits the result, and exits. A browser read uses a short-lived AgentCore Browser session. The local simulator and smoke tests can run without AWS or the PAT.
+
+```mermaid
+flowchart LR
+    Owner --> API[API Gateway HTTPS]
+    API --> Console[Console Lambda]
+    Console --> DDB[(DynamoDB)]
+    DDB -->|Stream| Dispatch[Dispatcher Lambda]
+    Dispatch --> Flow[Step Functions]
+    Flow -->|RunTask| Task[Fargate employee]
+    Task --> Bedrock
+    Task -->|When requested| Browser[AgentCore Browser]
+    Task -->|Reply and memory| DDB
+```
 
 ## AWS infrastructure and Git credentials
 
@@ -77,6 +90,6 @@ aws secretsmanager list-secret-version-ids --region us-east-1 \
 
 Here `PAT_STACK` is the target stack name and `PRIVATE_TAG_FILE` is a private JSON array of CloudFormation `Key` and `Value` pairs. A newly created, unpopulated slot has zero versions.
 
-The hosted reference runs the console, Bedrock decision worker and network-isolated page renderer as separate ECS services with persistent SQLite on encrypted EBS. Its templates take a target account, region, domain, network, image digests and credential references. CI builds the production image and exercises its runtime. Deploying a new environment is a release-runner operation. [Account deployment procedure](infra/PORTABILITY.md) · [Hosted stack and recovery](infra/HOSTED.md)
+Use the standard AWS HTTPS endpoint or supply an approved custom domain. The release runner publishes two single-architecture images and synthesizes the hosted stack using the target account's inputs. [Deployment procedure](infra/PORTABILITY.md) · [Hosted operations and pricing](infra/HOSTED.md)
 
-The separate DynamoDB, versioned S3 and SQS foundation supports the planned distributed employee runtime. SES email, AgentCore interactive browsing, hiring and the Git worker remain future milestones. [Foundation operations](infra/README.md) · [Engineering contract](ENGINEERING.md)
+Email, hiring, the Git worker, and application provisioning remain future milestones. The separate foundation template is available for future corporate files and shared work queues. [Foundation](infra/README.md) · [Engineering contract](ENGINEERING.md)

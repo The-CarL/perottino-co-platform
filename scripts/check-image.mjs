@@ -1,83 +1,57 @@
-import { randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { hashPassword } from '../src/auth.mjs';
-
-// Smoke an already-built image. Temporary containers have no host port or network access.
-const image = process.argv[2];
-if (!image || image.startsWith('-')) throw new Error('Usage: node scripts/check-image.mjs IMAGE');
-const name = 'perottino-smoke-' + randomUUID();
-const data = name + '-data';
-const browserIpc = name + '-render';
-const ipcDirectory = '/run/perottino-render';
-const workerIpc = name + '-worker';
-const workerDirectory = '/run/perottino-worker';
-const password = randomBytes(32).toString('base64url');
-const probe = readFileSync(new URL('./image-probe.mjs', import.meta.url));
-const environment = {
-  ...process.env, OWNER_USERNAME: 'ci-owner', OWNER_PASSWORD_HASH: await hashPassword(password),
-  IMAGE_SMOKE_PASSWORD: password, PEROTTINO_BEDROCK_WORKER_TOKEN: randomBytes(32).toString('base64url'),
-};
-function docker(args, input) {
-  const result = spawnSync('docker', args, {
-    env: environment, input, stdio: ['pipe','pipe','pipe'], timeout: 90_000,
-  });
+import { readFileSync } from 'node:fs';
+const [worker, lambda, database] = process.argv.slice(2);
+if (![worker,lambda,database].every(s => s && !s.startsWith('-'))) {
+  throw new Error('Usage: node scripts/check-image.mjs WORKER_IMAGE LAMBDA_IMAGE DYNAMODB_LOCAL_IMAGE');
+}
+const probe = readFileSync(new URL('./image-probe.mjs', import.meta.url),'utf8');
+const prefix = 'perottino-smoke-' + randomUUID();
+const tasks = new Set();
+function docker(args) {
+  const result = spawnSync('docker',args,{encoding:'utf8',timeout:90_000});
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error('Docker ' + args[0] + ' failed. ' + result.stderr.toString().trim());
-  return result.stdout.toString().trim();
+  if (result.status !== 0) throw new Error('Docker ' + args[0] + ' failed: ' + result.stderr.trim());
+  return result.stdout.trim();
 }
-const containers = new Set();
-function start(suffix, args, cmd = []) {
-  const task = name + '-' + suffix;
-  docker(['run','--detach','--pull=never','--name',task,'--network','none', ...args, image, ...cmd]);
-  containers.add(task);
-  return task;
+function start(label,args) {
+  const name = prefix + '-' + label;
+  docker(['run','--detach','--pull=never','--name',name,...args]);
+  tasks.add(name);
+  return name;
 }
-function check(task, phase) {
-  const credentials = ['write','recover'].includes(phase) ? ['--env','IMAGE_SMOKE_PASSWORD'] : [];
-  docker(['exec','--interactive',...credentials,task,'node','--input-type=module','-',phase],probe);
+function stop(name) {
+  docker(['rm','--force','--volumes',name]);
+  tasks.delete(name);
 }
-function stop(task) {
-  docker(['stop','--time','10',task]);
-  docker(['rm',task]);
-  containers.delete(task);
-}
-const appEnvironment = ['--init','--memory','896m','--cpu-shares','384','--env','OWNER_USERNAME','--env','OWNER_PASSWORD_HASH',
-  '--env','PEROTTINO_AGENT_MODE=local','--env','PUBLIC_ORIGIN=https://127.0.0.1:3000',
-  '--mount','type=volume,source=' + data + ',target=/var/lib/perottino',
-  '--mount','type=volume,source=' + browserIpc + ',target=' + ipcDirectory + ',readonly',
-  '--env','PEROTTINO_BROWSER_RENDER_SOCKET=' + ipcDirectory + '/renderer.sock',
-  '--mount','type=volume,source=' + workerIpc + ',target=' + workerDirectory + ',readonly',
-  '--env','PEROTTINO_BEDROCK_WORKER_TOKEN','--env','PEROTTINO_BEDROCK_WORKER_SOCKET=' + workerDirectory + '/decision.sock'];
-const volumes = [];
 try {
-  for (const volume of [data, browserIpc, workerIpc]) {
-    docker(['volume','create',volume]);
-    volumes.push(volume);
+  // All test containers share only this networkless loopback namespace. No AWS endpoints are reachable.
+  const db = start('ddb',['--network','none',database,'-jar','DynamoDBLocal.jar','-inMemory','-sharedDb']);
+  const common = ['--network','container:' + db,'--env','AWS_REGION=us-east-1','--env','AWS_ACCESS_KEY_ID=localtest',
+    '--env','AWS_SECRET_ACCESS_KEY=synthetic','--env','AWS_EC2_METADATA_DISABLED=true','--env','PEROTTINO_STATE_TABLE=ImageSmoke',
+    '--env','AWS_ENDPOINT_URL_DYNAMODB=http://127.0.0.1:8000','--env','AWS_ENDPOINT_URL_SECRETS_MANAGER=http://127.0.0.1:8099'];
+  const lambdaLimits = ['--user','1000:1000','--memory','512m','--read-only','--tmpfs','/tmp:rw,mode=1777'];
+  const api = start('api',[...common,...lambdaLimits,'--env','PEROTTINO_OWNER_SECRET_ARN=synthetic-owner',lambda]);
+  docker(['exec','--detach',api,'node','--input-type=module','-e',probe,'secret-fixture']);
+  const {turnId, marker} = JSON.parse(docker(['exec',api,'node','--input-type=module','-e',probe,'api']));
+  if (!/^[a-f0-9]{64}$/.test(turnId)) throw new Error('The API did not return a durable turn ID');
+  docker(['run','--rm','--pull=never',...common,'--cpus','0.25','--memory','1g','--read-only','--tmpfs','/tmp:rw,mode=1777','--cap-drop=ALL',
+    '--env','TURN_ID=' + turnId,'--entrypoint','node',worker,'--input-type=module','-e',probe,'employee']);
+  // First run handles the explicit remember command. A replacement task then replays the same wake.
+  const employeeTask = ['run','--rm','--pull=never',...common,'--cpus','0.25','--memory','1g',
+    '--read-only','--tmpfs','/tmp:rw,mode=1777','--cap-drop=ALL','--env','AGENT_ID=ceo','--env','TURN_ID=' + turnId,worker];
+  docker(employeeTask);
+  docker(employeeTask);
+  docker(['exec',api,'node','--input-type=module','-e',probe,'recover']);
+  stop(api);
+  for (const phase of ['handler','admit','terminal']) {
+    const fn = start(phase,[...common,...lambdaLimits,'--env','AWS_ENDPOINT_URL_SFN=http://127.0.0.1:8100',
+      '--env','PEROTTINO_STATE_MACHINE_ARN=arn:aws:states:us-east-1:111111111111:stateMachine:ImageSmoke',lambda,'src/dispatch.' + phase]);
+    docker(['exec','--env','TURN_ID=' + turnId,'--env','IMAGE_SMOKE_MARKER=' + JSON.stringify(marker),
+      fn,'node','--input-type=module','-e',probe,phase]);
+    stop(fn);
   }
-  const renderer = start('renderer', ['--init','--read-only','--memory','640m','--cpu-shares','512','--cap-drop=ALL','--security-opt','no-new-privileges',
-    '--tmpfs','/tmp:rw,nosuid,nodev,size=256m,mode=1777',
-    '--mount','type=volume,source=' + browserIpc + ',target=' + ipcDirectory,
-    '--env','PEROTTINO_BROWSER_RENDER_SOCKET=' + ipcDirectory + '/renderer.sock',
-    '--env','PEROTTINO_BROWSER_EXTERNAL_SANDBOX=1'],['node','src/renderer.mjs']);
-  check(renderer,'renderer');
-  const worker = start('inference', [
-    '--env','PEROTTINO_BEDROCK_WORKER_TOKEN','--env','PEROTTINO_BEDROCK_WORKER_SOCKET=' + workerDirectory + '/decision.sock',
-    '--mount','type=volume,source=' + workerIpc + ',target=' + workerDirectory,
-    '--init','--read-only','--cap-drop=ALL','--memory','1280m','--cpu-shares','1024',
-    '--tmpfs','/tmp:rw,nosuid,nodev,size=256m,mode=1777'],['node','src/agent.mjs','--bedrock-worker']);
-  const first = start('first',appEnvironment);
-  check(first,'worker');
-  check(first,'write');
-  stop(first);
-  const fresh = start('fresh',appEnvironment);
-  check(fresh,'recover');
-  stop(fresh);
-  stop(worker);
-  stop(renderer);
-  console.log('Image passed owner sign-in, chat, memory, cold recovery, Chromium rendering and worker authentication.');
+  console.log('Packaged HTTP API, Streams dispatch, admission, terminal handler, one-shot employee, replay and memory passed.');
 } finally {
-  // Only these uniquely named local test containers and volume are owned by this run.
-  for (const task of containers) docker(['rm','--force',task]);
-  for (const volume of volumes) docker(['volume','rm',volume]);
+  for (const name of [...tasks].reverse()) stop(name);
 }
