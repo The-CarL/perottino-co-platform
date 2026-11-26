@@ -1,0 +1,27 @@
+{
+  "name": "@perottino-co/platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Perottino & Co. owner console and employee runtime",
+  "packageManager": "npm@11.9.0",
+  "engines": { "node": "24.19.x" },
+  "scripts": {
+    "setup:owner": "node scripts/init-owner.mjs",
+    "setup:browser": "playwright-core install chromium",
+    "start": "node src/server.mjs",
+    "start:model-worker": "node src/agent.mjs --bedrock-worker",
+    "test": "node --test test/*.test.mjs",
+    "test:smoke": "node scripts/smoke.mjs",
+    "synth": "node infra/synth.mjs",
+    "check": "npm test && npm run synth && npm run test:smoke"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "0.163.0",
+    "playwright-core": "1.57.0"
+  },
+  "devDependencies": {
+    "aws-cdk-lib": "2.221.0",
+    "constructs": "10.4.2"
+  }
+}
