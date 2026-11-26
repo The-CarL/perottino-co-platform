@@ -1,5 +1,5 @@
 import { argon2, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { isIPv4 } from 'node:net';
+import { isIP, isIPv4 } from 'node:net';
 import { promisify } from 'node:util';
 
 const derive = promisify(argon2);
@@ -63,6 +63,19 @@ function requestOrigin(req, configuredOrigin) {
   return localHost && loopback(req.socket.remoteAddress) ? url.origin : null;
 }
 
+function requestSource(req, configuredOrigin) {
+  const peer = req.socket.remoteAddress;
+  if (!configuredOrigin || req.socket.encrypted || req.headers['x-forwarded-proto'] !== 'https') return peer;
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded !== 'string') return peer;
+  // The restricted TLS ingress appends or replaces the rightmost hop. Earlier values
+  // may be client-supplied. Some ALBs include the client's source port.
+  const last = forwarded.slice(forwarded.lastIndexOf(',') + 1).trim();
+  if (isIP(last)) return last;
+  const address = /^\[([^\]]+)\]:\d+$/.exec(last)?.[1] ?? /^(\d+(?:\.\d+){3}):\d+$/.exec(last)?.[1];
+  return address && isIP(address) ? address : peer;
+}
+
 function allowedRequest(req, origin) {
   const source = req.headers.origin;
   const site = req.headers['sec-fetch-site'];
@@ -123,7 +136,7 @@ export function createOwnerAuth({ username, passwordHash, publicOrigin }) {
       return true;
     }
 
-    const source = req.socket.remoteAddress;
+    const source = requestSource(req, configuredOrigin);
     const failed = failures.get(source);
     if (activeChecks >= maxConcurrentChecks || (failed?.until > now && failed.count >= maxTrials)) {
       return deny(res, 429, 'Try signing in again later.');

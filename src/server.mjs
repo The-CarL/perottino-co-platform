@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createOwnerAuth } from './auth.mjs';
-import { runTurn } from './agent.mjs';
+import { runTurn, validateWorkerConnection } from './agent.mjs';
 import { makeBrowser } from './browser.mjs';
 import { createStore } from './store.mjs';
 
@@ -101,12 +101,22 @@ function createWorker(store, runner, browser, turnTimeoutMs) {
       }), aborted]);
       signal.throwIfAborted();
       if (typeof reply !== 'string' || !reply.trim()) throw new Error('Empty reply.');
-      store.complete(job, reply.trim(), pending);
+      try {
+        store.complete(job, reply.trim(), pending);
+      } catch {
+        // A transient disk error leaves the durable lease recoverable. Replaying
+        // the transaction can never expose a partial reply or partial notes.
+        console.error('Could not commit turn; the dispatcher will recover its lease:', job.message.id);
+      }
     } catch {
-      if (stopping) store.release(job);
-      else {
-        store.fail(job);
-        console.error('Turn failed:', job.agent.id, job.message.id, signal.aborted ? 'timeout' : 'execution error');
+      try {
+        if (stopping) store.release(job);
+        else {
+          store.fail(job);
+          console.error('Turn failed:', job.agent.id, job.message.id, signal.aborted ? 'timeout' : 'execution error');
+        }
+      } catch {
+        console.error('Could not update turn; the dispatcher will recover its lease:', job.message.id);
       }
     } finally {
       clearTimeout(timeout);
@@ -144,6 +154,7 @@ export function createApp({ dataDir, username, passwordHash, publicOrigin, runne
   publicDir = resolve(root, 'public'), turnTimeoutMs = 120000 } = {}) {
   const mode = process.env.PEROTTINO_AGENT_MODE ?? 'local';
   if (!['local', 'bedrock'].includes(mode)) throw new Error('PEROTTINO_AGENT_MODE must be local or bedrock.');
+  if (mode === 'bedrock' && runner === runTurn) validateWorkerConnection();
   if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs <= 0) throw new Error('Invalid turn timeout.');
   const auth = createOwnerAuth({ username, passwordHash, publicOrigin });
   const store = createStore(dataDir);

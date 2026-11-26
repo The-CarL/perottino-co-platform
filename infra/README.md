@@ -1,6 +1,6 @@
 # AWS durable foundation
 
-This CDK app synthesizes a CloudFormation template for the company's persistent records, shared files and worker wakeups. The owner console and employee worker run locally in this milestone. Connecting them to the services below requires storage adapters and a hosted dispatcher. The template creates a new corporate bucket. Reusing an existing bucket requires confirming its ownership, versioning and prefix map, then changing the stack to reference it before deployment.
+This CDK app synthesizes a CloudFormation template for the company's persistent records, shared files and worker wakeups. The owner console and decision worker have a single-host reference deployment. The distributed runtime still requires adapters and a dispatcher for the services below. [Single-host deployment](PORTABILITY.md) The template creates a new corporate bucket. Reusing an existing bucket requires confirming its ownership, versioning and prefix map, then changing the stack to reference it before deployment.
 
 | Resource | Contract |
 | --- | --- |
@@ -37,4 +37,4 @@ Review the synthesized template and the named change set against the exact accou
 
 A failed or interrupted operation can leave retained resources behind. Reconcile stack events, physical IDs, data versions and inventory before retrying. For a table incident, restore a selected point in time to a new table, check records and explicitly repoint consumers after verification. For a file incident, read the recorded object version and copy it to a new current version to restore it. For a dead-letter incident, inspect the durable work item's state and side effects, correct its cause and replay the same idempotency key. Keep the original recovery references. Resource retention preserves data and can continue to incur charges after a stack change. Cleanup follows a separately agreed resource and data plan.
 
-Hosted integration still needs the DynamoDB and S3 adapters, idempotent dispatcher, ECS execution and workload roles, Bedrock model access, networking, image publication, owner authentication and HTTPS chat ingress. Email delivery and signed-in browser access require their own service setup. The [Git worker secret template](github-pat.yaml) has a separate lifecycle.
+Using this foundation for distributed employee runs requires DynamoDB and S3 adapters and an idempotent dispatcher. The single-host stack has its own ECS roles, image publication, HTTPS ingress and deployment procedure. Email delivery and signed-in browser access require their own service setup. The [Git worker secret template](github-pat.yaml) has a separate lifecycle.

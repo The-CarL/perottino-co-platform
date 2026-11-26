@@ -17,7 +17,7 @@ test('bootstrap creates one retained secret slot and leaves its value to the own
   assert.equal(secret.Properties.Name, '/perottino-co/github/pat');
   assert.equal(secret.DeletionPolicy, 'Retain');
   assert.equal(secret.UpdateReplacePolicy, 'Retain');
-  assert.equal('GenerateSecretString' in secret.Properties, false);
-  assert.equal('SecretString' in secret.Properties, false);
+  // The Git worker's owner-supplied value has a separate lifecycle from infrastructure.
+  assert.deepEqual(Object.keys(secret.Properties).sort(), ['Description', 'Name']);
   assert.deepEqual(template.Outputs.ProjectsGitTokenArn.Value, { Ref: 'ProjectsGitToken' });
 });

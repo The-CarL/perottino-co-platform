@@ -95,3 +95,18 @@ test('bootstrap saves only a private verifier and refuses replacement', async t 
   assert.equal(await readFile(path, 'utf8'), data);
   assert.deepEqual(await readdir(dir), ['owner.json']);
 });
+
+test('rate limits separate clients behind a trusted TLS ingress and ignore untrusted earlier hops', async () => {
+  const host = 'console.example.test';
+  const auth = createOwnerAuth({ ...credentials, publicOrigin: 'https://' + host });
+  const bad = 'Basic ' + Buffer.from('owner:incorrect').toString('base64');
+  const from = (forwarded, header = bad) => call(auth, {
+    remoteAddress: '10.0.0.2', headers: { host, authorization: header,
+      'x-forwarded-proto': 'https', 'x-forwarded-for': forwarded },
+  });
+  for (let i = 0; i < 10; i++) {
+    assert.equal((await from('198.51.100.' + (i + 1) + ', 192.0.2.5:8001')).res.statusCode, 401);
+  }
+  assert.equal((await from('198.51.100.99, 192.0.2.5:8002')).res.statusCode, 429);
+  assert.equal((await from('[2001:db8::1]:443', authorization)).allowed, true);
+});

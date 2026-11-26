@@ -35,6 +35,7 @@ export function createStore(dataDir) {
       text TEXT NOT NULL,
       created_at TEXT NOT NULL,
       state TEXT NOT NULL CHECK (state IN ('queued','working','done','error')),
+      attempts INTEGER NOT NULL DEFAULT 0,
       token TEXT,
       lease_until INTEGER,
       reply_id TEXT UNIQUE,
@@ -70,6 +71,12 @@ export function createStore(dataDir) {
     }
   }
 
+  // Upgrade existing pilot databases in place before any dispatcher can claim a turn.
+  transaction(() => {
+    if (!db.prepare('PRAGMA table_info(turn)').all().some(column => column.name === 'attempts'))
+      db.exec('ALTER TABLE turn ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+  });
+
   const getAgent = id => db.prepare('SELECT id, name, handle, role FROM agent WHERE id=?').get(id);
   const getMemories = agentId => db.prepare(`
     SELECT m.id, m.text, m.sourceMessageId, m.createdAt, (
@@ -79,7 +86,7 @@ export function createStore(dataDir) {
   `).all(agentId).map(({ updatedAt, ...note }) => updatedAt ? { ...note, updatedAt, updatedBy: 'owner' } : note);
   const memoryRevision = agentId => db.prepare('SELECT MAX(seq) AS seq FROM memory_action WHERE agent_id=?').get(agentId).seq;
   const releaseStatement = db.prepare(
-    "UPDATE turn SET state='queued', token=NULL, lease_until=NULL WHERE id=? AND state='working' AND token=?"
+    "UPDATE turn SET state='queued', attempts=MAX(attempts-1,0), token=NULL, lease_until=NULL WHERE id=? AND state='working' AND token=?"
   );
 
   return {
@@ -133,7 +140,10 @@ export function createStore(dataDir) {
     claim(leaseMs) {
       return transaction(() => {
         const now = Date.now();
-        db.prepare("UPDATE turn SET state='queued', token=NULL, lease_until=NULL WHERE state='working' AND lease_until<=?").run(now);
+        // A crash or failed durable commit can repeat model inference. Bound that
+        // cost across restarts; an explicit owner resubmission starts a new turn.
+        db.prepare(`UPDATE turn SET state=CASE WHEN attempts>=3 THEN 'error' ELSE 'queued' END,
+          token=NULL, lease_until=NULL WHERE state='working' AND lease_until<=?`).run(now);
         const turn = db.prepare(`
           SELECT * FROM turn t WHERE t.state='queued' AND NOT EXISTS (
             SELECT 1 FROM turn active WHERE active.agent_id=t.agent_id AND active.state='working'
@@ -141,7 +151,7 @@ export function createStore(dataDir) {
         `).get();
         if (!turn) return;
         const token = randomUUID();
-        db.prepare("UPDATE turn SET state='working', token=?, lease_until=? WHERE id=?")
+        db.prepare("UPDATE turn SET state='working', attempts=attempts+1, token=?, lease_until=? WHERE id=?")
           .run(token, now + leaseMs, turn.id);
         // A second incoming message can be queued while the first turn is working.
         const history = db.prepare('SELECT * FROM turn WHERE agent_id=? AND seq<? ORDER BY seq')

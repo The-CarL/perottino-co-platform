@@ -67,6 +67,7 @@ async function openChat(baseURL, viewport) {
 }
 
 const note = 'Launch briefs include a working preview link.';
+const corrected = 'Launch briefs include a working preview link and its expiry.';
 try {
   await prepareOwner();
   const firstURL = await startServer();
@@ -81,12 +82,18 @@ try {
   await first.page.locator('#picker').getByRole('button', { name: /Mara/i }).click();
   await first.page.locator('#messageText').fill('remember ' + note);
   await first.page.locator('#send').click();
-  await first.page.waitForFunction(async () => {
-    const result = await fetch('/api/agents/ceo/messages').then(r => r.json());
-    return result.status === 'idle' && result.messages.some(m => m.author === 'agent');
-  });
+  await first.page.locator('#timeline .employee').getByText('Remembered: ' + note, { exact: true }).waitFor();
   await first.page.locator('#memoryButton').click();
-  await first.page.locator('#memories').getByText(note, { exact: true }).waitFor();
+  const notes = first.page.locator('#memories');
+  await notes.getByText(note, { exact: true }).waitFor();
+  await notes.getByRole('button', { name: 'Edit', exact: true }).click();
+  await first.page.getByLabel('Note', { exact: true }).fill(corrected);
+  await first.page.getByRole('button', { name: 'Save changes' }).click();
+  await notes.getByText(corrected, { exact: true }).waitFor();
+  await notes.getByText(/Edited by you/).waitFor();
+  await notes.getByRole('button', { name: 'Source message' }).click();
+  const source = first.page.locator('#timeline .owner:focus .bubble');
+  assert.equal(await source.textContent(), 'remember ' + note);
   await first.page.locator('#closeMemory').click();
   await snapshot(first.page, 'desktop-chat');
   await first.context.close();
@@ -98,14 +105,22 @@ try {
   await second.page.locator('#conversations').getByRole('button', { name: /Mara/i }).click();
   await second.page.locator('#messageText').fill('recall preview');
   await second.page.locator('#send').click();
-  await second.page.waitForFunction(async expected => {
-    const result = await fetch('/api/agents/ceo/messages').then(r => r.json());
-    return result.messages.length === 4 && result.messages[3].author === 'agent' && result.messages[3].text.includes(expected);
-  }, note);
+  await second.page.locator('#timeline .employee .bubble').filter({ hasText: corrected }).waitFor();
   assert(await second.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'mobile layout overflowed');
   await snapshot(second.page, 'mobile-chat');
+  await second.page.locator('#memoryButton').click();
+  const restored = second.page.locator('#memories');
+  await restored.getByRole('button', { name: 'Source message' }).click();
+  await second.page.locator('#memoryPanel').waitFor({ state: 'hidden' });
+  assert.equal(await second.page.locator('#timeline .owner:focus .bubble').textContent(), 'remember ' + note);
+  await second.page.locator('#memoryButton').click();
+  await restored.getByRole('button', { name: 'Forget', exact: true }).click();
+  await second.page.getByRole('button', { name: 'Forget note', exact: true }).click();
+  await restored.getByText('No saved notes yet.', { exact: true }).waitFor();
+  await second.page.locator('#closeMemory').click();
+  await second.page.locator('#timeline .owner .bubble').filter({ hasText: 'remember ' + note }).waitFor();
   await second.context.close();
-  console.log('Smoke passed: owner auth, directory alias, DM, sourced memory, process restart, mobile recall.');
+  console.log('Smoke passed: owner auth, directory alias, DM, memory correction, original source, restart, mobile recall and forgetting.');
 } finally {
   await browser?.close();
   await stopServer();

@@ -1,0 +1,21 @@
+{
+  "account": "111111111111",
+  "region": "us-east-1",
+  "vpcId": "vpc-abcdef01234567890",
+  "publicSubnetId": "subnet-abcdef01234567890",
+  "availabilityZone": "us-east-1a",
+  "amiId": "ami-abcdef01234567890",
+  "hostname": "company.example.com",
+  "hostedZoneId": "ZEXAMPLE123456",
+  "appImage": "111111111111.dkr.ecr.us-east-1.amazonaws.com/example-company@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "proxyImage": "111111111111.dkr.ecr.us-east-1.amazonaws.com/example-company@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "ownerSecretArn": "arn:aws:secretsmanager:us-east-1:111111111111:secret:example/owner-aBc123",
+  "workerSecretArn": "arn:aws:secretsmanager:us-east-1:111111111111:secret:example/worker-xYz456",
+  "permissionsBoundaryArn": "arn:aws:iam::111111111111:policy/ExampleBoundary",
+  "bedrockModel": "us.openai.gpt-6-sol",
+  "bedrockResourceArns": [
+    "arn:aws:bedrock:us-east-1:111111111111:inference-profile/us.openai.gpt-6-sol",
+    "arn:aws:bedrock:us-west-2::foundation-model/openai.gpt-6-sol",
+    "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-6-sol"
+  ]
+}

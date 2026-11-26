@@ -2,7 +2,7 @@
 
 The platform for an agent-run company in its owner's AWS account. This repository contains the employee runtime and owner console. Employees will publish their applications in the separate [company projects repository](https://github.com/The-CarL/perottino-co-projects).
 
-The first milestone runs on a developer machine. Sign in, find Mara by name or the CEO role, send a direct message and inspect the notes she keeps. Messages, queued work and notes survive a process restart. The only live AWS resource provisioned for this milestone is the projects Git credential slot.
+The first milestone runs locally and has a reusable AWS deployment definition. CI exercises the developer and container paths on every PR. Sign in, find Mara by name or the CEO role, send a direct message and inspect the notes she keeps. Messages, queued work and notes survive a process restart. The only live AWS resource provisioned for this milestone is the projects Git credential slot.
 
 ## Run locally
 
@@ -40,7 +40,7 @@ npm run setup:browser
 npm run check
 ```
 
-The check runs the Node test suite, synthesizes the AWS foundation into `cdk.out/`, then drives Chromium against the actual owner setup and chat server. The browser smoke test sends a desktop DM, verifies its saved note, restarts the server and recalls the note on a mobile viewport. Tests use temporary credentials, ephemeral loopback listeners, fixture web pages and temporary data directories. For screenshots, set `PEROTTINO_SCREENSHOT_DIR` when running `npm run test:smoke`. Dependencies and the matched browser download require network access on first installation. The test flow uses no AWS account or external model.
+The check runs the Node test suite, synthesizes the AWS foundation and the hosted stack into separate directories, then drives Chromium against the actual owner setup and chat server. The browser smoke test sends a desktop DM, verifies its saved note, restarts the server and recalls the note on a mobile viewport. Tests use temporary credentials, ephemeral loopback listeners, fixture web pages and temporary data directories. For screenshots, set `PEROTTINO_SCREENSHOT_DIR` when running `npm run test:smoke`. Dependencies and the matched browser download require network access on first installation. The test flow uses no AWS account or external model.
 
 The GitHub Actions workflow performs the same check on Ubuntu with read-only repository permissions. [Check workflow](.github/workflows/check.yml)
 
@@ -59,7 +59,7 @@ For noninteractive owner setup, pipe the password from a protected source into `
 
 ### Bedrock worker
 
-The optional inference process uses the pinned Codex SDK and the native Amazon Bedrock provider. Run `npm run start:model-worker` in the isolated worker environment with its ECS task-role credentials, an authorized model or inference profile in `PEROTTINO_BEDROCK_MODEL`, and `AWS_REGION`. Set `PEROTTINO_BEDROCK_WORKER_TOKEN` to the same private random value of at least 32 bytes in the worker and the console. The worker defaults to `127.0.0.1:3101`. Configure the console with `PEROTTINO_AGENT_MODE=bedrock` and `PEROTTINO_BEDROCK_WORKER_URL` pointed at the worker. A remote worker requires HTTPS and a private, authenticated route. Keep the owner credential and application storage out of the model worker. The worker contract is tested with a simulated response. Live model access and hosted routing still require a deployment check.
+The optional inference process uses the pinned Codex SDK and the native Amazon Bedrock provider. Run `npm run start:model-worker` in the isolated worker environment with its ECS task-role credentials, an authorized model or inference profile in `PEROTTINO_BEDROCK_MODEL`, and `AWS_REGION`. Set `PEROTTINO_BEDROCK_WORKER_TOKEN` to the same private random value of at least 32 bytes in the worker and the console. The worker defaults to `127.0.0.1:3101`. Configure the console with `PEROTTINO_AGENT_MODE=bedrock` and `PEROTTINO_BEDROCK_WORKER_URL` pointed at the worker. The single-host AWS deployment uses the shared `PEROTTINO_BEDROCK_WORKER_SOCKET` Unix socket and worker token. A separately networked worker requires HTTPS and a private, authenticated route. Keep the owner credential and application storage out of the model worker. The worker contract is tested with a simulated response. Live model access and hosted routing still require a deployment check.
 
 ## AWS infrastructure and Git credentials
 
@@ -77,4 +77,6 @@ aws secretsmanager list-secret-version-ids --region us-east-1 \
 
 Here `PAT_STACK` is the target stack name and `PRIVATE_TAG_FILE` is a private JSON array of CloudFormation `Key` and `Value` pairs. A newly created, unpopulated slot has zero versions.
 
-The CDK foundation for DynamoDB, versioned S3 and SQS synthesizes locally. Hosted ECS workers, a production DM URL, SES email, AgentCore interactive browsing, hiring and the Git worker are later milestones. The foundation needs runtime adapters before it can replace the local store. [Foundation operations](infra/README.md) · [Engineering contract and milestone state](ENGINEERING.md)
+The hosted reference runs the console, Bedrock decision worker and network-isolated page renderer as separate ECS services with persistent SQLite on encrypted EBS. Its templates take a target account, region, domain, network, image digests and credential references. CI builds the production image and exercises its runtime. Deploying a new environment is a release-runner operation. [Account deployment procedure](infra/PORTABILITY.md) · [Hosted stack and recovery](infra/HOSTED.md)
+
+The separate DynamoDB, versioned S3 and SQS foundation supports the planned distributed employee runtime. SES email, AgentCore interactive browsing, hiring and the Git worker remain future milestones. [Foundation operations](infra/README.md) · [Engineering contract](ENGINEERING.md)

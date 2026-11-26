@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { once } from 'node:events';
-import { createDecisionServer, runTurn } from '../src/agent.mjs';
+import { createDecisionServer, runTurn, sdkDecision } from '../src/agent.mjs';
 
 function employee() {
   const notes = [];
@@ -60,4 +60,29 @@ test('Bedrock transport authenticates and handles only validated scoped tool req
   assert.deepEqual(worker.memories, [{ text: 'The draft is ready.' }]);
   assert.equal(calls, 2);
   await assert.rejects(message(worker, 'invalid'), /Bedrock worker/);
+});
+
+test('SDK worker restricts tool access to this run and excludes other job and application credentials', async () => {
+  const ThreadStub = class {
+    constructor(options) {
+      assert.equal(options.config.default_permissions, 'decision');
+      assert.deepEqual(options.config.permissions.decision.network, { enabled: false });
+      assert.deepEqual(options.configOverrides, [
+        'permissions.decision.filesystem={":root"="deny",":workspace_roots"="read"}',
+      ]);
+      assert.equal(options.config.model_provider, 'amazon-bedrock-runtime');
+      assert.equal(options.env.PEROTTINO_BEDROCK_WORKER_TOKEN, undefined);
+      assert.equal(options.env.OWNER_PASSWORD_HASH, undefined);
+      assert.equal(options.env.OPENAI_API_KEY, undefined);
+    }
+    startThread(options) {
+      // Legacy --sandbox or workspace-write network overrides can displace the named profile.
+      assert.equal(options.sandboxMode, undefined);
+      assert.equal(options.networkAccessEnabled, undefined);
+      assert.equal(options.approvalPolicy, 'never');
+      return { run: async () => ({ finalResponse: '{"action":"reply","value":"ready"}' }) };
+    }
+  };
+  assert.deepEqual(await sdkDecision({ message: 'hello' }, undefined, ThreadStub),
+    { action: 'reply', value: 'ready' });
 });

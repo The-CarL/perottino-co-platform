@@ -8,3 +8,4 @@ cdk.out/
 *.sqlite
 *.sqlite-*
 test-results/
+cdk.hosted.out/

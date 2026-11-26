@@ -3,11 +3,9 @@ import { BlockList, isIP } from 'node:net';
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { checkedRenderResult, renderDocument, maxDocumentBytes } from './renderer.mjs';
 import path from 'node:path';
 
-const maxBytes = 1_048_576;
 const deadlineMs = 30_000;
 const deniedIPv4 = new BlockList();
 for (const [ip, prefix] of [
@@ -132,7 +130,7 @@ async function fetchDocument(url, address, signal, useProxy) {
       let size = 0;
       res.on('data', chunk => {
         size += chunk.length;
-        if (size > maxBytes) {
+        if (size > maxDocumentBytes) {
           reject(new Error('Page exceeds the browser size limit.')); res.destroy(); return;
         }
         chunks.push(chunk);
@@ -145,49 +143,41 @@ async function fetchDocument(url, address, signal, useProxy) {
   });
 }
 
-// Render the fetched document in a fresh, offline browser. The remote page never receives
-// credentials, opens subresources, executes scripts, or gets a socket into the worker's network.
-async function render(document, signal) {
-  const { chromium } = await import('playwright-core');
-  const home = await mkdtemp(path.join(tmpdir(), 'perottino-browser-'));
-  let browser;
-  let abort;
-  try {
-    signal.throwIfAborted();
-    browser = await chromium.launch({
-      executablePath: process.env.PEROTTINO_CHROMIUM_PATH || undefined,
-      chromiumSandbox: process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX !== '1',
-      env: { HOME: home, PATH: '/usr/bin:/bin', TMPDIR: home },
-      timeout: 15_000,
-      args: ['--disable-background-networking', '--disable-dev-shm-usage',
-        '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>'],
-    });
-    abort = () => { browser.close().catch(() => {}); };
-    signal.addEventListener('abort', abort, { once: true });
-    signal.throwIfAborted();
-    const ctx = await browser.newContext({ javaScriptEnabled: false, serviceWorkers: 'block',
-      acceptDownloads: false, offline: true });
-    const page = await ctx.newPage();
-    const internal = 'https://reader.invalid/';
-    let served = false;
-    await ctx.route('**/*', route => {
-      if (served || route.request().url() !== internal || !route.request().isNavigationRequest()) {
-        return route.abort();
-      }
-      served = true;
-      return route.fulfill({ status: 200, contentType: document.type + '; charset=utf-8',
-        headers: { 'Content-Security-Policy': "default-src 'none'; form-action 'none'; base-uri 'none'; sandbox" },
-        body: document.body });
-    });
-    await page.goto(internal, { waitUntil: 'domcontentloaded', timeout: 8000 });
-    const title = (await page.title()).trim().slice(0, 240);
-    const text = (await page.locator('body').innerText({ timeout: 4000 })).trim().slice(0, 8000);
-    return { title, text };
-  } finally {
-    if (abort) signal.removeEventListener('abort', abort);
-    await browser?.close().catch(() => {});
-    await rm(home, { recursive: true, force: true });
+function renderViaSocket(socketPath, document, signal) {
+  if (!path.isAbsolute(socketPath) || Buffer.byteLength(socketPath) > 103 || socketPath.includes('\0')) {
+    throw new Error('Invalid renderer socket path.');
   }
+  // Send only the vetted MIME type and bounded raw bytes. The renderer never learns the public URL.
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      socketPath, method: 'POST', path: '/render', signal, agent: false,
+      headers: { 'Content-Type': document.type, 'Content-Length': document.body.length },
+    }, response => {
+      response.on('error', reject);
+      if (response.statusCode !== 200 || response.headers['content-type'] !== 'application/json') {
+        response.destroy();
+        reject(new Error('The renderer could not process the document.'));
+        return;
+      }
+      const chunks = [];
+      let size = 0;
+      response.on('data', chunk => {
+        size += chunk.length;
+        // Worst-case JSON escaping uses six bytes per code unit of output.
+        if (size > 64 * 1024) {
+          response.destroy();
+          reject(new Error('Renderer response exceeded its size limit.'));
+        } else chunks.push(chunk);
+      });
+      response.on('end', () => {
+        try {
+          resolve(checkedRenderResult(JSON.parse(Buffer.concat(chunks))));
+        } catch (error) { reject(error); }
+      });
+    });
+    request.on('error', reject);
+    request.end(document.body);
+  });
 }
 
 export async function browse(input, { signal: externalSignal, fixtureOrigin } = {}) {
@@ -200,7 +190,9 @@ export async function browse(input, { signal: externalSignal, fixtureOrigin } = 
     const document = await fetchDocument(url, address, signal, url.origin !== fixtureOrigin);
     if (!document.redirect) {
       try {
-        return { url: url.href, ...await render(document, signal) };
+        const socket = process.env.PEROTTINO_BROWSER_RENDER_SOCKET;
+        const result = socket ? await renderViaSocket(socket, document, signal) : await renderDocument(document, signal);
+        return { url: url.href, ...result };
       } catch (cause) {
         signal.throwIfAborted();
         throw new Error('Browser could not render this page. Check the Chromium worker configuration.', { cause });

@@ -1,0 +1,46 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Per-account image registry and credentials for the hosted owner console.
+Resources:
+  Images:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      Tags:
+        - Key: perottino:purpose
+          Value: runtime-images
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  ConsoleOwner:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Tags:
+        - Key: perottino:purpose
+          Value: owner-verifier
+      Description: Separately populated owner verifier JSON containing username and passwordHash.
+  WorkerToken:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Private authentication token shared only by the console and decision worker.
+      Tags:
+        - Key: perottino:purpose
+          Value: worker-token
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+Outputs:
+  ImageRepositoryUri:
+    Value: !GetAtt [Images, RepositoryUri]
+  ImageRepositoryName:
+    Value: !Ref Images
+  OwnerSecretArn:
+    Value: !Ref ConsoleOwner
+  WorkerSecretArn:
+    Value: !Ref WorkerToken

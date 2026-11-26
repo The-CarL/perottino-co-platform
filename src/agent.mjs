@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { listenPrivateSocket, listenServer } from './private-socket.mjs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -79,7 +80,55 @@ function workerToken() {
   return value;
 }
 
+function configuredSocket() {
+  const value = process.env.PEROTTINO_BEDROCK_WORKER_SOCKET;
+  if (!value) return undefined;
+  if (!path.isAbsolute(value) || Buffer.byteLength(value) > 103 || value.includes('\0'))
+    throw new Error('The worker socket must be an absolute Unix socket path of at most 103 bytes.');
+  if (process.env.PEROTTINO_BEDROCK_WORKER_URL)
+    throw new Error('Configure either a worker socket or a worker URL.');
+  return value;
+}
+
+function socketDecision(socketPath, context, signal) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ socketPath, path: '/decision', method: 'POST', agent: false, signal,
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + workerToken() }
+    }, res => {
+      res.on('error', reject);
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error('The Bedrock worker could not complete this turn.'));
+        return;
+      }
+      const chunks = [];
+      let bytes = 0;
+      res.on('data', chunk => {
+        bytes += chunk.length;
+        if (bytes > 128 * 1024) {
+          res.destroy(new Error('The model decision is too large.'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        try { resolve(checkDecision(JSON.parse(Buffer.concat(chunks)))); }
+        catch (error) { reject(error); }
+      });
+    });
+    req.on('error', reject);
+    req.end(JSON.stringify(context));
+  });
+}
+
+export function validateWorkerConnection() {
+  workerToken();
+  if (!configuredSocket()) workerUrl();
+}
+
 async function requestDecision(context, signal) {
+  const socketPath = configuredSocket();
+  if (socketPath) return socketDecision(socketPath, context, signal);
   const response = await fetch(workerUrl(), {
     method: 'POST', redirect: 'error', signal, headers: {
       'Content-Type': 'application/json', Authorization: 'Bearer ' + workerToken(),
@@ -126,11 +175,11 @@ export async function runTurn(job) {
 
 // Runs only in the separately deployed inference worker. Its task role may invoke the
 // selected Bedrock model. Do not mount the application store or give this worker owner credentials.
-async function sdkDecision(context, signal) {
+export async function sdkDecision(context, signal, CodexImplementation) {
   const model = process.env.PEROTTINO_BEDROCK_MODEL || 'us.openai.gpt-6-sol';
   const region = process.env.AWS_REGION || 'us-east-1';
   if (!/^(?:us|global)\.openai\.[a-z0-9.-]+$/.test(model)) throw new Error('Invalid Bedrock inference profile.');
-  const { Codex } = await import('@openai/codex-sdk');
+  const Codex = CodexImplementation ?? (await import('@openai/codex-sdk')).Codex;
   const base = await mkdtemp(path.join(tmpdir(), 'perottino-codex-'));
   try {
     const workspace = path.join(base, 'work');
@@ -146,12 +195,17 @@ async function sdkDecision(context, signal) {
       env, config: {
         model_provider: 'amazon-bedrock-runtime', model,
         model_providers: { 'amazon-bedrock-runtime': { aws: { region } } },
+        default_permissions: 'decision',
+        permissions: { decision: { network: { enabled: false } } },
         web_search: 'disabled', shell_environment_policy: { inherit: 'none' },
         features: { shell_tool: false, unified_exec: false, multi_agent: false, plugins: false, apps: false },
       },
+      // The legacy read-only mode permits reading all files. Restrict local tool reads
+      // to this empty workdir, excluding other runs, process environments and the IPC volume.
+      configOverrides: ['permissions.decision.filesystem={":root"="deny",":workspace_roots"="read"}'],
     });
     const thread = client.startThread({ workingDirectory: workspace, skipGitRepoCheck: true,
-      sandboxMode: 'read-only', networkAccessEnabled: false, approvalPolicy: 'never', webSearchMode: 'disabled' });
+      approvalPolicy: 'never', webSearchMode: 'disabled' });
     const result = await thread.run(instructions + '\n\n' + JSON.stringify(context),
       { outputSchema: decisionSchema, signal });
     return checkDecision(JSON.parse(result.finalResponse));
@@ -198,8 +252,19 @@ export function createDecisionServer(decide = sdkDecision) {
   });
 }
 
+export async function listenDecisionServer(server = createDecisionServer()) {
+  const socket = configuredSocket();
+  if (!socket) {
+    await listenServer(server, Number(process.env.PEROTTINO_BEDROCK_WORKER_PORT || 3101),
+      process.env.PEROTTINO_BEDROCK_WORKER_HOST || '127.0.0.1');
+    return server;
+  }
+  return listenPrivateSocket(server, socket);
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href &&
     process.argv[2] === '--bedrock-worker') {
-  createDecisionServer().listen(Number(process.env.PEROTTINO_BEDROCK_WORKER_PORT || 3101),
-    process.env.PEROTTINO_BEDROCK_WORKER_HOST || '127.0.0.1');
+  listenDecisionServer().then(server => {
+    for (const event of ['SIGINT', 'SIGTERM']) process.once(event, () => server.close());
+  }).catch(error => { console.error(error.message); process.exitCode = 1; });
 }

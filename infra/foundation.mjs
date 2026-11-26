@@ -13,9 +13,9 @@ const requiredTags = [
 const changeTags = ['last-run-id', 'last-source-commit', 'last-source-branch', 'last-source-author']
   .map(key => 'factory:' + key);
 
-function resourceTags({ tags, overrides = {} }) {
+export function resourceTags({ tags, overrides = {} }, ids = resourceIds) {
   if (!tags || Object.keys(tags).length !== requiredTags.length
-      || Object.keys(overrides).some(id => !resourceIds.includes(id))) {
+      || Object.keys(overrides).some(id => !ids.includes(id))) {
     throw new Error('Use the complete factory tags and recognized resource IDs');
   }
   const project = tags['factory:project-id'];
@@ -40,7 +40,7 @@ function resourceTags({ tags, overrides = {} }) {
       || (tags['factory:expires-at'] !== 'none' && !timestamp(tags['factory:expires-at']))) {
     throw new Error('Use UTC RFC 3339 creation and expiry times, or none for approved retention');
   }
-  return Object.fromEntries(resourceIds.map(id => {
+  return Object.fromEntries(ids.map(id => {
     const changes = overrides[id] ?? {};
     if (Object.keys(changes).some(key => !changeTags.includes(key))) {
       throw new Error('Resource overrides may update only latest change attribution');
