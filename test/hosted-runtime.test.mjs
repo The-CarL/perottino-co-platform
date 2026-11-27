@@ -29,7 +29,7 @@ test('a failed commit retains the turn for a durable retry', async () => {
     db.exec(`CREATE TRIGGER fail_commit BEFORE UPDATE OF reply ON turn
       BEGIN SELECT RAISE(ABORT, 'simulated storage interruption'); END`);
     let attempts = 0;
-    app = createApp({ dataDir, username: 'owner', passwordHash: await hashPassword('test-only-strong-password'),
+    app = createApp({ dataDir, foundations: false, username: 'owner', passwordHash: await hashPassword('test-only-strong-password'),
       runner: async ({ remember }) => { attempts++; remember('Durable plan'); return 'Saved it'; } });
     await until(() => attempts > 0);
     assert.equal(store.messages('ceo').status, 'working');

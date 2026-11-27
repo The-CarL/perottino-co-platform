@@ -27,7 +27,11 @@ async function directory(t) {
 }
 
 async function open(dataDir, runner, options = {}) {
-  const app = createApp({ dataDir, username, passwordHash, runner, browser: async () => ({}), ...options });
+  const app = createApp({ dataDir, username, passwordHash, foundations: false, runner, browser: async () => ({}), ...options });
+  return listen(app);
+}
+
+async function listen(app) {
   try {
     await new Promise((resolve, reject) => {
       app.server.once('error', reject);
@@ -46,7 +50,14 @@ async function open(dataDir, runner, options = {}) {
   const change = (id, method, body) => fetch(origin + '/api/agents/ceo/memory/' + id, {
     method, headers: { Authorization: auth, Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify(body)
   });
-  return { ...app, get, post, change };
+  const company = async (op, input = {}) => {
+    const response = await fetch(origin + '/api/company/' + op, { method: 'POST',
+      headers: { Authorization: auth, Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+    const result = await response.json();
+    assert.equal(response.status, 200, op + ': ' + JSON.stringify(result));
+    return result;
+  };
+  return { ...app, get, post, change, company };
 }
 
 async function until(operation) {
@@ -307,3 +318,42 @@ for (const [description, cap, options] of [
     } finally { store.close(); }
   });
 }
+
+test('default local company hires from a CEO conversation and resumes the same employee inbox after reopening', async t => {
+  const dataDir = await directory(t);
+  const start = () => listen(createApp({ dataDir, username, passwordHash }));
+  let app = await start();
+  t.after(() => app.close());
+  const { conversation } = await app.company('conversations.dm', { peerId: 'ceo' });
+  const post = { conversationId: conversation.id, requestId: 'hire-a-designer', text: 'hire Designer' };
+  const first = await app.company('messages.post', post);
+  assert.equal((await app.company('messages.post', post)).message.id, first.message.id);
+  await until(async () => {
+    const { messages } = await app.company('messages.list', { conversationId: conversation.id });
+    return messages.some(m => m.senderId === 'ceo' && m.replyTo === first.message.id && /Designer/.test(m.text));
+  });
+  const { agents } = await app.company('directory');
+  assert.equal(agents.length, 2);
+  const designer = agents.find(person => person.role === 'Designer');
+  assert.equal(designer.managerId, 'ceo');
+  assert.equal(designer.canHire, false);
+  await app.company('employee.pause', { agentId: designer.id, requestId: 'pause-designer' });
+  const dm = (await app.company('conversations.dm', { peerId: designer.id })).conversation;
+  const message = (await app.company('messages.post', { conversationId: dm.id, requestId: 'design-first', text: 'hello' })).message;
+  await app.close();
+  app = await start();
+  assert.equal((await app.company('directory')).agents.find(p => p.id === designer.id).desiredState, 'paused');
+  assert.equal((await app.company('messages.list', { conversationId: dm.id })).messages.length, 1);
+  await app.company('employee.resume', { agentId: designer.id, requestId: 'resume-designer' });
+  await until(async () => (await app.company('messages.list', { conversationId: dm.id })).messages
+    .some(m => m.replyTo === message.id && m.senderId === designer.id));
+  await app.company('employee.fire', { agentId: designer.id, requestId: 'fire-designer' });
+  assert.equal((await app.company('directory')).agents.find(p => p.id === designer.id).desiredState, 'fired');
+  assert.equal((await app.company('messages.list', { conversationId: dm.id })).messages.length, 2);
+  const ownerHire = { requestId: 'owner-hire', role: 'QA' };
+  const report = (await app.company('employee.hire', ownerHire)).employee;
+  assert.equal(report.managerId, 'ceo');
+  assert.equal(report.canHire, false);
+  assert.equal((await app.company('employee.hire', ownerHire)).employee.id, report.id);
+  assert.equal((await app.company('directory')).agents.length, 3);
+});

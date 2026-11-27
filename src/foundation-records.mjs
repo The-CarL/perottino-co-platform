@@ -84,10 +84,11 @@ export function makeSqliteRecords({ filename, db: suppliedDb }) {
       const { prefix, limit, after } = listOptions(options);
       return page(list.all(partition(pk), prefix, after ?? '', prefix, prefix, limit + 1), limit);
     },
-    async transact(changes) {
+    async transact(changes, authorize) {
       const batch = writes(changes);
       db.exec('BEGIN IMMEDIATE');
       try {
+        authorize?.();
         for (const { pk, sk, expect, data } of batch) {
           const row = select.get(pk, sk);
           const version = row?.data == null ? null : row.version;

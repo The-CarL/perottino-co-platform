@@ -4,9 +4,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createConsoleHandler } from './console-http.mjs';
 import { createOwnerAuth } from './auth.mjs';
-import { createTurnTools, runTurn, validateWorkerConnection } from './agent.mjs';
+import { createTurnTools, requestCompanyDecision, runTurn, validateWorkerConnection } from './agent.mjs';
 import { makeBrowser } from './browser.mjs';
 import { createStore } from './store.mjs';
+import { createLocalCompany } from './company-local.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 function createWorker(store, runner, browser, turnTimeoutMs, mode) {
@@ -104,21 +105,23 @@ function createWorker(store, runner, browser, turnTimeoutMs, mode) {
 }
 
 export function createApp({ dataDir, username, passwordHash, publicOrigin, runner = runTurn, browser = makeBrowser(),
-  publicDir = resolve(root, 'public'), turnTimeoutMs = 120000 } = {}) {
+  publicDir = resolve(root, 'public'), turnTimeoutMs = 120000, foundations = true, decide } = {}) {
   const mode = process.env.PEROTTINO_AGENT_MODE ?? 'local';
   if (!['local', 'bedrock'].includes(mode)) throw new Error('PEROTTINO_AGENT_MODE must be local or bedrock.');
-  if (mode === 'bedrock' && runner === runTurn) validateWorkerConnection();
+  if (mode === 'bedrock' && (foundations ? !decide : runner === runTurn)) validateWorkerConnection();
   if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs <= 0) throw new Error('Invalid turn timeout.');
   const auth = createOwnerAuth({ username, passwordHash, publicOrigin });
   const store = createStore(dataDir);
-  const worker = createWorker(store, runner, browser, turnTimeoutMs, mode);
+  const worker = foundations ? createLocalCompany({ dataDir, store, mode,
+    decide: decide ?? (mode === 'bedrock' ? requestCompanyDecision : undefined), browse: browser, turnTimeoutMs })
+    : createWorker(store, runner, browser, turnTimeoutMs, mode);
   const ownerControl = action => {
     const result = store.setEmployeeState(action);
     if (result.ok && result.employee.desiredState !== 'active') worker.suspend(action.agentId);
     if (result.ok && result.employee.desiredState === 'active') setImmediate(worker.wake);
     return result;
   };
-  const server = createServer(createConsoleHandler({ store, auth, publicDir, mode, onEnqueued: worker.wake, ownerControl }));
+  const server = createServer(createConsoleHandler({ store, auth, publicDir, mode, onEnqueued: worker.wake, ownerControl, company: worker.company }));
   server.headersTimeout = 15000;
   server.requestTimeout = 30000;
   let closing;
@@ -126,6 +129,7 @@ export function createApp({ dataDir, username, passwordHash, publicOrigin, runne
     closing ??= (async () => {
       const httpClosed = server.listening ? new Promise(resolve => server.close(resolve)) : Promise.resolve();
       await Promise.all([httpClosed, worker.stop()]);
+      worker.close?.();
       store.close();
     })();
     return closing;

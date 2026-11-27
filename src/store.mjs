@@ -74,6 +74,14 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
     CREATE TABLE IF NOT EXISTS hire_receipt (
       turn_id TEXT PRIMARY KEY REFERENCES turn(id), agent_id TEXT NOT NULL REFERENCES agent(id)
     );
+    CREATE TABLE IF NOT EXISTS local_pulse (
+      agent_id TEXT PRIMARY KEY REFERENCES agent(id), generation INTEGER NOT NULL,
+      at INTEGER NOT NULL, summary TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS company_hire_receipt (
+      manager_id TEXT NOT NULL REFERENCES agent(id), request_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+      employee_id TEXT NOT NULL REFERENCES agent(id), PRIMARY KEY(manager_id, request_id)
+    );
     CREATE TABLE IF NOT EXISTS goal (
       id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agent(id), request_id TEXT NOT NULL,
       turn_id TEXT UNIQUE NOT NULL REFERENCES turn(id), text TEXT NOT NULL, checkpoint TEXT NOT NULL DEFAULT '',
@@ -104,11 +112,29 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
   });
 
   const getAgent = id => db.prepare('SELECT id, name, handle, role FROM agent WHERE id=?').get(id);
-  function employee(id) {
-    const row = db.prepare(`SELECT a.*, e.manager_id AS managerId,e.desired_state AS desiredState,
-      e.generation, e.can_hire AS canHire FROM agent a JOIN employment e ON e.agent_id=a.id WHERE a.id=?`).get(id);
-    if (!row) return null;
-    return { ...row, canHire: Boolean(row.canHire), runtimeStatus: row.desiredState === 'active' ? 'Local worker' : 'Stopped' };
+  const roster = `SELECT a.*,e.manager_id AS managerId,e.desired_state AS desiredState,
+    e.generation,e.can_hire AS canHire FROM agent a JOIN employment e ON e.agent_id=a.id`;
+  function employeeView(row) {
+    return row ? { ...row, canHire: Boolean(row.canHire), runtimeStatus: row.desiredState === 'active' ? 'Local worker' : 'Stopped' } : null;
+  }
+  function employee(id) { return employeeView(db.prepare(roster + ' WHERE a.id=?').get(id)); }
+  function createEmployee(manager, role) {
+    if (typeof role !== 'string' || !role.trim() || role.length > 120) throw Object.assign(new Error('Invalid employee role.'), { status: 400 });
+    if (db.prepare("SELECT COUNT(*) AS total FROM employment WHERE desired_state<>'fired'").get().total >= employeeLimit)
+      throw Object.assign(new Error('Employee limit reached.'), { code: 'EMPLOYEE_LIMIT', status: 409 });
+    const names = ['Iris','Robin','Ari','Sasha','Elio','Morgan','Sam','Nora'];
+    let index = db.prepare('SELECT COUNT(*) AS n FROM agent').get().n - 1;
+    let name, handle;
+    do {
+      const suffix = Math.floor(index / names.length);
+      name = names[index % names.length] + (suffix ? ' ' + (suffix + 1) : '');
+      handle = name.toLowerCase().replace(' ', '-');
+      index++;
+    } while (db.prepare('SELECT 1 FROM agent WHERE name=? COLLATE NOCASE OR handle=? COLLATE NOCASE').get(name, handle));
+    const id = randomUUID();
+    db.prepare('INSERT INTO agent(id,name,handle,role) VALUES(?,?,?,?)').run(id, name, handle, role.trim());
+    db.prepare('INSERT INTO employment(agent_id,manager_id) VALUES(?,?)').run(id, manager.id);
+    return employee(id);
   }
   function mustAcceptWork(agentId) {
     if (employee(agentId)?.desiredState === 'fired')
@@ -141,6 +167,15 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
     directory: () => db.prepare('SELECT id, name, handle, role FROM agent ORDER BY rowid').all(),
     getAgent,
     employee,
+    listEmployees: () => db.prepare(roster + ' ORDER BY a.rowid').all().map(employeeView),
+    getPulse: id => db.prepare('SELECT generation,at,summary FROM local_pulse WHERE agent_id=?').get(id),
+    recordLocalPulse(id, generation, summary) {
+      const result = db.prepare(`INSERT INTO local_pulse (agent_id,generation,at,summary)
+        SELECT agent_id,generation,?,? FROM employment WHERE agent_id=? AND generation=? AND desired_state='active'
+        ON CONFLICT(agent_id) DO UPDATE SET generation=excluded.generation,at=excluded.at,summary=excluded.summary`)
+        .run(Date.now(), summary, id, generation);
+      return result.changes === 1;
+    },
     listGoals: agentId => db.prepare(goalQuery + ' WHERE g.agent_id=? ORDER BY g.rowid DESC LIMIT 20').all(agentId),
     assignGoal(agentId, text, requestId) {
       return transaction(() => {
@@ -153,9 +188,14 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
         return { goal: insertGoal(agentId, text, requestId), conflict: false };
       });
     },
-    setEmployeeState({ agentId, operation, requestId }) {
+    setEmployeeState({ agentId, operation, requestId, callerId, generation }) {
       return transaction(() => {
         const current = employee(agentId);
+        if (callerId) {
+          const caller = employee(callerId);
+          if (caller?.desiredState !== 'active' || caller.generation !== generation || !caller.canHire ||
+              operation !== 'fire' || current?.managerId !== callerId) return { ok: false, status: 403 };
+        }
         if (!current) return { ok: false, status: 404 };
         const receipt = db.prepare('SELECT operation FROM employment_action WHERE agent_id=? AND request_id=?').get(agentId, requestId);
         if (receipt) return receipt.operation === operation ? { ok: true, employee: current } : { ok: false, status: 409 };
@@ -177,6 +217,27 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
         return { ok: true, employee: employee(agentId) };
       });
     },
+    hireCompanyEmployee(callerId, generation, input) {
+      return transaction(() => {
+        const managerId = callerId === 'owner' ? 'ceo' : callerId;
+        const manager = employee(managerId);
+        if (manager?.desiredState !== 'active' || (callerId !== 'owner' && (manager.generation !== generation || !manager.canHire))) {
+          throw Object.assign(new Error('This employee cannot hire.'), { status: 403 });
+        }
+        const { requestId, role, goalId, title, acceptance } = input;
+        const receiptKey = callerId + '/' + requestId;
+        const fingerprint = JSON.stringify([role, goalId ?? null, title ?? null, acceptance ?? null]);
+        const prior = db.prepare('SELECT employee_id,fingerprint FROM company_hire_receipt WHERE manager_id=? AND request_id=?').get(managerId, receiptKey);
+        if (prior) {
+          if (prior.fingerprint !== fingerprint) throw Object.assign(new Error('Hiring request already used.'), { status: 409 });
+          return employee(prior.employee_id);
+        }
+        const hire = createEmployee(manager, role);
+        db.prepare('INSERT INTO company_hire_receipt(manager_id,request_id,fingerprint,employee_id) VALUES(?,?,?,?)')
+          .run(managerId, receiptKey, fingerprint, hire.id);
+        return hire;
+      });
+    },
     hireForTurn(job, role, assignment) {
       return transaction(() => {
         const manager = employee(job.agent.id);
@@ -185,16 +246,7 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
         if (!lease || manager?.desiredState !== 'active' || !manager.canHire) throw new Error('This employee cannot hire.');
         const existing = db.prepare('SELECT agent_id FROM hire_receipt WHERE turn_id=?').get(job.message.id);
         if (existing) return employee(existing.agent_id);
-        if (db.prepare("SELECT COUNT(*) AS total FROM employment WHERE desired_state<>'fired'").get().total >= employeeLimit)
-          throw Object.assign(new Error('Employee limit reached.'), {code:'EMPLOYEE_LIMIT'});
-        if (typeof role !== 'string' || !role.trim() || role.length > 120) throw new Error('Invalid employee role.');
-        const names = ['Iris','Robin','Ari','Sasha','Elio','Morgan','Sam','Nora'];
-        const count = db.prepare('SELECT COUNT(*) AS n FROM agent').get().n - 1;
-        const base = names[count % names.length], suffix = Math.floor(count / names.length);
-        const name = base + (suffix ? ' ' + (suffix + 1) : ''), handle = name.toLowerCase().replace(' ', '-');
-        const id = randomUUID();
-        db.prepare('INSERT INTO agent(id,name,handle,role) VALUES(?,?,?,?)').run(id, name, handle, role.trim());
-        db.prepare('INSERT INTO employment(agent_id,manager_id) VALUES(?,?)').run(id, manager.id);
+        const { id } = createEmployee(manager, role);
         db.prepare('INSERT INTO hire_receipt(turn_id,agent_id) VALUES(?,?)').run(job.message.id, id);
         if (assignment) insertGoal(id, assignment, 'hire/' + job.message.id, manager.id);
         return employee(id);
