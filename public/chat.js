@@ -272,35 +272,86 @@ function workList(kind, items, emptyText) {
   }
   return rows;
 }
-function eventList(events) {
+// Business activity shows consequences and relevant work. Identifiers for private
+// communications and provider actions appear only on the audited owner read.
+function auditEventDetails(event) {
+  const rows = [];
+  for (const [key, title] of [
+    ['policyVersion', 'Policy revision'],
+    ['managerId', 'Manager'],
+    ['accountableId', 'Accountable employee'],
+    ['assigneeId', 'Assignee'],
+    ['reviewerId', 'Reviewer'],
+    ['amountKind', 'Amount type'],
+    ['amountCents', 'Amount (USD)'],
+    ['purpose', 'Purpose'],
+    ['reasonCode', 'Reason'],
+    ['projectId', 'Project ID'],
+    ['goalId', 'Goal ID'],
+    ['taskId', 'Task ID'],
+    ['jobId', 'Job ID'],
+    ['buildId', 'Build ID'],
+    ['grantId', 'Hiring grant'],
+    ['fundingGrantId', 'Funding grant'],
+    ['proposalId', 'Proposal ID'],
+    ['reservationId', 'Reservation ID'],
+    ['resourceId', 'Resource ID'],
+    ['threadId', 'Email thread ID'],
+    ['conversationId', 'Conversation ID'],
+    ['messageId', 'Message ID'],
+    ['browserSessionId', 'Browser session ID'],
+    ['browserProfileId', 'Browser profile ID'],
+    ['traceId', 'Trace ID'],
+  ]) {
+    const value = event[key];
+    if (value === undefined || value === null) continue;
+    if (key === 'amountCents') rows.push([title, currency(value)]);
+    else if (['managerId', 'accountableId', 'assigneeId', 'reviewerId'].includes(key))
+      rows.push([title, nameOf(value)]);
+    else if (['amountKind', 'reasonCode', 'purpose'].includes(key)) rows.push([title, label(value)]);
+    else rows.push([title, el('code', {}, String(value))]);
+  }
+  if (rows.length)
+    return el('details', { class: 'event-trace' }, el('summary', {}, 'Audit details'), facts(rows));
+}
+
+function eventList(events, audited = false) {
   if (!events.length) return empty('Company activity will appear here.');
   return el(
     'ol',
     { class: 'rows' },
     events.map((event) => {
-      const what = label(event.kind);
-      const who = event.employeeId
-        ? nameOf(event.actor) + ' → ' + nameOf(event.employeeId)
-        : nameOf(event.actor);
-      const details = [who, date(event.at || event.createdAt)].filter(Boolean).join(' · ');
-      const related = event.taskId
-        ? btn('Open task', () => showWork('tasks', event.taskId), { class: 'link' })
-        : event.goalId
-          ? btn('Open goal', () => showWork('goals', event.goalId), { class: 'link' })
-          : null;
-      const trace = event.traceId
-        ? el(
-            'details',
-            { class: 'event-trace' },
-            el('summary', {}, 'Trace ID'),
-            el('code', {}, event.traceId),
-          )
-        : null;
+      const who = event.actor ? nameOf(event.actor) : '';
+      const people = [who, event.employeeId && nameOf(event.employeeId)].filter(Boolean).join(' → ');
+      const details = [people, date(event.at || event.createdAt), event.status && label(event.status)]
+        .filter(Boolean)
+        .join(' · ');
+      const related = el('div', { class: 'actions' });
+      if (event.taskId)
+        related.append(btn('Open task', () => showWork('tasks', event.taskId), { class: 'link' }));
+      if (event.goalId)
+        related.append(btn('Open goal', () => showWork('goals', event.goalId), { class: 'link' }));
       return el(
         'li',
         { class: 'row event' },
         el('span', { class: 'event-mark', 'aria-hidden': 'true' }),
-        el('div', {}, el('strong', {}, what), el('small', {}, details), related, trace),
+        el(
+          'div',
+          {},
+          el('strong', {}, label(event.kind)),
+          el('small', {}, details),
+          related.childElementCount ? related : null,
+          audited
+            ? auditEventDetails(event)
+            : event.traceId
+              ? el(
+                  'details',
+                  { class: 'event-trace' },
+                  el('summary', {}, 'Trace ID'),
+                  el('code', {}, event.traceId),
+                )
+              : null,
+        ),
       );
     }),
   );
@@ -891,7 +942,7 @@ async function auditLog() {
       events.push(...result.events);
       after = result.next;
       more.hidden = !after;
-      rows.replaceChildren(eventList(events));
+      rows.replaceChildren(eventList(events, true));
     } finally {
       more.disabled = false;
     }

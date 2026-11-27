@@ -710,6 +710,12 @@ input[type='checkbox'] {
   color: var(--soft);
 }
 
+.event > div {
+  min-width: 0;
+}
+.event-trace .details {
+  overflow-wrap: anywhere;
+}
 .event-trace summary {
   cursor: pointer;
 }

@@ -5,6 +5,7 @@ import { hashPassword } from '../src/auth.mjs';
 import { createCloudHandler } from '../src/cloud-api.mjs';
 import { makeSqliteRecords } from '../src/foundation-records.mjs';
 import { createCompanyService } from '../src/company-service.mjs';
+import { eventRows } from '../src/company-events.mjs';
 
 test('shipping Gateway handler scopes Chat to the owner and audits explicit read-only Admin inspection',async t => {
   const origin = 'https://owner.example.test';
@@ -24,6 +25,23 @@ test('shipping Gateway handler scopes Chat to the owner and audits explicit read
   const message = (await command('ceo','messages.post',{conversationId:kai.id,text:'Private team discussion',requestId:'private'})).message;
   await command('kai','memory.save',{conversationId:kai.id,sourceMessageId:message.id,text:'Team context',requestId:'remember'});
   await assert.rejects(command('owner','memory.list',{conversationId:kai.id,employeeId:'kai'}),{status:404});
+  const { goal } = await command('owner', 'goal.create', {
+    outcome:'Audit the reporting change', successCriteria:'Reviewed deliverable', accountableId:'ceo',requestId:'ui-goal',
+  });
+  const { task } = await command('owner', 'task.create', {
+    goalId:goal.id, title:'Reconcile the ledger', acceptance:'Evidence recorded', assigneeId:'kai',requestId:'ui-task',
+  });
+  const auditEvents = [
+    ['budget.settle', {employeeId:'kai', policyVersion:3, projectId:'p-9', fundingGrantId:'g-2',
+      amountKind:'spend', amountCents:125, purpose:'model', taskId:task.id}],
+    ['delivery.build', {projectId:'p-9', buildId:'b-8', taskId:task.id, status:'passed'}],
+    ['infra.active', {projectId:'p-9', resourceId:'i-7', status:'active'}],
+    ['browser.started', {browserSessionId:'bs-6', browserProfileId:'profile-5', status:'active'}],
+    ['mail.sent', {threadId:'th-4', messageId:'m-3', subject:'Excluded subject'}],
+  ];
+  for (const [kind, metadata] of auditEvents) {
+    assert(await records.transact(eventRows(kind, {actor:'ceo', ...metadata}, 'ui-audit-'+kind)));
+  }
   const handle = createCloudHandler({company,publicOrigin:origin,readOwner:async()=>({username:'owner',passwordHash})});
   const browser = await chromium.launch({executablePath:process.env.PEROTTINO_CHROMIUM_PATH || undefined});
   t.after(()=>browser.close());
@@ -55,6 +73,29 @@ test('shipping Gateway handler scopes Chat to the owner and audits explicit read
   const audits = (await records.list('company-events')).items.filter(e=>e.kind.startsWith('admin.'));
   assert.ok(audits.some(e=>e.kind==='admin.messages.read' && e.actor==='owner' && e.conversationId===kai.id));
   assert.doesNotMatch(JSON.stringify(audits),/Private team discussion|Team context/);
+  await page.getByRole('button',{name:'Audit log'}).click();
+  const audit = page.locator('#dialog');
+  async function inspectEvent(name, labels, values) {
+    const row = audit.locator('.event').filter({has:page.getByText(name,{exact:true})});
+    await row.getByText('Audit details',{exact:true}).click();
+    for (const title of labels) await row.getByText(title,{exact:true}).waitFor();
+    for (const value of values) await row.getByText(value,{exact:true}).waitFor();
+    return row;
+  }
+  await inspectEvent('Delivery build',['Build ID'],['b-8']);
+  await inspectEvent('Infra active',['Resource ID'],['i-7']);
+  await inspectEvent('Browser started',['Browser session ID','Browser profile ID'],['bs-6','profile-5']);
+  await inspectEvent('Mail sent',['Email thread ID','Message ID'],['th-4','m-3']);
+  assert.doesNotMatch(await audit.innerText(),/Private team discussion|Team context|Excluded subject/);
+  const spending = await inspectEvent('Budget settle',['Policy revision','Project ID','Funding grant','Amount type','Amount (USD)','Purpose'],
+    ['3','p-9','g-2','Spend','$1.25','Model']);
+  await spending.getByRole('button',{name:'Open task'}).click();
+  await audit.getByRole('heading',{name:'Reconcile the ledger'}).waitFor();
+  await page.locator('#dialog-close').click();
+  await page.locator('#nav-activity').click();
+  await page.locator('#content').getByText('Delivery build',{exact:true}).waitFor();
+  const headline = await page.locator('#content').innerText();
+  assert.doesNotMatch(headline,/bs-6|th-4|profile-5|Private team discussion|Excluded subject|Audit details/);
   await page.locator('#nav-chat').click();
   await page.locator('#timeline').getByText('Owner conversation',{exact:true}).waitFor();
   assert.equal(await page.getByText('Private team discussion').count(),0);
