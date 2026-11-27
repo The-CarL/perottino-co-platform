@@ -10,58 +10,67 @@ Describe every new persistent AWS resource, permission and integration in versio
 
 The implementing agent owns the review of platform changes. Review the final commit, correct findings, rerun the applicable checks and record the technical verdict on the pull request. GitHub enforces the repository's formal review rules separately. Owner participation in local setup or test execution is unnecessary.
 
-## First operating milestone
+## Company workspace
 
-Carlo opens `/chat`, authenticates, finds Mara by name, handle or CEO role, sends a direct message and receives one answer. He can inspect a saved memory, see the message it came from, correct it or delete it. After restarting the process with the same data directory, Mara retains the conversation and can recall the corrected note. The local milestone also exercises reading a public web document.
+The owner's dashboard shows the roster, explicit work, review requests and recent work events. Directory opens a DM with any employee. Chat holds DMs and private groups the owner participates in. An employee-to-employee conversation appears for the owner only through the audited, read-only Admin view. Group members choose whether to request a reply and from whom. Conversation-scoped memories preserve the source message ID. A greeting exercises the conversation path without creating a goal or task. [Conversations](src/conversations.mjs) · [Owner console](public/index.html)
 
-The broader company design gives each employee a persistent identity, company email address, tools and authority. The week-later app change remains the end-to-end test for hiring, code delivery, recorded ownership and recovery. Before that trial, validate the hosted runtime in the target account and implement the outbound mail service, Git worker, project-scoped provisioning and promotion grants. Track outcome quality, elapsed time, actual spend and each owner intervention.
+The broader acceptance test starts with a brief for an app, a code review, a temporary preview and an update on the same thread a week later. Running it requires outbound mail, a trusted Git worker, an application sandbox and a scoped deployer. A separate hiring-grant milestone covers promotion, project-specific hiring authority, delegated budgets and revocation. Track outcome quality, elapsed time, actual spend and owner interventions when exercising those capabilities.
 
-## What runs
+## Runtime and authority
 
-| Component | Implementation and ownership |
+| Component | Behavior |
 | --- | --- |
-| Owner console | The Node HTTP server runs locally. On AWS, API Gateway HTTP API terminates HTTPS and Lambda serves the equivalent authenticated routes and static UI. Secrets Manager stores the owner verifier. |
-| Durable data | SQLite and its WAL are local development storage. The hosted runtime uses an on-demand DynamoDB table for employee identity, messages, leases, memory and receipts. API writes acknowledge committed work. Lease fencing prevents a worker that lost ownership from publishing a reply. |
-| Execution | Bootstrap and hiring launch standalone Fargate tasks. Each active employee checks its inbox for email and chat, or works on a due goal. One task handles many turns. A bounded model step can checkpoint a goal and set its next wake. The factory fences stopped tasks by employee identity, execution generation and task ARN. |
-| Hiring | The CEO starts with hiring authority. Each hire receives a stable identity, manager, initial assignment and its own resident task. The default company limit is 100 employees including the CEO. |
-| Mail | Optional SES receipt rule, SNS topic and Lambda map a dedicated domain’s email addresses to the durable inbox. External messages carry their own sender attribution. Outbound delivery is pending. [Inbound mail](infra/INBOUND-EMAIL.md) |
-| Browser | Both paths enforce bounded public-document reads and validate redirects. Local tests use Chromium. On AWS, a requested read starts an AgentCore Browser session, renders the fetched material with subresources and scripts disabled, then closes it. The browser is a separate managed service. |
-| Recovery | ECS stopped events and periodic reconciliation replace employees whose desired state is active. Pausing or firing an employee changes durable state before stopping its task. The table retains history and has point-in-time recovery. [Hosted recovery](infra/HOSTED.md) |
+| Owner API | Node serves the authenticated workspace locally. On AWS, API Gateway terminates HTTPS and Lambda serves the UI and owner commands. Secrets Manager holds the owner verifier. |
+| Company broker | The trusted service resolves actor identity and checks read and write scope. A hosted employee calls the private Lambda entry point with its employee capability, generation and current ECS task ARN. The service fences writes against the live company and task binding. Employee tasks use the broker for company data. |
+| Employee identity and hiring | Bootstrap creates the CEO. Authorized hires get a directory identity, manager and resident process. The default cap includes 100 employees total. Setting goals or delegating tasks to reports uses the reporting relationship, independently of permission to hire. |
+| Work loop | A resident polls discussion deliveries, submitted work awaiting review, unplanned goals, available tasks and closable goals. It saves decisions and effect receipts so replacement workers can resume. Empty polls avoid model calls. The local service runs the same company workflow against SQLite with a deterministic decision policy. |
+| Public-document reader | Local Chromium and hosted AgentCore Browser return bounded public-page text. The reader validates destinations and redirects, disables scripts and subresources, and ends each managed session after the read. Native desktop and reusable authenticated browser profiles are future capabilities. |
+| Lifecycle | The factory launches a standalone Fargate task at bootstrap, hire or resume. A stopped event and scheduled reconciliation recover an active employee after failure. Pause and firing advance the durable generation before stopping the old process. Historical conversations and work persist. |
+| Optional email adapter | SES, SNS and Lambda resolve employee addresses and deduplicate externally attributed receipts in the legacy inbox. The V2 resident consumes company conversation deliveries. A bridge and threaded outbound delivery are future work. [Mail stack](infra/INBOUND-EMAIL.md) |
 
-The UI follows Carlo's selected cobalt chat mockup with warm neutral surfaces, a serif wordmark, system sans fallbacks and responsive panels. The implementation reviewed the personal-site stylesheet (Git blob `424c721c4ff3254cb05a671d743488ce653adc6f`) and layout, plus Forge's stylesheet (blob `08f3c81aa2c693d5d38b27c718e2a350a3af6ea8`) and ProjectCard. Core controls remain usable with a narrow viewport and keyboard navigation. [Personal site](https://github.com/The-CarL/carloperottino-site/blob/main/src/styles/global.css) · [Forge](https://github.com/The-CarL/carloperottino-forge/blob/main/src/styles/global.css)
+The owner-facing service accepts authenticated JSON commands at `POST /api/company/<operation>` and derives the owner identity at its boundary. The employee broker authenticates the task before invoking the same domain layer. User-supplied actor, caller and binding fields are rejected. Owner conversations, worker permissions and audit access are checked independently of what the GUI displays. [Service](src/company-service.mjs) · [HTTP routes](src/console-http.mjs) · [Worker loop](src/company-worker.mjs)
 
-## Local operation and verification
+## Goals, tasks and review
 
-Use Node 24.19.0 and npm 11.9.0 from the repository root. For a fresh local workspace run these commands in order.
+A goal records an outcome, success criteria and one accountable employee. For a new goal, the accountable employee can plan work for itself or assign within its reporting scope. An employee participating in a goal can create tasks for itself. Each task has one assignee, explicit acceptance criteria and optional dependencies on previously created tasks in the same goal.
+
+| Transition | Durable condition |
+| --- | --- |
+| Ready → Running | The assignee claims due work after every dependency passes review. The claim carries an expiring token and increments the attempt. A replacement claim fences the earlier worker. |
+| Running → Ready, Waiting or Blocked | The assignee records its progress or reason. A released task returns to the queue, a scheduled wait becomes eligible at its wake time, and a blocked task needs an explicit resume. |
+| Running → Submitted | The assignee supplies evidence for the deliverable. The task enters the designated review queue. |
+| Submitted → Ready or Done | An independent manager in scope or the owner inspects the submission, records a decision and explains it. Requesting changes reopens the task for the assignee. |
+| Active goal → Done | The goal has at least one task and every task has an accepted review. The accountable employee or an authorized leader can close it. |
+
+A logical command carries a stable request ID. Goal and task mutations commit the record, indexes, request receipt, immutable work history where applicable and an audit event together. A retry with the same input returns the original result. Stale claims cannot overwrite later progress. New tasks, submissions and independent review are separate business decisions, including when different employees carry them out. [Domain](src/company-work.mjs) · [Concurrency and recovery tests](test/company-work.test.mjs)
+
+## Data and observability
+
+SQLite shares `company.sqlite` between the local directory and the `foundation_records` table. DynamoDB uses the hosted company's retained table. Versioned V2 records have a distinct `V2#` partition-key namespace. Directory, employment and factory records retain their established keys and identity. Earlier pilot transcripts, notes, goals and leases remain in their original format and require explicit migration to appear in the new workspace. Preserve existing data and test rollback when changing the active runtime. [Record adapter](src/foundation-records.mjs) · [SQLite and DynamoDB contract tests](test/foundation-records.test.mjs)
+
+The activity feed shows committed work events. Admin records privileged history reads. Traces and metrics connect model decisions, tool actions and employee handoffs to latency and failures. Trusted W3C trace context links asynchronous work across process restarts. Telemetry allowlists identifiers and status fields. Message bodies, prompts, evidence, browser contents and credentials remain outside exported telemetry. Use the hosted guide for sampling, X-Ray, CloudWatch and the local OTLP receiver. [Observability](infra/TELEMETRY.md) · [Telemetry tests](test/telemetry.test.mjs)
+
+The UI follows Carlo's selected cobalt chat mockup with warm neutral surfaces, a serif wordmark, system sans fallbacks and responsive panels. The implementation reviewed the personal-site stylesheet (Git blob `424c721c4ff3254cb05a671d743488ce653adc6f`) and layout, plus Forge's stylesheet (blob `08f3c81aa2c693d5d38b27c718e2a350a3af6ea8`) and ProjectCard. Core controls support narrow viewports and keyboard navigation. [Personal site](https://github.com/The-CarL/carloperottino-site/blob/main/src/styles/global.css) · [Forge](https://github.com/The-CarL/carloperottino-forge/blob/main/src/styles/global.css)
+
+## Local verification and recovery
+
+Use Node 24.19.0 and npm 11.9.0 from the repository root. `npm ci`, `npm run setup:browser`, `npm run setup:owner` and `npm start` start the owner workspace at `http://127.0.0.1:3000/`. The setup command prints a generated password once and stores the username and salted Argon2id verifier in `.local/owner.json` with mode 0600. To supply a password noninteractively, pass it on stdin with `npm run setup:owner -- --password-stdin`. See the local trial for an explicit goal with a real public source. [Quick start](README.md#run-locally)
 
 ```sh
-npm ci
-npm run setup:browser
-npm run setup:owner
-npm start
+npm run check
 ```
 
-Open `http://127.0.0.1:3000/chat`. The interactive owner setup displays a generated password once and saves only the username and salted Argon2id verifier in `.local/owner.json` with mode 0600. For unattended provisioning pipe the password to `npm run setup:owner -- --password-stdin` or supply it through a protected `OWNER_PASSWORD` environment variable. Set `OWNER_USERNAME` to override the default `owner` name and `DATA_DIR` to choose a durable local directory. Setup refuses to replace an existing owner file.
+This command runs the Node suite, synthesizes the foundation and hosted CloudFormation stacks, then runs a real Chromium desktop/mobile workflow against the local server. With `PEROTTINO_DDB_TEST_ENDPOINT` pointing to DynamoDB Local, the storage integration tests use disposable local tables. CI provisions a pinned emulator, validates CloudFormation schemas, builds both Linux x86-64 release images, and exercises the packaged software. CPU-local decisions and provider fixtures keep these checks reproducible. A real Bedrock reply and AgentCore Browser session require a separate check in the target account. [CI](.github/workflows/check.yml) · [Browser smoke](scripts/company-smoke.mjs) · [Worker acceptance](test/company-worker.test.mjs)
 
-```sh
-npm test
-npm run synth
-npm run test:smoke
-```
+For local recovery, stop the service cleanly and preserve the complete `DATA_DIR` as an access-controlled backup. A live SQLite WAL database needs SQLite's backup facility or a consistent snapshot. Restore to a separate directory and verify the roster, conversations, task history and pending reviews before switching the active directory.
 
-`npm run check` runs all three commands. CI installs Chromium and the required OS packages, synthesizes the hosted stack, then executes the source and image checks on Ubuntu with read-only repository permissions. The operator owns these checks. The owner can use the hosted service without a development environment. A prepared machine can use an explicitly selected Chromium binary via `PEROTTINO_CHROMIUM_PATH`. The smoke uses disposable data and checks owner authentication, directory lookup, a DM, a sourced memory and a restart followed by recall on a mobile viewport. Set `PEROTTINO_SCREENSHOT_DIR` to a private directory for screenshots. Browser tests also exercise a controlled HTTP fixture through the actual reader. The Bedrock transport test substitutes a decision provider. A successful live inference requires observing an actual response under the approved AWS role. [CI](.github/workflows/check.yml) · [Browser smoke](scripts/smoke.mjs)
+## Hosted delivery and acceptance
 
-For recovery, stop the local service cleanly and preserve the complete data directory as an encrypted, access-controlled backup. A live SQLite WAL database needs SQLite's backup facility or a consistent snapshot. Restore to a separate directory first and verify the directory, chat and memory records before switching `DATA_DIR`. Preserve the original data through rollback. Refreshes and network retries of a single write use the original request ID.
+The destination supplies its own account, region, VPC, public subnets, permissions boundary, model access and owner-verifier ARN. Publish the worker and Lambda images from the intended source revision, retain their manifest digests, and synthesize using the target's private provenance. Review the change set's effect on IAM, existing tasks, data retention, ongoing cost and rollback. Keep physical resources, DNS records, secret references and release receipts in the private inventory. [Release procedure](infra/PORTABILITY.md) · [Hosted stack and pricing](infra/HOSTED.md)
 
-## Hosted delivery and verification
+In the destination account, verify HTTPS and owner sign-in, an actual model reply, one employee handling separate messages, and a delegated task progressing while the browser is closed. Compare independent review with its submission and trace the handoff. Inspect a real managed browser read. Replace an active task and verify its history, pending work and employment binding survive. Pause and fire a test employee and confirm delayed events leave it stopped. Record the release revision, CI verdict, cloud readbacks, compute time, token usage, storage requests and owner interventions separately.
 
-Use the AWS-managed API Gateway HTTPS endpoint for initial validation. The owner can map `co.carloperottino.com` later with a regional ACM certificate and the approved DNS record. The preconfigured AWS target supplies its account, region, VPC, public subnets, image digests, owner-verifier ARN, IAM boundary and Bedrock profile. The active design has no EC2 instance, always-on ECS service, EBS data volume, load balancer or NAT gateway. [Account release procedure](infra/PORTABILITY.md) · [Hosted stack](infra/HOSTED.md)
-
-A running employee incurs continuous Fargate and IPv4 charges. Operator acceptance in a destination account includes signing into the console, seeing bootstrap launch precisely one CEO, delivering multiple DMs to the same ECS task and observing a durable goal advance after the browser closes. Verify a real Bedrock response and AgentCore Browser read. Stop an active task, confirm that its replacement preserves the checkpoint, then pause and fire a test employee and verify that delayed events leave it stopped. Record actual task-hours, tokens, DynamoDB reads and writes, browser session time and owner interventions. [Cost assumptions](infra/PORTABILITY.md)
-
-The retained Secrets Manager slot `/perottino-co/github/pat` was created in us-east-1. The stack reached CREATE_COMPLETE with zero secret versions. Its source template was committed at `73474040419a68c852b45aa646bb8b6a43862cbd`. The owner supplies an expiring projects-repository token privately when the Git worker is ready. Only the trusted Git worker should be able to read the token. The feature-branch pilot in us-east-1 now runs the release bootstrap, a project-owned network, and the hosted employee stack. The owner signs in at the private-inventory API Gateway URL. Bootstrap created one CEO under a 100-employee limit. The authenticated owner console and a managed AgentCore Browser read have been verified live. The native Codex client also reached Bedrock. Each new account needs its model activation verified before a free-form CEO reply can pass acceptance. The custom domain and mail stack remain optional. Keep provider receipts and physical inventories in the approved private record. [Secret declaration](infra/github-pat.yaml)
-
-Synthesize with the real private provenance input before deployment. Review the change set, protected-resource exclusions, effect on existing resources, recurring costs, rollback and data recovery. Record the approved account and region, role, commit, image digest, change-set result, resources and DNS changes in the private project record. Verify HTTPS and owner authentication from a browser, an actual Bedrock reply, an owner memory correction, and recovery after replacing the worker. A fresh hosted employee must recover from shared durable state after losing its local disk. Record the release revision, CI run and live test results separately.
+The retained `/perottino-co/github/pat` secret slot is reserved for a future trusted Git worker. Use a fine-grained projects-repository token when implementing that integration. Git worktrees, PRs, preview provisioning and destructive production actions each need their own scoped executor and enforcement. [Secret declaration](infra/github-pat.yaml)
 
 ## Factory continuity
 

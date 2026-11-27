@@ -1,12 +1,10 @@
 # Perottino & Co.
 
-The platform for an agent-run company in its owner's AWS account. This repository contains the employee runtime and owner console. Employees will publish their applications in the separate [company projects repository](https://github.com/The-CarL/perottino-co-projects).
-
-The first milestone runs locally and has a reusable AWS deployment definition. CI exercises the developer and container paths on every PR. Sign in, find Mara by name or the CEO role, send a direct message or assign a goal. Each active employee gets a standalone Fargate task at bootstrap or hire. Its messages, goals and memory survive a replacement task. The AWS pilot runs from the feature branch in us-east-1. It starts one CEO with a company limit of 100 employees. Its owner login and deployment inventory are held privately.
+Perottino & Co. is a workspace for running a company of AI employees in the owner's AWS account. Start with Mara, the CEO. Talk with her or other employees, assign an outcome, follow the tasks it generates, and inspect the evidence before accepting the result. Dashboard, Goals, Tasks, Activity, Chat, Directory and Admin use the same durable company records. Employee-built software belongs in the separate projects repository. [Company projects](https://github.com/The-CarL/perottino-co-projects)
 
 ## Run locally
 
-Use Git, Node 24.19.0, npm 11.9.0 and a host supported by Playwright Chromium. From the checkout, run the following commands. The first two lines use nvm to select the pinned Node version.
+Use Git, Node 24.19.0 and npm 11.9.0. From the checkout, run these commands. The first two select the pinned Node version with nvm.
 
 ```sh
 nvm install
@@ -18,21 +16,16 @@ npm run setup:owner
 npm start
 ```
 
-Open [the local chat](http://127.0.0.1:3000/chat) and sign in as `owner` using the password printed once by the setup command. On Linux, if Chromium reports missing system libraries, install its OS dependencies with `npx --no-install playwright-core install --with-deps chromium`.
+Open the workspace and sign in as `owner` with the password printed once by setup. On Linux, install any missing Chromium libraries with `npx --no-install playwright-core install --with-deps chromium`. The default local simulator needs no AWS or GitHub credentials. [Local workspace](http://127.0.0.1:3000/)
 
-In the directory, search for `@ceo` or `@mara`. Try sending these as separate messages.
+### Try a complete work cycle
 
-```text
-remember Every project handoff includes a preview URL.
-recall handoff
-browse https://example.com/
-```
+1. Open **Directory**, search for `@ceo` and select **Message Mara**. A greeting gets a reply and leaves the work queues empty. Send `hire Engineer` to exercise Mara's hiring authority in the local simulator. The new employee appears in Directory with Mara as manager.
+2. In **Goals**, choose **Create goal**. Set the outcome to `Read https://example.com/ and report the page title`, the success criteria to `The evidence includes the page URL and title`, and the accountable employee to the engineer. This trial requires internet access. The local employee can plan a task for itself, read the public document, and submit its evidence.
+3. In **Tasks**, open the submitted task. Read its acceptance criteria, evidence and history. Use **Review submission** to accept the work or request changes with a reason. An employee can submit its own work. Approval comes from its manager, another leader with scope, or the owner. Once all tasks pass review, the accountable employee can close the goal.
+4. In **Chat**, create a group and select its members. Choose which employees should reply to a message. Ordinary chat lists conversations the owner participates in. **Admin** provides an audited, read-only view into other company conversations. In the CEO DM, `remember Every handoff needs a preview URL.` and then `recall` demonstrate conversation-scoped notes. **Memory** links a note back to its source message.
 
-For a local hiring trial, send `hire Engineer` to Mara. Open the new employee from the directory, select **Employee**, and assign `remember Review the preview before release.` as a goal. The same dialog shows progress and provides pause, resume and fire controls. The local simulator supports deterministic work; the hosted employee uses Bedrock for free-form goals.
-
-Open **Memory** to inspect, correct or forget a saved note and follow it back to the original message. Correcting or forgetting a note keeps the original chat history. Stop the service with Ctrl-C and restart it in the same directory to recover the conversation.
-
-The default local worker handles these commands deterministically. Public web reads use Chromium to extract text from HTML or plain text, with redirects checked and scripts and external assets disabled. Browsing a real site requires internet access. Credentials, a GitHub token and AWS model access are unnecessary for the local demo.
+The local simulator follows a small deterministic policy. It can hire, manage notes, read public documents and submit retrieved material. It flags work that needs capabilities or judgment beyond that policy. The hosted resident uses the native Codex SDK with the configured Bedrock model. [Decision policy](src/company-decisions.mjs) · [Work rules](src/company-work.mjs)
 
 ## Verify from a clean checkout
 
@@ -42,50 +35,35 @@ npm run setup:browser
 npm run check
 ```
 
-The check runs the Node test suite, synthesizes the AWS foundation and the hosted stack into separate directories, then drives Chromium against the actual owner setup and chat server. The browser smoke test sends a desktop DM, verifies its saved note, restarts the server, recalls the note on a mobile viewport, and exercises hiring, goal assignment and lifecycle controls. Tests use temporary credentials, ephemeral loopback listeners, fixture web pages and temporary data directories. For screenshots, set `PEROTTINO_SCREENSHOT_DIR` when running `npm run test:smoke`. Dependencies and the matched browser download require network access on first installation. The test flow uses no AWS account or external model.
+The check runs the Node tests, synthesizes both CloudFormation stacks and drives Chromium against the real local server. The desktop and mobile smoke covers ordinary conversation, hiring, group membership, audited access, explicit goals and tasks, lifecycle controls and recovery after restart. It uses temporary data and fixture web pages. To capture screenshots, set `PEROTTINO_SCREENSHOT_DIR` when running `npm run test:smoke`. [Browser smoke](scripts/company-smoke.mjs)
 
-The GitHub Actions workflow performs the same check on Ubuntu with read-only repository permissions. [Check workflow](.github/workflows/check.yml)
+For the DynamoDB integration suites, set `PEROTTINO_DDB_TEST_ENDPOINT` to an explicitly local emulator, such as `http://127.0.0.1:8000`, before running `npm run check`. The workflow pins DynamoDB Local and builds both single-architecture images. First-time dependency and browser installs require network access. [CI workflow](.github/workflows/check.yml) · [Work tests](test/company-work.test.mjs) · [Conversation tests](test/conversations.test.mjs) · [Worker tests](test/company-worker.test.mjs)
 
-## Configuration and persistence
+## Persistence and configuration
 
 | Setting | Purpose |
 | --- | --- |
-| `DATA_DIR` | Local SQLite database and owner verifier. Defaults to `.local/`. Use the same directory across restarts. |
+| `DATA_DIR` | Local SQLite database and owner verifier. Defaults to `.local/`. Reuse the directory across restarts. |
 | `HOST`, `PORT` | Local HTTP listener. Defaults to `127.0.0.1` and `3000`. |
-| `OWNER_USERNAME`, `OWNER_PASSWORD_HASH` | Together override the local owner record. Production mode requires both. The hash uses the Argon2id verifier format emitted by the owner setup command. |
-| `PUBLIC_ORIGIN` | Exact HTTPS origin. In AWS the stack derives it from the HTTP API or optional custom domain. |
-| `PEROTTINO_AGENT_MODE` | `local` by default. `bedrock` sends free-form requests to the separately configured inference worker. |
-| `PEROTTINO_CHROMIUM_PATH` | Optional absolute path to a compatible system Chromium. The pinned Playwright browser is the normal setup. |
+| `OWNER_USERNAME`, `OWNER_PASSWORD_HASH` | Together override the local owner record. Production requires both. Owner setup emits an Argon2id verifier. |
+| `PUBLIC_ORIGIN` | Exact HTTPS origin for public access. The hosted stack derives it from the HTTP API or configured custom domain. |
+| `PEROTTINO_CHROMIUM_PATH` | Optional absolute path to a compatible local Chromium binary. |
 
-For noninteractive owner setup, pipe the password from a protected source into `npm run setup:owner -- --password-stdin`. The setup command writes a salted verifier with owner-only permissions. It refuses to overwrite an existing identity. Chat and notes live in `company.sqlite` alongside the verifier. For a consistent local backup, stop the service cleanly and copy the entire data directory to protected storage.
+For noninteractive setup, pipe the password from a protected source to `npm run setup:owner -- --password-stdin`. Setup creates the owner verifier with owner-only permissions and refuses to overwrite an existing one. Stop the local service cleanly and copy the entire data directory to protected storage for a consistent backup.
 
-### Hosted execution
+Company conversations, goals, tasks, receipts and events use the V2 record schema. SQLite stores these records alongside the roster in `company.sqlite`. On AWS the existing employee directory, reporting lines and lifecycle state stay in the retained DynamoDB table. New records use partition keys prefixed `V2#`. Earlier pilot chat, notes and in-flight work stay in their original records. They require an explicit migration to appear in the new workspace. [Storage contract](src/foundation-records.mjs)
 
-Bootstrap starts Mara as the first employee. An authorized hire creates a directory entry and a durable first assignment, then the factory calls ECS `RunTask` for the new employee. Each task stays alive across messages, checks its inbox and advances due goals on a pulse. Empty pulses consume Fargate time and DynamoDB reads. Bedrock is invoked for work that needs inference.
+## Hosted execution
 
-The owner console submits DMs, goals and lifecycle commands. Closing the browser leaves employees running. The factory records a pause or firing before it stops the task. An unexpected stop of an active employee triggers recovery from DynamoDB. Generation and task-identity checks protect against late work from an old task. The default headcount limit is 100, including Mara. Hiring fills the remaining 99 seats as work arrives.
+The owner signs into the API Gateway console. Inside the company, each active employee has one standalone Fargate task that polls for deliveries, planning, due work and reviews. The employee calls a trusted Lambda broker to access company data. The broker derives the actor from the authenticated task binding and enforces conversation membership, reporting scope and write conditions. Message delivery and task assignment reuse the existing employee process. The factory launches tasks at bootstrap, hire, resume or recovery. Pause and firing change durable state before the task stops. The default company cap is 100 employees, including the CEO.
 
-```mermaid
-flowchart LR
-    Owner --> Console[API Gateway and owner console]
-    Console -->|DM or goal| DDB[(DynamoDB)]
-    Console -->|Lifecycle control| Factory[Employee factory]
-    Factory -->|RunTask at bootstrap, hire or recovery| Task[Standalone Fargate employee]
-    Email[Optional SES inbound email] -->|SNS and mail Lambda| DDB
-    Task <-->|Inbox, goals and checkpoints| DDB
-    Task -->|Authorized hire| Factory
-    Task --> Bedrock
-    Task -->|Public web read| Browser[AgentCore Browser]
-    ECS[ECS stopped event or scheduled repair] --> Factory
-```
+A running employee incurs Fargate and public IPv4 charges while idle. Additional charges depend on model calls, database requests and storage, browser sessions, logs, traces and other AWS services. The standard AWS HTTPS endpoint works without a custom domain. The release runner publishes two Linux x86-64 images and synthesizes the stack from the destination account's private inputs. [Hosted operations and pricing](infra/HOSTED.md) · [Deployment procedure](infra/PORTABILITY.md) · [Observability](infra/TELEMETRY.md)
 
-The separate mail stack delivers scanned messages for employee handles and unambiguous role aliases. An incoming email is attributed to its external sender. Replies to external recipients require the future outbound mail service. [Inbound mail setup](infra/INBOUND-EMAIL.md)
+The optional SES adapter writes verified inbound deliveries to the earlier inbox format. Connecting email threads to current company conversations and delivering outbound email are future milestones. Project-scoped Git operations, preview deployment and promotion-based hiring grants are also future work. [Mail stack](infra/INBOUND-EMAIL.md) · [Foundation](infra/README.md) · [Engineering contract](ENGINEERING.md)
 
-## AWS infrastructure and Git credentials
+### Projects Git credential slot
 
-The projects Git worker's credential slot is declared in CloudFormation. The template specifies the secret name and retention and leaves its value empty. In the owner's account the name is **`/perottino-co/github/pat`**, in **`us-east-1`**. The owner can save a fine-grained GitHub PAT as its plaintext value in Secrets Manager. Scope it to `The-CarL/perottino-co-projects` with **Contents** and **Pull requests** set to **Read and write** for branch pushes and pull requests. Token values belong only in Secrets Manager. [Secret template](infra/github-pat.yaml)
-
-To reproduce the slot in a fresh target account, create a CloudFormation stack from the checked-in template using that target's reviewed provenance tags and scoped deployment identity. The name is unique per account and region. For an existing installation, look up its owning stack in the private inventory and review a change set against that stack. Updating the token value is a separate Secrets Manager operation and leaves source and templates unchanged.
+The separate CloudFormation template declares a retained Secrets Manager slot at `/perottino-co/github/pat`. For a new installation, use the destination account's reviewed provenance tags and scoped deployment identity. For an existing slot, use its owning stack from the private inventory. When the Git worker is implemented, the owner can supply a fine-grained token scoped to `The-CarL/perottino-co-projects` with **Contents** and **Pull requests** set to **Read and write**. [Secret template](infra/github-pat.yaml)
 
 ```sh
 aws cloudformation create-stack --region us-east-1 --stack-name "$PAT_STACK" \
@@ -95,8 +73,4 @@ aws secretsmanager list-secret-version-ids --region us-east-1 \
   --secret-id /perottino-co/github/pat --include-deprecated --query 'length(Versions)'
 ```
 
-Here `PAT_STACK` is the target stack name and `PRIVATE_TAG_FILE` is a private JSON array of CloudFormation `Key` and `Value` pairs. A newly created, unpopulated slot has zero versions.
-
-Use the standard AWS HTTPS endpoint or supply an approved custom domain. The release runner publishes two single-architecture images and synthesizes the hosted stack using the target account's inputs. [Deployment procedure](infra/PORTABILITY.md) · [Hosted operations and pricing](infra/HOSTED.md)
-
-Promotion grants, outbound email, the Git worker and application provisioning remain future milestones. The separate foundation template is available for future corporate files and shared work queues. [Foundation](infra/README.md) · [Engineering contract](ENGINEERING.md)
+`PAT_STACK` names the stack and `PRIVATE_TAG_FILE` contains the private array of CloudFormation tag keys and values. An empty slot has zero versions. Keep the token value in Secrets Manager.
