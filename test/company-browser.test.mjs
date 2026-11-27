@@ -7,7 +7,7 @@ import {tmpdir} from 'node:os';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
 import {createManagedBrowser} from '../src/company-browser.mjs';
-import {localInteractiveBrowser} from '../src/interactive-browser.mjs';
+import {agentCoreInteractiveBrowser,localInteractiveBrowser} from '../src/interactive-browser.mjs';
 import {makeSqliteRecords} from '../src/foundation-records.mjs';
 import {createCompanyFiles,localBlobs} from '../src/company-files.mjs';
 async function fixture(t,provider,profiles,options={}) {
@@ -110,4 +110,25 @@ test('managed browser diagnostics keep signed headers and browsing details out o
     ['browser_action','Only HTTP or HTTPS pages without embedded credentials are supported.','browser_page_origin'],
     ['browser_action','private unexpected value','browser_action'],
   ])assert.equal(browserFailure(stage,new Error(message)),expected);
+});
+
+test('reconnected managed sessions use a company tab and leave the provider landing page untouched', async t=>{
+  const {chromium}=await import('playwright-core');
+  const browser=await chromium.launch({chromiumSandbox:false});
+  t.after(()=>browser.close());
+  const context=await browser.newContext(),landing=await context.newPage();
+  await landing.goto('data:text/html,<title>private provider landing page</title>');
+  const provider=agentCoreInteractiveBrowser({region:'us-east-1',control:async()=>({
+    connect:async()=>({contexts:()=>[context],close:async()=>{}}),close(){},
+  })});
+  const first=await provider.action('session','browser.read',{});
+  assert.equal(first.url,'about:blank');assert.equal(first.title,'');
+  const company=context.pages().find(page=>page!==landing);
+  assert.ok(company);
+  await company.setContent('<title>Company work</title><p>resume me</p>');
+  const next=await provider.action('session','browser.read',{});
+  assert.equal(next.title,'Company work');assert.equal(next.text,'resume me');
+  assert.match((await provider.action('session','browser.frame',{})).dataUrl,/^data:image\/jpeg;base64,/);
+  await assert.rejects(provider.action('session','browser.navigate',{url:'data:text/html,test'}),/HTTP or HTTPS/);
+  assert.equal(context.pages().length,2);assert.equal(await landing.title(),'private provider landing page');
 });

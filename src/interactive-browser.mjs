@@ -33,16 +33,22 @@ async function operate(context,op,input,{origins,fixtureOrigin,deliveryOrigin}={
       await route.fulfill(response);
     }catch{await route.abort().catch(()=>{});}
   }
-  const pages=context.pages();
-  const page=pages[0]??await context.newPage();
+  // Managed Chromium may open a provider-owned landing tab (for example, a data:
+  // or chrome: URL). Never render, navigate or send input to that tab. CDP
+  // reconnections see the same company web tab alongside the landing tab.
+  let page=context.pages().find(p=>p.url()==='about:blank'||/^https?:\/\//i.test(p.url()));
+  if(!page) {
+    page=await context.newPage();
+    if(page.url()!=='about:blank')await page.goto('about:blank');
+  }
   const dismiss=dialog=>{void dialog.dismiss().catch(()=>{});};
   const popup=other=>{if(other!==page)void other.close().catch(()=>{});};
   page.on('dialog',dismiss);
   context.on('page',popup);
   await context.route('**/*',guard);
   try {
-    await page.setViewportSize(viewport);
     if(page.url()!=='about:blank')await check(page.url(),origins,fixtureOrigin,deliveryOrigin);
+    await page.setViewportSize(viewport);
     if(op==='browser.navigate') {
       await check(input.url,origins,fixtureOrigin,deliveryOrigin);
       await page.goto(input.url,{waitUntil:'domcontentloaded',timeout:10_000});
