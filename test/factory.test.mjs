@@ -27,7 +27,14 @@ async function fixture(t, foundations = false, overrides = {}) {
   const client = DynamoDBDocumentClient.from(raw), tasks = new Map(), launches = [], responses = [];
   const clock = { time:Date.now() }, flags = { loseLaunch:false, rejectLaunch:false, afterSleep:null };
   const now = () => clock.time;
-  const state = createFactoryState({ tableName,client }), store = createCloudStore({ tableName,client,now });
+  const stateClient = {async send(command) {
+    try {return await client.send(command);}
+    catch (error) {
+      if(flags.omitSeatReasons && command.input.TransactItems?.some(item=>item.Update?.Key?.sk==='SEATS')) delete error.CancellationReasons;
+      throw error;
+    }
+  }};
+  const state = createFactoryState({ tableName,client:stateClient }), store = createCloudStore({ tableName,client,now });
   const ecs = { async send(command) {
     const p = command.input;
     assert.equal(p.cluster, config.clusterArn);
@@ -238,11 +245,18 @@ test('a 100-person roster defers excess Fargate residents and preserves their wo
     const work=await f.factory.manager({operation:'company',callerId:waiter.id,generation:newEmployee.generation,
       taskArn:run.arn,capability:run.capability,requestId:randomUUID(),command:{op:'worker.poll',input:{workerId:run.arn}}});
     assert.equal(work.result.inbox.message.id,message.id);
+    f.flags.omitSeatReasons=true;
     const next=await hire('fifth-person');
     assert.equal((await f.store.employee(next.id)).taskArn,null);
     assert.equal((await owner('directory')).agents.length,5);
     assert.equal((await f.store.employee(incumbent.id)).desiredState,'paused');
-    await owner('employee.pause',{agentId:next.id,requestId:'pause-waiter'});
+    assert.deepEqual(await f.state.waiters(12),[{id:next.id,generation:1}]);
+    await owner('employee.pause',{agentId:waiter.id,requestId:'free-another-seat'});
+    await f.stopped(f.tasks.get(run.arn));
+    assert.ok((await f.store.employee(next.id)).taskArn);
     assert.deepEqual(await f.state.waiters(12),[]);
-    assert.equal(f.launches.length,4);
+    const last=await hire('queued-and-paused');
+    await owner('employee.pause',{agentId:last.id,requestId:'pause-waiter'});
+    assert.deepEqual(await f.state.waiters(12),[]);
+    assert.equal(f.launches.length,5);
   });

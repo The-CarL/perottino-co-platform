@@ -131,6 +131,7 @@ export function createFactoryState({ tableName = process.env.PEROTTINO_STATE_TAB
     },
     async reserve(id, lease, run, company, seat, enqueue = true) {
       const seatCondition = seat ? 'seat=:yes' : 'attribute_not_exists(seat)';
+      const limit = company.residentLimit ?? company.employeeLimit;
       try {
         await db.send(new TransactWriteCommand({ TransactItems: [
           { ConditionCheck: { TableName:tableName, Key:key('COMPANY'), ConditionExpression:'#v=:v AND #e=:yes AND #s=:no',
@@ -140,23 +141,35 @@ export function createFactoryState({ tableName = process.env.PEROTTINO_STATE_TAB
             ExpressionAttributeNames:{ '#r':'run' }, ExpressionAttributeValues:{ ':owner':lease, ':r':run, ':yes':true } } },
           ...(seat ? [] : [{ Update:{ TableName:tableName, Key:key('SEATS'), ConditionExpression:'attribute_not_exists(#n) OR #n<:limit',
             UpdateExpression:'ADD #n :one', ExpressionAttributeNames:{ '#n':'occupied' },
-            ExpressionAttributeValues:{ ':limit':company.residentLimit ?? company.employeeLimit, ':one':1 } } }]),
+            ExpressionAttributeValues:{ ':limit':limit, ':one':1 } } }]),
           { Delete:{TableName:tableName,Key:key('WAIT#'+id)} },
         ] }));
         return true;
       } catch (error) {
-        if (enqueue && !seat && error.name === 'TransactionCanceledException' && error.CancellationReasons?.[2]?.Code === 'ConditionalCheckFailed') {
-          try {
-            await db.send(new UpdateCommand({TableName:tableName,Key:key('WAIT#'+id),
-              UpdateExpression:'SET #g=:g',ConditionExpression:'attribute_not_exists(#g) OR #g<:g',
-              ExpressionAttributeNames:{'#g':'generation'},ExpressionAttributeValues:{':g':run.generation}}));
-          } catch (waitError) { if (contended(waitError)) return false; throw waitError; }
-          // Close the interval between the first failed reservation and becoming
-          // visible to the refill handler. Only a newly queued generation retries.
-          return this.reserve(id,lease,run,company,seat,false);
+        if (error.name !== 'TransactionCanceledException') throw error;
+        const reasons = error.CancellationReasons ?? [];
+        if (reasons.some(reason => !['None','ConditionalCheckFailed','TransactionConflict'].includes(reason.Code))) throw error;
+        if (reasons.slice(0,2).some(reason => reason.Code === 'ConditionalCheckFailed')) return false;
+        let full = !seat && reasons[2]?.Code === 'ConditionalCheckFailed';
+        if (!reasons.length) {
+          const [current,locked,seats] = await Promise.all([get('COMPANY'),get('RUN#'+id),get('SEATS')]);
+          if (current?.version !== company.version || !current.enabled || current.suspended ||
+              locked?.lockOwner !== lease || (locked.seat === true) !== seat) return false;
+          full = !seat && seats?.occupied >= limit;
+          if (!full) {
+            if (enqueue) return this.reserve(id,lease,run,company,seat,false);
+            throw error;
+          }
         }
-        if (error.name === 'TransactionCanceledException' && error.CancellationReasons?.some(r => r.Code === 'ConditionalCheckFailed')) return false;
-        throw error;
+        if (!full || !enqueue) return false;
+        try {
+          await db.send(new UpdateCommand({TableName:tableName,Key:key('WAIT#'+id),
+            UpdateExpression:'SET #g=:g',ConditionExpression:'attribute_not_exists(#g) OR #g<:g',
+            ExpressionAttributeNames:{'#g':'generation'},ExpressionAttributeValues:{':g':run.generation}}));
+        } catch (waitError) { if (contended(waitError)) return false; throw waitError; }
+        // Close the interval between the first failed reservation and becoming
+        // visible to the refill handler. Only a newly queued generation retries.
+        return this.reserve(id,lease,run,company,seat,false);
       }
     },
     async unlock(id, lease, empty) {
