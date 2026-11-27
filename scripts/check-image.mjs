@@ -109,7 +109,7 @@ try {
   stop(web);
   stop(broker);
   console.log('Packaged foundation owner API and employer broker, real worker heartbeat, scoped message delivery and durable employee reply passed.');
-  console.log('Packaged API, two successive messages served by one resident, source memory, goal checkpoints, pause, factory handlers, threaded mail ingress and outbox startup passed.');
+  console.log('Packaged API, two successive messages served by one resident, source memory, goal checkpoints, pause, factory handlers, threaded mail ingress/outbox, scoped Git handler, and generated-site tests passed.');
 } finally {
   for (const name of [...tasks].reverse()) stop(name);
 }

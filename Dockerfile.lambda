@@ -5,14 +5,14 @@ COPY package.json package-lock.json ./
 RUN --mount=type=secret,id=build_ca \
     if [ -f /run/secrets/build_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/build_ca; fi; \
     npm ci --omit=dev --include=optional --ignore-scripts --no-audit --no-fund
-RUN rm -rf node_modules/@openai node_modules/playwright-core node_modules/@aws-sdk/client-bedrock-agentcore node_modules/.bin
+RUN rm -rf node_modules/@openai node_modules/.bin
 
 # Official x86_64 AWS Lambda Node.js 24 image with the Runtime Interface Client.
 FROM public.ecr.aws/lambda/nodejs:24@sha256:d20c164c7208f5d3af9adf77c455e36784198495638053710d99be2394d5dbfc
 WORKDIR ${LAMBDA_TASK_ROOT}
 COPY --from=dependencies /build/node_modules ./node_modules
 COPY package.json ./
-COPY src/telemetry.mjs src/company-service.mjs src/company-events.mjs src/company-notifications.mjs src/company-work.mjs src/conversations.mjs src/company-journal.mjs src/foundation-records.mjs src/auth.mjs src/console-http.mjs src/cloud-api.mjs src/cloud-store.mjs src/employee-store.mjs src/headcount.mjs src/factory.mjs src/factory-state.mjs src/email-ingress.mjs ./src/
+COPY src/ ./src/
 COPY public/ ./public/
 # AWS Lambda chooses its own least-privileged UID. Source checkouts may use 0600.
 RUN chmod -R a+rX,go-w src public package.json

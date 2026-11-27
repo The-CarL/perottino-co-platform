@@ -106,7 +106,7 @@ async function apply() {
   const client = new LambdaClient({});
   try {
     const execute = companyCommand(binding, { client, InvokeCommand, functionName:managerArn, capability });
-    const state = await runCompanyPulse({actor:{id:'ceo'},workerId:taskArn,execute,
+    const state = await runCompanyPulse({actor:{id:'ceo'},workerId:taskArn,execute,mode:'local',
       decide:async() => ({op:'reply',input:{text:answer}})});
     assert.equal(state,'worked');
     const { flushTelemetry } = await import('./src/telemetry.mjs');

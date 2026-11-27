@@ -228,6 +228,18 @@ async function mailSender() {
   // without creating a send intent or connecting to a mail recipient.
   assert.deepEqual(await eventually(()=>invoke({operation:'dispatch'})),{ok:true});
 }
-const phases = {fixtures, setup, native, secondMessage, verify, pause, goals, factory, owner, manager, mail, mailSender};
+async function projectGit() {
+  assert.deepEqual(await eventually(()=>invoke({operation:'unsupported'})),{ok:false,status:400});
+}
+async function deliveryExecutor() {
+  const page={path:'public/index.html',content:'<!doctype html><title>Release image</title>'};
+  const fixture={template:'static-site-v1',files:[page,{path:'test/total.test.mjs',
+    content:"import test from 'node:test'; import assert from 'node:assert/strict'; test('sum',()=>assert.equal(12+19,31));"}]};
+  const report=await eventually(()=>invoke(fixture));
+  assert.equal(report.status,'passed');
+  assert.equal(report.testsPassed,1);
+  assert.deepEqual(report.files,[page]);
+}
+const phases = {fixtures, setup, native, secondMessage, verify, pause, goals, factory, owner, manager, mail, mailSender, projectGit, deliveryExecutor};
 if (!Object.hasOwn(phases, phase)) throw new Error('Unknown image smoke phase');
 await phases[phase]();
