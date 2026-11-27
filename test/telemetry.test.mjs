@@ -29,6 +29,8 @@ test('traceparent crosses an internal handoff, child spans nest, and retries can
   assert.equal(retry.links.length, 1);
   assert.equal(retry.links[0].context.traceId, enqueue.spanContext().traceId);
   assert.notEqual(retry.spanContext().traceId, enqueue.spanContext().traceId);
+  assert.equal(logs.at(-1).upstreamTraceId, enqueue.spanContext().traceId);
+  assert.equal(logs.at(-1).upstreamSpanId, enqueue.spanContext().spanId);
   assert.ok(!JSON.stringify(logs).includes(secret));
   await t.shutdown();
 });
@@ -96,4 +98,30 @@ test('the local OTLP exporter sends a redacted work span to a real HTTP receiver
   assert.equal(formats[0][0], '/v1/traces');
   assert.ok(bodies.some(body => body.includes('work.process') && body.includes(opaque)));
   assert.ok(bodies.every(body => !body.includes(secret)));
+});
+
+test('X-Ray rejection reports one content-free diagnostic and preserves application outcomes', async () => {
+  const warnings = [];
+  const exporter = createXRayExporter({ send: async () => { throw new Error(secret); } }, () => warnings.push('export_failed'));
+  const t = createTelemetry({ mode:'aws', exporter, write() {} });
+  for (let i = 0; i < 2; i++) {
+    assert.equal(await t.withSpan('work.process', {}, async () => 17), 17);
+    await t.flushTelemetry();
+  }
+  assert.deepEqual(warnings, ['export_failed']);
+  await t.shutdown();
+});
+
+test('failures before a work span emit a bounded EMF failure without invoking trace export', async () => {
+  const exporter = new InMemorySpanExporter(), lines = [];
+  const t = createTelemetry({mode:'aws',service:'resident',scope,exporter,write:raw => lines.push(JSON.parse(raw))});
+  t.operationFailure('work.failure',{ reason:'store_retry',attempt:2,secret,taskId:secret },45.2);
+  await t.flushTelemetry();
+  assert.equal(lines[0].Failures,1);
+  assert.equal(lines[0].DurationMs,45);
+  assert.equal(lines[0].outcome,'error');
+  assert.equal(lines[0].attempt,2);
+  assert.equal(lines[0].taskId,undefined);
+  assert.equal(exporter.getFinishedSpans().length,0);
+  await t.shutdown();
 });

@@ -85,8 +85,8 @@ async function setup() {
     const result = await gateway('/chat',{}); assert.equal(result.statusCode,401); return result;
   });
   assert.match(challenge.headers['www-authenticate'], /^Basic /);
-  assert.match((await gateway('/chat',auth)).body, /Company chat/);
-  assert.match((await gateway('/chat.js',auth)).body, /getElementById/);
+  assert.match((await gateway('/chat',auth)).body, /Company workspace/);
+  assert.match((await gateway('/chat.js',auth)).body, /messages\.post/);
   const {createFactoryState} = await import('./src/factory-state.mjs');
   await createFactoryState({tableName}).configure({stackId:'image-smoke',requestId:'image-setup',enabled:true,
     deployment:{revision:'image-v1'},employeeLimit:2,create:true});

@@ -60,26 +60,35 @@ function fromCarrier(carrier) {
 const seconds = ([s, ns]) => s + ns / 1e9;
 const xrayTraceId = id => '1-' + id.slice(0, 8) + '-' + id.slice(8);
 
-export function createXRayExporter(client) {
+export function createXRayExporter(client, report = () => {}) {
+  let nextWarningAt = 0;
+  function finish(callback, ok) {
+    if (!ok && Date.now() >= nextWarningAt) {
+      nextWarningAt = Date.now() + 60_000;
+      try { report(); } catch { /* The export result remains independent of diagnostics. */ }
+    }
+    callback({ code: ok ? ExportResultCode.SUCCESS : ExportResultCode.FAILED });
+  }
   return {
     export(spans, callback) {
       const documents = spans.map(span => {
         const service = span.resource.attributes['service.name'];
         const parent = span.parentSpanContext;
+        const upstream = span.links[0]?.context;
         return JSON.stringify({
           name: service, id: span.spanContext().spanId, trace_id: xrayTraceId(span.spanContext().traceId),
           start_time: seconds(span.startTime), end_time: seconds(span.endTime),
           ...(parent && { parent_id: parent.spanId }), ...(parent && !parent.isRemote && { type: 'subsegment' }),
           ...(span.status.code === SpanStatusCode.ERROR && { fault: true }),
-          annotations: { operation: span.name, scope: span.resource.attributes['perottino.scope'] },
+          annotations: { operation: span.name, scope: span.resource.attributes['perottino.scope'],
+            ...(upstream && { upstream_trace_id: xrayTraceId(upstream.traceId) }) },
           metadata: { perottino: { ...span.attributes, release: span.resource.attributes['service.version'],
             links: span.links.map(({ context }) => ({ trace_id: xrayTraceId(context.traceId), span_id: context.spanId })) } },
         });
       });
       // Batches contain at most 25 short documents. The AWS SDK signs using the workload's own role.
       client.send(new PutTraceSegmentsCommand({ TraceSegmentDocuments: documents }), { abortSignal: AbortSignal.timeout(1500) })
-        .then(response => callback({ code: response.UnprocessedTraceSegments?.length ? ExportResultCode.FAILED : ExportResultCode.SUCCESS }),
-          () => callback({ code: ExportResultCode.FAILED }));
+        .then(response => finish(callback, !response.UnprocessedTraceSegments?.length), () => finish(callback, false));
     },
     async shutdown() { client.destroy?.(); },
   };
@@ -96,7 +105,8 @@ export function createTelemetry({ mode = 'off', service = 'local', scope = '', r
   if (enabled) {
     const ids = new RandomIdGenerator();
     const resources = { 'service.name': name, 'perottino.scope': company, ...(version && { 'service.version': version }) };
-    const sink = exporter ?? (mode === 'aws' ? createXRayExporter(new XRayClient({ maxAttempts: 1 }))
+    const exportWarning = () => write(JSON.stringify({ operation: 'telemetry.export_failed', service: name, scope: company }));
+    const sink = exporter ?? (mode === 'aws' ? createXRayExporter(new XRayClient({ maxAttempts: 1 }), exportWarning)
       : new OTLPTraceExporter({ ...(endpoint && { url: endpoint }), timeoutMillis: 1500 }));
     provider = new TracerProvider({ resource: resourceFromAttributes(resources),
       sampler: new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(Number.isFinite(sampleRate) && sampleRate >= 0 && sampleRate <= 1 ? sampleRate : 1) }),
@@ -118,7 +128,9 @@ export function createTelemetry({ mode = 'off', service = 'local', scope = '', r
     const current = storage.getStore();
     const ctx = current && trace.getSpanContext(current.context);
     const record = { operation, service: name, scope: company, ...(version && { release: version }),
-      ...(ctx && { traceId: ctx.traceId, spanId: ctx.spanId }), ...safeAttributes(attributes) };
+      ...(ctx && { traceId: ctx.traceId, spanId: ctx.spanId }),
+      ...(current?.upstream && { upstreamTraceId: current.upstream.traceId, upstreamSpanId: current.upstream.spanId }),
+      ...safeAttributes(attributes) };
     if (elapsedMs !== undefined) {
       record.DurationMs = elapsedMs;
       record.Operations = 1;
@@ -149,7 +161,7 @@ export function createTelemetry({ mode = 'off', service = 'local', scope = '', r
       .map(fromCarrier).filter(Boolean).map(ctx => ({ context: trace.getSpanContext(ctx) }));
     const span = tracer.startSpan(operation, { attributes: values, links }, parent);
     const start = performance.now();
-    return storage.run({ span, context: trace.setSpan(parent, span), attributes: values }, async () => {
+    return storage.run({ span, context: trace.setSpan(parent, span), attributes: values, upstream: links[0]?.context }, async () => {
       let failed = false;
       try { return await fn(); }
       catch (error) { failed = true; span.setStatus({ code: SpanStatusCode.ERROR }); throw error; }
@@ -160,6 +172,10 @@ export function createTelemetry({ mode = 'off', service = 'local', scope = '', r
     });
   }
   return { withSpan, traceCarrier, spanAttributes, operationEvent: emit,
+    operationFailure(name, attributes, elapsedMs = 0) {
+      const duration = Number.isFinite(elapsedMs) && elapsedMs >= 0 ? Math.round(elapsedMs) : 0;
+      emit(name, { ...attributes, outcome: 'error' }, duration, true);
+    },
     async flushTelemetry() { try { await provider?.forceFlush({ timeoutMillis: 2200 }); } catch { /* Best effort before Lambda freeze. */ } },
     async shutdown() { try { await provider?.shutdown(); } catch { /* Best effort on process shutdown. */ } } };
 }
@@ -180,3 +196,4 @@ export const traceCarrier = () => telemetry().traceCarrier();
 export const spanAttributes = attributes => telemetry().spanAttributes(attributes);
 export const operationEvent = (name, attributes) => telemetry().operationEvent(name, attributes);
 export const flushTelemetry = () => telemetry().flushTelemetry();
+export const operationFailure = (name, attributes, elapsedMs) => telemetry().operationFailure(name, attributes, elapsedMs);

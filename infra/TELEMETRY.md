@@ -6,7 +6,7 @@ Use the stack’s `OperationsDashboard` and `ResidentFailureAlarmName` outputs t
 
 The dashboard shows worker-reported token usage, failures, HTTP API errors and Lambda errors. Metrics under `Perottino/Company` use the project scope and service as dimensions. Token fields appear only when the native SDK returns usage. Token counts cover the SDK-reported turn and can include cached input. The dashboard provides an operational estimate. AWS billing records remain the source for actual charges.
 
-In the project's 14-day CloudWatch log group, find a failed operation and use its trace ID to inspect related spans. Work that resumes in a fresh trace carries the previous trace and span IDs in the X-Ray segment’s `perottino.links` metadata when the producer supplied a link. The authenticated company's durable events and retry receipts provide the history of committed operations. API Gateway access logs record the request ID, configured route, response status and latency.
+In the project's 14-day CloudWatch log group, find a failed operation and use its trace ID to inspect related spans. Work that resumes in a fresh trace carries the previous trace and span IDs in the X-Ray segment’s `perottino.links` metadata when the producer supplied a link. Search CloudWatch Logs for `upstreamTraceId` or X-Ray for the `upstream_trace_id` annotation to locate downstream work from the producer. A rejected X-Ray export records a content-free warning at most once per minute per process. The authenticated company's durable events and retry receipts provide the history of committed operations. API Gateway access logs record the request ID, configured route, response status and latency.
 
 ```text
 fields @timestamp, service, operation, outcome, reason, attempt, traceId, work_id
