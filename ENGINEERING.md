@@ -42,6 +42,8 @@ A goal records an outcome, success criteria and one accountable employee. For a 
 | Submitted → Ready or Done | An independent manager in scope or the owner inspects the submission, records a decision and explains it. Requesting changes reopens the task for the assignee. |
 | Active goal → Done | The goal has at least one task and every task has an accepted review. The accountable employee or an authorized leader can close it. |
 
+When a goal originates in a company conversation, the service verifies that both its creator and its accountable employee can read the exact source message. Closing that goal queues one completion notice in the same transaction. The notice returns to the original conversation, linked to the request, and carries the completion status and goal ID. Company-wide work views omit the private conversation and message IDs.
+
 A logical command carries a stable request ID. Goal and task mutations commit the record, indexes, request receipt, immutable work history where applicable and an audit event together. A retry with the same input returns the original result. Stale claims cannot overwrite later progress. New tasks, submissions and independent review are separate business decisions, including when different employees carry them out. [Domain](src/company-work.mjs) · [Concurrency and recovery tests](test/company-work.test.mjs)
 
 ## Data and observability

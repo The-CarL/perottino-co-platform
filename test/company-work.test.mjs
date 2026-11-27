@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createWork } from '../src/company-work.mjs';
+import { notificationRow } from '../src/company-notifications.mjs';
+import { createConversations } from '../src/conversations.mjs';
 import { makeSqliteRecords } from '../src/foundation-records.mjs';
 import { createTelemetry } from '../src/telemetry.mjs';
 
@@ -201,4 +203,42 @@ test('trusted spans follow the work through delegation, submission and closure i
   const audit=(await records.list('work-events')).items;
   assert.ok(audit.some(row=>row.kind==='task.reviewed'&&row.taskId===task.id));
   assert.ok(!JSON.stringify(audit).includes('Verified signature'));
+});
+
+test('goal closure queues one private source notification atomically; both creator and accountable must have source access',async t=>{
+  const records=makeSqliteRecords({filename:':memory:'});
+  t.after(()=>records.close());
+  const chat=createConversations({records,employee});
+  const {conversation}=await chat.execute('owner','conversations.dm',{peerId:'ceo'});
+  const {message}=await chat.execute('owner','messages.post',request({conversationId:conversation.id,text:'Please prepare a report.',responders:[]}));
+  const source={conversationId:conversation.id,messageId:message.id};
+  const canReadSource=async(actor,ref)=>{
+    try { await chat.execute(actor,'messages.get',ref); return true; }
+    catch(error) { if ([403,404].includes(error.status)) return false; throw error; }
+  };
+  const {execute}=createWork({records,employee,canReadSource});
+  const spec={outcome:'Prepare a report',successCriteria:'Deliver the accepted result',accountableId:'ceo',source};
+  await rejects(execute('ceo','goal.create',request({...spec,source:{...source,messageId:'m-'+'0'.repeat(40)}})),404);
+  await rejects(execute('lead','goal.create',request({...spec,accountableId:'engineer'})),404);
+  await rejects(execute('owner','goal.create',request({...spec,accountableId:'engineer'})),404);
+  const {goal}=await execute('owner','goal.create',request(spec));
+  const {task}=await execute('ceo','task.create',request({goalId:goal.id,assigneeId:'engineer',title:'Find the independent data',acceptance:'Data provided'}));
+  const {claimToken}=await execute('engineer','task.claim',request({taskId:task.id}));
+  await execute('engineer','task.submit',request({taskId:task.id,claimToken,evidence:['Sensitive individual data']}));
+  const notification=notificationRow({...goal,closedBy:'ceo',source,status:'done'});
+  assert.equal(await records.get(notification.pk,notification.sk),null);
+  await rejects(execute('ceo','goal.close',request({goalId:goal.id})),409);
+  assert.equal(await records.get(notification.pk,notification.sk),null);
+  await execute('ceo','task.review',request({taskId:task.id,decision:'accept',note:'Reviewed'}));
+  const ready=(await execute('ceo','goal.list',{closable:true})).goals[0];
+  const close=request({goalId:goal.id});
+  const [result,replay]=await Promise.all([execute('ceo','goal.close',close),execute('ceo','goal.close',close)]);
+  assert.deepEqual(result,replay);
+  for(const view of [goal,task,ready,result,await execute('owner','goal.get',{goalId:goal.id}),await execute('engineer','goal.get',{goalId:goal.id})]) {
+    assert.ok(!JSON.stringify(view).includes(source.messageId));
+  }
+  const queued=await records.get(notification.pk,notification.sk);
+  assert.ok(queued);
+  assert.ok(!JSON.stringify(queued).includes('Sensitive individual data'));
+  assert.ok(!JSON.stringify((await records.list('work-events')).items).includes(source.messageId));
 });
