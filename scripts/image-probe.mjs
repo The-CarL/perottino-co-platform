@@ -2,7 +2,9 @@
 // share an isolated loopback network. Explicit memory commands need no model.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { rootCertificates } from 'node:tls';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const phase = process.argv.at(-1);
@@ -104,6 +106,9 @@ async function setup() {
 
 async function native() {
   assert.ok(process.getuid() > 0,'Fargate employee must run as nonroot');
+  const systemBundle = '/etc/ssl/certs/ca-certificates.crt';
+  assert.equal(statSync(systemBundle).mode & 0o777, 0o644);
+  assert.equal(readFileSync(systemBundle, 'utf8'), rootCertificates.join('\n') + '\n');
   const {chromium} = await import('playwright-core');
   assert.equal(typeof chromium.connectOverCDP,'function');
   assert.match(execFileSync('node',['node_modules/@openai/codex/bin/codex.js','--version'],{encoding:'utf8'}), /codex/);

@@ -9,6 +9,9 @@ RUN rm -rf node_modules/@aws-sdk/client-secrets-manager node_modules/@aws-sdk/cl
 
 FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df
 ENV NODE_ENV=production
+# Native HTTPS clients discover this system bundle independently of Node's TLS configuration.
+RUN mkdir -p /etc/ssl/certs \
+    && node -e 'require("node:fs").writeFileSync("/etc/ssl/certs/ca-certificates.crt", require("node:tls").rootCertificates.join("\n") + "\n", {mode: 0o644})'
 WORKDIR /app
 COPY --from=dependencies /build/node_modules ./node_modules
 COPY package.json ./
