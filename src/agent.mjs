@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { startBedrockRelay } from './bedrock-relay.mjs';
 import { listenPrivateSocket, listenServer } from './private-socket.mjs';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
@@ -204,12 +205,16 @@ export async function runTurn(job, { mode = process.env.PEROTTINO_AGENT_MODE || 
 // Keep owner credentials out of this task; model-callable filesystem tools are confined below.
 export async function sdkDecision(context, signal, CodexImplementation, protocol = {
   instructions, schema: decisionSchema, validate: checkDecision,
-}) {
+}, requestUpstream) {
+  const deadline = AbortSignal.timeout(120_000);
+  signal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  signal.throwIfAborted();
   const model = process.env.PEROTTINO_BEDROCK_MODEL || 'us.openai.gpt-6-sol';
   const region = process.env.AWS_REGION || 'us-east-1';
   if (!/^(?:us|global)\.openai\.[a-z0-9.-]+$/.test(model)) throw new Error('Invalid Bedrock inference profile.');
   const Codex = CodexImplementation ?? (await import('@openai/codex-sdk')).Codex;
   const base = await mkdtemp(path.join(tmpdir(), 'perottino-codex-'));
+  let relay;
   try {
     const workspace = path.join(base, 'work');
     const codexHome = path.join(base, 'codex');
@@ -230,6 +235,7 @@ export async function sdkDecision(context, signal, CodexImplementation, protocol
       'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE', 'AWS_CONTAINER_AUTHORIZATION_TOKEN']) {
       if (process.env[key]) env[key] = process.env[key];
     }
+    relay = await startBedrockRelay(region, signal, requestUpstream);
     const client = new Codex({
       env, config: {
         model_provider: 'amazon-bedrock-runtime', model, model_catalog_json: catalog,
@@ -237,7 +243,9 @@ export async function sdkDecision(context, signal, CodexImplementation, protocol
         // otherwise launches a filesystem helper that requires user namespaces.
         project_doc_max_bytes: 0,
         tools: { experimental_request_user_input: { enabled: false } },
-        model_providers: { 'amazon-bedrock-runtime': { aws: { region } } },
+        model_providers: { 'amazon-bedrock-runtime': {
+          aws: { region }, base_url: relay.baseUrl, http_headers: { host: relay.hostname },
+        } },
         default_permissions: 'decision',
         permissions: { decision: { network: { enabled: false } } },
         web_search: 'disabled', shell_environment_policy: { inherit: 'none' },
@@ -254,6 +262,7 @@ export async function sdkDecision(context, signal, CodexImplementation, protocol
       { outputSchema: protocol.schema, signal });
     return protocol.validate(JSON.parse(result.finalResponse));
   } finally {
+    await relay?.close();
     await rm(base, { recursive: true, force: true });
   }
 }
