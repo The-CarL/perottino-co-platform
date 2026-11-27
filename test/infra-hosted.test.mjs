@@ -219,3 +219,17 @@ test('only trusted broker endpoints get company storage while every application 
   assert.equal(props(r,'ResidentFailureAlarm').TreatMissingData,'notBreaching');
   assert.throws(() => render(t, {...sample(), traceSampleRate:2}), /traceSampleRate/);
 });
+
+test('a configured company browser allowance gives paid starts only to the metered broker', t => {
+  for (const minutes of [0,200]) {
+    const {Resources:r} = render(t, {...sample(), browserMinutesPerMonth:minutes}).template;
+    const env = props(r,'WorkerTask').ContainerDefinitions[0].Environment;
+    assert.deepEqual(env.find(e=>e.Name==='PEROTTINO_BROWSER_VIA_BROKER'), {Name:'PEROTTINO_BROWSER_VIA_BROKER',Value:'1'});
+    assert.ok(!actions(r,'WorkerRole').some(a=>a.startsWith('bedrock-agentcore:')));
+    assert.ok(!actions(r,'WebRole').includes('bedrock-agentcore:StartBrowserSession'));
+    assert.ok(actions(r,'FactoryRole').includes('bedrock-agentcore:StartBrowserSession'));
+    for (const fn of ['OwnerFn','ManagerFn']) assert.equal(props(r,fn).Environment.Variables.PEROTTINO_BROWSER_MONTHLY_MINUTES,String(minutes));
+  }
+  assert.throws(()=>render(t,{...sample(),browserMinutesPerMonth:-1}),/browserMinutesPerMonth/);
+  assert.throws(()=>render(t,{...sample(),browserMinutesPerMonth:'200'}),/browserMinutesPerMonth/);
+});

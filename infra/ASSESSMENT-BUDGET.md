@@ -17,6 +17,8 @@ Set the owner policy to `totalBudgetCents: 3000` once for the whole company. A t
 }
 ```
 
+Set `browserMinutesPerMonth: 200` in the hosted configuration to give the whole assessment a shared 200-minute allowance each UTC month. The broker reserves the maximum session time before contacting AgentCore, 15 minutes for interactive sessions and 90 seconds for document reads. Early stops and uncertain starts consume their reservations. A session that could cross a month boundary reserves time in both months. During the original 30-second admission window, a retry of an interactive start reuses its provider token without another charge to the allowance. The operator can read the remaining allowance with `browser.usage`. Removing this optional configuration restores the default direct document reader on employee tasks.
+
 At full steady occupancy the $43.67 resident estimate plus the $30 wallet leaves $26.33 of the $100 assessment for other charges. The wallet meters model calls and fixed build-attempt charges. Browser time, public API traffic, data transfer, DynamoDB, logs, traces, storage, mail and other AWS services bill separately. Review billing during the assessment and pause early enough to allow for delayed charges. The separate cloud budget sends notifications. It cannot guarantee a $100 invoice ceiling. [AWS Budgets update timing](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-best-practices.html)
 
 ## Install the billing alert

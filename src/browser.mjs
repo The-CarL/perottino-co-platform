@@ -196,6 +196,7 @@ export async function browse(input, { signal: externalSignal, fixtureOrigin, ren
         return { url: url.href, ...result };
       } catch (cause) {
         signal.throwIfAborted();
+        if (['BROWSER_ALLOWANCE_EXHAUSTED','BROWSER_ADMISSION_USED','BROWSER_ADMISSION_EXPIRED','BROWSER_ADMISSION_BUSY'].includes(cause?.code)) throw cause;
         const failure = new Error('Browser could not render this page. Check the Chromium worker configuration.', { cause });
         failure.code = 'BROWSER_RENDER_FAILED';
         throw failure;

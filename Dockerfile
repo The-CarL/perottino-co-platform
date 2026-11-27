@@ -15,7 +15,7 @@ RUN mkdir -p /etc/ssl/certs \
 WORKDIR /app
 COPY --from=dependencies /build/node_modules ./node_modules
 COPY package.json ./
-COPY src/telemetry.mjs src/company-worker.mjs src/company-capabilities.mjs src/company-decisions.mjs src/company-governance.mjs src/company-work.mjs src/company-notifications.mjs src/company-events.mjs src/foundation-records.mjs src/resident.mjs src/employee-store.mjs src/headcount.mjs src/cloud-store.mjs src/agent.mjs src/agentcore-browser.mjs src/browser.mjs src/renderer.mjs src/private-socket.mjs src/bedrock-relay.mjs ./src/
+COPY src/telemetry.mjs src/company-worker.mjs src/company-capabilities.mjs src/company-decisions.mjs src/company-governance.mjs src/company-work.mjs src/company-notifications.mjs src/company-events.mjs src/foundation-records.mjs src/resident.mjs src/employee-store.mjs src/headcount.mjs src/cloud-store.mjs src/agent.mjs src/agentcore-browser.mjs src/company-browser-budget.mjs src/browser.mjs src/renderer.mjs src/private-socket.mjs src/bedrock-relay.mjs ./src/
 RUN chmod -R a+rX,go-w src package.json \
     && node node_modules/@openai/codex/bin/codex.js --version \
     && node --input-type=module -e "await import('./src/cloud-store.mjs'); await import('./src/company-worker.mjs')"

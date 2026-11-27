@@ -1,3 +1,5 @@
+import {createBrowserBudget} from './company-browser-budget.mjs';
+import {makeAgentCoreBrowser} from './agentcore-browser.mjs';
 import {join} from 'node:path';
 import {localBlobs,s3Blobs} from './company-files.mjs';
 import {createRemoteProjectGit} from './project-git.mjs';
@@ -15,23 +17,38 @@ function configuration(env) {
     return makeModelMeter({...args,tariffs}).execute(actor,op,input);
   }})};
 }
-function browserAdapter(config,makeProvider) {
+function browserAdapter(config,makeProvider,region) {
   let provider;
   return args=>({async execute(actor,op,input) {
+    const budget=config.browserMinutesPerMonth===undefined ? undefined :
+      createBrowserBudget({records:args.records,minutes:config.browserMinutesPerMonth});
+    if (budget && op==='browser.usage') {
+      if (actor!=='owner') throw Object.assign(new Error('Owner access required.'),{status:403});
+      return budget.usage();
+    }
+    if (budget && op==='browser.document') {
+      // Only the broker's role can start a paid session under a configured allowance.
+      const reader=makeAgentCoreBrowser({region,admit:()=>budget.reserve(actor,'document',input.requestId)});
+      return reader(input.url);
+    }
     const {createManagedBrowser}=await import('./company-browser.mjs');
     provider ??= Promise.resolve(makeProvider());
-    try {return await createManagedBrowser({...args,profiles:config.profiles,provider:await provider}).execute(actor,op,input);}
+    try {return await createManagedBrowser({...args,budget,profiles:config.profiles,provider:await provider}).execute(actor,op,input);}
     catch(error){if(!await provider.catch(()=>null))provider=undefined;throw error;}
   }});
 }
 export function hostedAdapters(env=process.env) {
   const config=configuration(env);
+  if(env.PEROTTINO_BROWSER_MONTHLY_MINUTES!==undefined) {
+    if(!/^\d{1,7}$/.test(env.PEROTTINO_BROWSER_MONTHLY_MINUTES)) throw Error('Invalid monthly browser allowance.');
+    config.browserMinutesPerMonth=Number(env.PEROTTINO_BROWSER_MONTHLY_MINUTES);
+  }
   return {...config,infrastructure:env.PEROTTINO_SANDBOX_API_ORIGIN ? createRemoteInfrastructure({origin:env.PEROTTINO_SANDBOX_API_ORIGIN,region:env.PEROTTINO_SANDBOX_API_REGION}) : null,
     blobs:env.PEROTTINO_FILES_BUCKET && s3Blobs(env.PEROTTINO_FILES_BUCKET),
     git:createRemoteProjectGit({functionName:env.PEROTTINO_PROJECTS_GIT_ARN}),
     mail:{domain:env.PEROTTINO_MAIL_DOMAIN ?? 'company.invalid',externalEnabled:env.PEROTTINO_MAIL_OUTBOUND==='1'},
     browser:browserAdapter(config,async()=>{const {agentCoreInteractiveBrowser}=await import('./interactive-browser.mjs');
-      return agentCoreInteractiveBrowser({deliveryOrigin:env.PEROTTINO_DELIVERY_ORIGIN,region:env.AWS_REGION,browserIdentifier:'aws.browser.v1'});}),
+      return agentCoreInteractiveBrowser({deliveryOrigin:env.PEROTTINO_DELIVERY_ORIGIN,region:env.AWS_REGION,browserIdentifier:'aws.browser.v1'});},env.AWS_REGION),
     deployments:args=>createDeployments({...args,origin:env.PEROTTINO_DELIVERY_ORIGIN,policy:config.deliveryPolicy,execute:createLambdaExecutor(env.PEROTTINO_DELIVERY_EXECUTOR_ARN)})};
 }
 

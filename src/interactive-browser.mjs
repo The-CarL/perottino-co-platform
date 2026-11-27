@@ -1,3 +1,4 @@
+import {browserSessionSeconds} from './company-browser-budget.mjs';
 import {mkdtemp,mkdir,readFile,rename,rm,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -86,8 +87,9 @@ export function agentCoreInteractiveBrowser({region=process.env.AWS_REGION||'us-
     });
   }
   return {validate:async(url,origins)=>check(url,origins,undefined,await configured(deliveryOrigin)),action:act,
-    async start(s) {
-      const sessionId=await service(api=>api.start(AbortSignal.timeout(10_000),{clientToken:s.id,timeoutSeconds:900,guardNetwork:true,profileId:s.profileId}));
+    async start(s,permit) {
+      const signal=AbortSignal.timeout(10_000);
+      const sessionId=await service(api=>api.start(signal,{clientToken:permit?.startToken()??s.id,timeoutSeconds:browserSessionSeconds.interactive,guardNetwork:true,profileId:s.profileId}));
       if(!sessionId)throw new Error('AgentCore browser failed to start.');
       if(s.url)await act(sessionId,'browser.navigate',{url:s.url},s.origins);
       return sessionId;

@@ -34,7 +34,7 @@ const commandNames = new Set([
   'settings.effective','settings.get','settings.history','settings.update','settings.restore',
   'knowledge.list','knowledge.save','knowledge.forget','browser.list','browser.view','browser.start','browser.stop',
   'browser.takeover','browser.release','browser.profile.grant','browser.profile.revoke','browser.navigate','browser.input',
-  'browser.read','browser.frame','browser.screenshot','browser.download','governance.get','policy.get','policy.set',
+  'browser.document','browser.usage','browser.read','browser.frame','browser.screenshot','browser.download','governance.get','policy.get','policy.set',
   'promotion.list','promotion.propose','promotion.approve','grant.revoke','budget.get','budget.allocate','budget.reclaim',
   'budget.model.begin','budget.model.finish','project.create','project.list','project.get','project.history',
   'project.attach','project.commit','project.snapshot','delivery.build','delivery.preview','delivery.status',

@@ -1,3 +1,4 @@
+import {browserSessionSeconds} from './company-browser-budget.mjs';
 import {createHash,randomUUID} from 'node:crypto';
 import {eventRows} from './company-events.mjs';
 import {spanAttributes} from './telemetry.mjs';
@@ -7,7 +8,7 @@ const fail=(status,message)=>{throw Object.assign(new Error(message),{status});}
 const id=(v)=>typeof v==='string'&&/^[\w.-]{1,160}$/.test(v);
 const write=(pk,sk,row,value)=>({pk,sk,expect:row?.version??null,value});
 const clean=({pk,sk,version,...data})=>data;
-const ttl=15*60_000;
+const ttl=browserSessionSeconds.interactive*1000;
 const keys=new Set(['Enter','Tab','Escape','Backspace','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End','PageUp','PageDown']);
 function origin(raw) {
   let u;try {u=new URL(raw);}catch{fail(400,'Invalid browser origin.');}
@@ -22,7 +23,7 @@ function summary(s,now) {
     status:s.expiresAt<=now && !['failed','stopped'].includes(s.status)?'expired':s.status,expiresAt:s.expiresAt};
 }
 
-export function createManagedBrowser({records,employee,provider,profiles=[],files,now=Date.now}) {
+export function createManagedBrowser({records,employee,provider,profiles=[],files,budget,now=Date.now}) {
   const pk='browser-sessions',locks='browser-locks';
   function audit(kind,actor,employeeId,{sessionId,profileId,status},key) {
     // Profile names can identify a customer or service. Only correlate their
@@ -84,7 +85,7 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
       const signature=digest(employeeId,profileId,input.url??null);
       let row=await reconcileExpiry(await records.get(pk,sessionId));
       if(row && row.signature!==signature)fail(409,'Browser request already used.');
-      let origins,grantVersion;
+      let origins,grantVersion,permit;
       if(profileId) {
         const grant=await records.get('browser-grants#'+employeeId,profileId);
         if(!grant||!catalog.has(profileId))fail(403,'Profile not granted.');
@@ -101,12 +102,18 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
         if(held.some(l=>l && l.expiresAt>at))fail(409,'An employee or profile session is already open.');
         for(const lock of held) if(lock && lock.sessionId!==sessionId) await reconcileExpiry(await records.get(pk,lock.sessionId));
         const changes=lockNames.map((k,i)=>write(locks,k,held[i],{sessionId,expiresAt}));
-        if(!await records.transact([write(pk,sessionId,null,s),write('browser-list#'+employeeId,String(1e14-at)+sessionId,null,{id:sessionId}),write('browser-catalog',String(1e14-at)+sessionId,null,{id:sessionId}),...changes]))
+        const creation=[write(pk,sessionId,null,s),write('browser-list#'+employeeId,String(1e14-at)+sessionId,null,{id:sessionId}),write('browser-catalog',String(1e14-at)+sessionId,null,{id:sessionId}),...changes];
+        if(budget) permit=await budget.reserve(actor,'interactive',sessionId,creation);
+        else if(!await records.transact(creation))
           fail(409,'Session start raced another request. Retry.');
         row=await records.get(pk,sessionId);
       }
       if(row.status==='starting'&&row.expiresAt>now()) {
-        const providerId=await provider.start({...row,url:input.url,origins});
+        if (budget) {
+          permit ??= await budget.reserve(actor,'interactive',row.id);
+          permit.startToken();
+        }
+        const providerId=await provider.start({...row,url:input.url,origins},permit);
         await records.transact([write(pk,row.id,row,{...clean(row),providerId,status:'active'}),
           ...audit('browser.started',actor,employeeId,{sessionId,profileId,status:'active'},sessionId)]);
         row=await records.get(pk,sessionId);

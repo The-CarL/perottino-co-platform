@@ -414,8 +414,11 @@ async function main() {
       capability:process.env.PEROTTINO_EMPLOYEE_CAPABILITY };
     if (process.env.PEROTTINO_FOUNDATIONS === '1') {
       const { runCompanyResident } = await import('./company-worker.mjs');
+      const execute=companyCommand(binding,broker);
+      const browse=process.env.PEROTTINO_BROWSER_VIA_BROKER==='1'
+        ? (url,{signal,requestId})=>execute('browser.document',{url,requestId},signal) : makeAgentCoreBrowser();
       await runCompanyResident({ actor:{ id:binding.agentId },workerId:binding.taskArn,
-        execute:companyCommand(binding,broker),browse:makeAgentCoreBrowser(),signal:stop.signal,
+        execute,browse,signal:stop.signal,
         reportFailure:record => operationFailure('work.failure',{agentId:binding.agentId,attempt:record.attempt,reason:record.reason ?? 'other',outcome:'error'}) });
       return;
     }

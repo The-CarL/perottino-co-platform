@@ -1,10 +1,11 @@
+import {browserSessionSeconds} from './company-browser-budget.mjs';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { makeBrowser } from './browser.mjs';
 import { withSpan } from './telemetry.mjs';
 import { readBrowserDocument } from './renderer.mjs';
 
-const sessionSeconds = 90;
+const sessionSeconds = browserSessionSeconds.document;
 
 export async function browserControl(region, browserIdentifier, { client: providedClient, connectCDP } = {}) {
   const [{ BedrockAgentCoreClient, StartBrowserSessionCommand, StopBrowserSessionCommand, SaveBrowserSessionProfileCommand },
@@ -18,7 +19,7 @@ export async function browserControl(region, browserIdentifier, { client: provid
     async start(signal,options={}) {
       const clientToken = options.clientToken??randomUUID();
       const result = await client.send(new StartBrowserSessionCommand({
-        browserIdentifier, name: 'perottino-' + clientToken, clientToken,
+        browserIdentifier, name: 'perottino-' + clientToken.slice(0, 36), clientToken,
         sessionTimeoutSeconds: options.timeoutSeconds??sessionSeconds,
         ...(options.profileId&&{profileConfiguration:{profileIdentifier:options.profileId}}),
         ...(options.guardNetwork&&{proxyConfiguration:{proxies:[{externalProxy:{server:'browser-requests.invalid',port:443}}]}}), viewPort: { width: 1280, height: 800 },
@@ -51,7 +52,7 @@ export async function browserControl(region, browserIdentifier, { client: provid
 
 export function makeAgentCoreBrowser({
   region = process.env.AWS_REGION || 'us-east-1', browserIdentifier = process.env.PEROTTINO_BROWSER_ID || 'aws.browser.v1',
-  control = browserControl, read = readBrowserDocument, fixtureOrigin,
+  control = browserControl, read = readBrowserDocument, fixtureOrigin, admit,
 } = {}) {
   if (!/^[a-z]{2}(?:-[a-z]+)+-\d$/.test(region)) throw new Error('Invalid browser Region.');
   // This release uses the isolated, public, built-in browser only. No owner profile or VPC browser.
@@ -63,7 +64,10 @@ export function makeAgentCoreBrowser({
     let connection;
     const disconnect = () => { connection?.close().catch(() => {}); };
     try {
-      sessionId = await service.start(signal);
+      const permit = admit && await admit();
+      const clientToken = permit?.startToken();
+      signal.throwIfAborted();
+      sessionId = await service.start(signal, clientToken ? {clientToken,timeoutSeconds:sessionSeconds} : undefined);
       if (!sessionId) throw new Error('AgentCore did not return a browser session.');
       signal.throwIfAborted();
       connection = await service.connect(sessionId);

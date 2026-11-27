@@ -154,9 +154,10 @@ function applyDecision({ unit, ctx, execute, browse, signal, requestId }, { op, 
       const runtime=await execute('settings.effective',{});
       if(runtime.settings.networkAccess===false)return {error:'Public network access is disabled for this employee.'};
     }
-    if(Object.hasOwn(capabilityFields,op)) return useCapability(op,input,{ctx,unit,execute,call,browse,signal});
+    const readDocument = (url, opts) => browse(url, {...opts, requestId:key('document')});
+    if(Object.hasOwn(capabilityFields,op)) return useCapability(op,input,{ctx,unit,execute,call,browse:readDocument,signal});
     if (op === 'browse') {
-      const page = await browse(input.url, { signal });
+      const page = await readDocument(input.url, { signal });
       return { url:page.url, title:String(page.title ?? '').slice(0,300), text:String(page.text ?? '').slice(0,4000) };
     }
     if (op === 'goal.create') {
@@ -276,7 +277,8 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
         } catch (error) {
           // Retry ambiguous writes using the staged input. A definitive policy or
           // validation denial can inform the next decision without a fake reply.
-          if (![400,403,404,409,422].includes(error.status) || error.code === 'MANAGER_DENIED') throw error;
+          const declined = error.code === 'BROWSER_ALLOWANCE_EXHAUSTED' || [400,403,404,409,422].includes(error.status);
+          if (!declined || error.code === 'MANAGER_DENIED') throw error;
           result = { error:'The service declined this action (' + error.status + ').' };
         }
         entry = (await execute('journal.confirm',{id,index,result})).entry;

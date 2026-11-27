@@ -16,6 +16,8 @@ function requireField(condition, key) {
 function validate(c) {
   const { account, region, ownerSecretArn, bedrockModel } = c;
   const employeeLimit = c.employeeLimit ?? maxCompanyEmployees;
+  requireField(c.browserMinutesPerMonth===undefined || (Number.isSafeInteger(c.browserMinutesPerMonth) &&
+    c.browserMinutesPerMonth>=0 && c.browserMinutesPerMonth<=1_000_000),'browserMinutesPerMonth (0 to 1000000)');
   requireField(isValidEmployeeLimit(employeeLimit), `employeeLimit (1 to ${maxCompanyEmployees})`);
   requireField(Object.hasOwn(workerSizes, c.workerSize ?? 'small'), 'workerSize (small, medium, large)');
   requireField(typeof account === 'string' && /^\d{12}$/.test(account), 'account');
@@ -138,8 +140,8 @@ export function synthHosted(config, provenance, outdir) {
     allow(['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], resources),
     { ...allow('bedrock:InvokeModel', 'arn:aws:bedrock:' + region + ':' + account + ':project/default'),
       Condition: { ArnEquals: { 'bedrock:ModelArn': profile } } },
-    allow(['bedrock-agentcore:StartBrowserSession', 'bedrock-agentcore:StopBrowserSession',
-      'bedrock-agentcore:ConnectBrowserAutomationStream'], browser)], ecsArn + '*');
+    ...(config.browserMinutesPerMonth===undefined ? [allow(['bedrock-agentcore:StartBrowserSession', 'bedrock-agentcore:StopBrowserSession',
+      'bedrock-agentcore:ConnectBrowserAutomationStream'], browser)] : [])], ecsArn + '*');
   const [cpu, memory] = workerSizes[config.workerSize ?? 'small'];
   const workerTask = retain(resource('WorkerTask', 'ECS::TaskDefinition', { Family: prefix + 'worker', NetworkMode: 'awsvpc',
     RequiresCompatibilities: ['FARGATE'], Cpu: cpu, Memory: memory, RuntimePlatform: { OperatingSystemFamily: 'LINUX', CpuArchitecture: 'X86_64' },
@@ -148,7 +150,8 @@ export function synthHosted(config, provenance, outdir) {
       Essential: true, StopTimeout: 30, LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: ['ALL'] } },
       Environment: Object.entries({ NODE_ENV: 'production', ...telemetryEnv, PEROTTINO_SERVICE: 'resident', PEROTTINO_RESIDENT: '1', PEROTTINO_COMPANY_GATE: '1',
         PEROTTINO_FACTORY_MANAGER_ARN: functionArn('m'), PEROTTINO_BEDROCK_MODEL: config.bedrockModel,
-        PEROTTINO_BEDROCK_MODELS:models.map(m=>m.id).join(','),PEROTTINO_BROWSER_ID: 'aws.browser.v1' }).map(([Name, Value]) => ({ Name, Value })),
+        PEROTTINO_BEDROCK_MODELS:models.map(m=>m.id).join(','),PEROTTINO_BROWSER_ID: 'aws.browser.v1',
+        ...(config.browserMinutesPerMonth!==undefined && {PEROTTINO_BROWSER_VIA_BROKER:'1'}) }).map(([Name, Value]) => ({ Name, Value })),
       LogConfiguration: { LogDriver: 'awslogs', Options: { 'awslogs-region': region, 'awslogs-group': logs.ref, 'awslogs-stream-prefix': 'employee' } },
     }] }));
   function fn(id, suffix, handler, functionRole, variables, timeout = 30) {
@@ -201,6 +204,7 @@ export function synthHosted(config, provenance, outdir) {
     ...(config.mailOutbound===true && config.mailDomain && {PEROTTINO_MAIL_OUTBOUND:'1'}),
     ...(config.deliveryPolicy && {PEROTTINO_DELIVERY_POLICY:JSON.stringify(config.deliveryPolicy)}),
     ...(config.modelTariffs && {PEROTTINO_MODEL_TARIFFS:JSON.stringify(config.modelTariffs)}),
+    ...(config.browserMinutesPerMonth!==undefined && {PEROTTINO_BROWSER_MONTHLY_MINUTES:String(config.browserMinutesPerMonth)}),
     PEROTTINO_CLUSTER_ARN: arn(cluster), PEROTTINO_TASK_DEFINITION_ARN: workerTask.ref,
     PEROTTINO_PUBLIC_SUBNET_IDS: config.publicSubnetIds.join(','), PEROTTINO_SECURITY_GROUP_ID: groupId,
     PEROTTINO_EMPLOYEE_LIMIT: limit };

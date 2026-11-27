@@ -116,7 +116,7 @@ export function createCompanyService({ records, store, control, heartbeat, adapt
     if(op.startsWith('mail.')) return mail.execute(actor,op,input);
     if(op.startsWith('project.')) return projects.execute(actor,op,input);
     if(op.startsWith('browser.') && browser) {
-      if(actor!=='owner' && ['browser.open','browser.start','browser.act','browser.navigate','browser.input','browser.download'].includes(op) &&
+      if(actor!=='owner' && ['browser.document','browser.open','browser.start','browser.act','browser.navigate','browser.input','browser.download'].includes(op) &&
         !(await settings.effective(actor,{})).settings.networkAccess) throw problem(403,'Network access is disabled for this employee.');
       return browser.execute(actor,op,input);
     }
