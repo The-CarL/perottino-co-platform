@@ -5,6 +5,7 @@ import { traceCarrier } from './telemetry.mjs';
 const owner = 'owner';
 const catalog = 'CONVERSATIONS';
 const hash = (...parts) => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+const dmId = members => 'c-' + hash('dm', members).slice(0, 40);
 const indexKey = id => 'C#' + id;
 const messageIndex = id => 'ID#' + id;
 const bucket = id => 'PARTICIPANT#' + hash(id).slice(0, 1);
@@ -91,7 +92,7 @@ export function createConversations({ records, employee, now = Date.now }) {
     if (members.length > 101) throw error(400, 'Group exceeds the company participant limit.');
     if (members.length < 2) throw error(400, 'A conversation needs another participant.');
     const title = group ? string(input.title, 160, 'group title') : '';
-    const id = 'c-' + (group ? hash('group', actor, string(input.requestId, 160, 'request ID')) : hash('dm', members)).slice(0, 40);
+    const id = group ? 'c-' + hash('group', actor, string(input.requestId, 160, 'request ID')).slice(0, 40) : dmId(members);
     return retry(async () => {
       const prior = await records.get(catalog, indexKey(id));
       if (prior) {
@@ -141,6 +142,22 @@ export function createConversations({ records, employee, now = Date.now }) {
     const messages = page.items.map(strip);
     return { messages, ...(last === null && page.next && { next: page.next }),
       ...(messages[0]?.seq > 1 && { previousBeforeSeq: messages[0].seq }) };
+  }
+  async function messageReceipts(actor, input) {
+    const { conversationId, peerId, messageId, beforeSeq, expectedText } = input;
+    if ((conversationId === undefined) === (peerId === undefined)) throw error(400, 'Choose a conversation or DM peer.');
+    if (messageId !== undefined && beforeSeq !== undefined) throw error(400, 'Choose a message or a page.');
+    const id = peerId === undefined ? conversationId : dmId(participants([actor, participant(peerId)], 'DM participants'));
+    const expected = expectedText === undefined ? undefined : string(expectedText, 16_000, 'expected text');
+    const page = messageId === undefined
+      ? await listMessages(actor, { conversationId:id, limit:12, ...(beforeSeq === undefined ? { latest:true } : { beforeSeq }) }, false)
+      : { messages:[await message(await conversation(actor,id),messageId)] };
+    // A post receipt records when the broker persisted the message.
+    const receipts = page.messages.map(row => ({
+      messageId:row.id, senderId:row.senderId, postedAt:row.createdAt,
+      ...(expected !== undefined && { textMatches:row.text === expected }),
+    }));
+    return { conversationId:id, receipts, ...(page.previousBeforeSeq && { previousBeforeSeq:page.previousBeforeSeq }) };
   }
   function buildMessage(conv, actor, id, text, responders, replyTo) {
     const seq = conv.lastSeq + 1;
@@ -296,6 +313,7 @@ export function createConversations({ records, employee, now = Date.now }) {
       case 'conversations.dm': return create(actor, input, 'dm');
       case 'conversations.group': return create(actor, input, 'group');
       case 'messages.list': return listMessages(actor, input, false);
+      case 'messages.receipts': return messageReceipts(actor, input);
       case 'messages.post': return post(actor, input);
       case 'messages.status': return status(actor, input);
       case 'admin.conversations': return listConversations(actor, input, true);

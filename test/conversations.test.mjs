@@ -139,3 +139,24 @@ test('failed delivery unblocks following messages and never fabricates a respons
   members.get('ceo').desiredState='paused';
   await fail(run('ceo','messages.list',{conversationId:id}),403);
 });
+
+test('receipt pages include only participant metadata, support old posts and do not create DMs',async t=>{
+  const {run,transactions}=fixture(t);
+  const before=transactions.length;
+  await fail(run('ada','messages.receipts',{peerId:'ben'}),404);
+  assert.equal(transactions.length,before);
+  const {id}=await dm(run,'ada','ben');
+  const posts=[];
+  for(let i=0;i<14;i++)posts.push(await send(run,'ada',id,'private note '+i,'receipt-'+i,{responders:[]}));
+  const latest=await run('ben','messages.receipts',{peerId:'ada',expectedText:'private note 13'});
+  assert.equal(latest.receipts.length,12);
+  assert.equal(latest.receipts.at(-1).textMatches,true);
+  assert.equal(latest.receipts[0].textMatches,false);
+  assert.deepEqual(Object.keys(latest.receipts[0]).sort(),['messageId','postedAt','senderId','textMatches']);
+  const older=await run('ada','messages.receipts',{conversationId:id,beforeSeq:latest.previousBeforeSeq});
+  assert.deepEqual(older.receipts.map(r=>r.messageId),posts.slice(0,2).map(m=>m.id));
+  for(const actor of ['owner','ceo','lee'])await fail(run(actor,'messages.receipts',{conversationId:id,messageId:posts[0].id}),404);
+  const group=(await run('ben','conversations.group',{members:['lee'],title:'New group',requestId:'receipt-group'})).conversation;
+  await fail(run('ben','messages.receipts',{conversationId:group.id,messageId:posts[0].id}),404);
+  await fail(run('ada','messages.receipts',{peerId:'ben',conversationId:id}),400);
+});

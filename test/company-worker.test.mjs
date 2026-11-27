@@ -183,3 +183,35 @@ test('a held planning page and a task claimed by another worker do not hide the 
   }});
   assert.equal(state,'worked'); assert.equal(pages.length,2); assert.deepEqual(pages[1].after,{plan:'page-2'});
 });
+
+test('an engineer recovers the existing DM receipt after changes and the reviewer verifies it without resending',async t=>{
+  const {pulse,exec,staff}=fixture(t);
+  staff.set('ada',{id:'ada',handle:'ada',name:'Ada',role:'Engineer',managerId:'ceo',desiredState:'active'});
+  const {goal}=await exec('owner','goal.create',{accountableId:'ceo',outcome:'Verify a handoff',successCriteria:'Verify the existing submission',requestId:'receipt-goal'});
+  const {task}=await exec('ceo','task.create',{goalId:goal.id,assigneeId:'ada',title:'Confirm by DM',acceptance:'Send a private marker to Mara.',requestId:'receipt-task'});
+  const expectedText='Private handoff marker';
+  await pulse('ada',ctx=>ctx.steps.length
+    ? choice('task.submit',{note:'Sent the confirmation.',evidence:['Reported a DM.']})
+    : choice('dm.send',{peerId:'ceo',text:expectedText,requestReply:false}));
+  await pulse('ceo',()=>choice('task.review',{decision:'changes',note:'Supply the original message reference.'}));
+  let original;
+  await pulse('ada',ctx=>{
+    if(!ctx.steps.length)return choice('messages.receipts',{peerId:'ceo',expectedText});
+    const result=ctx.steps[0].result;
+    assert.equal(result.receipts.length,1);
+    const [receipt]=result.receipts;
+    assert.equal(receipt.textMatches,true);
+    assert.equal(receipt.senderId,'ada');
+    assert.equal(receipt.text,undefined);
+    original={conversationId:result.conversationId,messageId:receipt.messageId};
+    return choice('task.submit',{note:'Verified the posted confirmation.',evidence:[receipt.messageId]});
+  });
+  await pulse('ceo',ctx=>{
+    if(!ctx.steps.length)return choice('messages.receipts',{...original,expectedText});
+    assert.equal(ctx.steps[0].result.receipts[0].textMatches,true);
+    return choice('task.review',{decision:'accept',note:'Verified the cited receipt.'});
+  });
+  assert.equal((await exec('owner','task.get',{taskId:task.id})).task.status,'done');
+  await assert.rejects(exec('owner','messages.receipts',original),{status:404});
+  assert.equal((await exec('ada','messages.list',{conversationId:original.conversationId})).messages.length,1);
+});

@@ -24,7 +24,7 @@ const knownValues = new Set([
   'empty_response', 'invalid_json', 'invalid_action', 'invalid_value', 'invalid_target', 'invalid_delay',
 ]);
 const commandNames = new Set([
-  'conversations.list', 'conversations.dm', 'conversations.group', 'messages.list', 'messages.post', 'messages.status',
+  'conversations.list', 'conversations.dm', 'conversations.group', 'messages.list', 'messages.post', 'messages.status', 'messages.receipts',
   'inbox.claim', 'inbox.complete', 'inbox.release', 'goal.list', 'goal.get', 'goal.create', 'goal.close',
   'task.list', 'task.get', 'task.create', 'task.claim', 'task.progress', 'task.submit', 'task.review',
   'task.block', 'task.wait', 'task.resume', 'journal.get', 'journal.stage', 'journal.confirm', 'journal.fail',
