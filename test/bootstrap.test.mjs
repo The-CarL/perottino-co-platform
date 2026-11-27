@@ -10,8 +10,8 @@ test('runtime bootstrap allocates an account-local registry, owner slot and scop
     const stack = new Stack(new App(), 'RuntimeBootstrap', { env });
     new CfnInclude(stack, 'Resources', { templateFile: fileURLToPath(new URL('../infra/runtime-bootstrap.yaml', import.meta.url)) });
     const { Resources, Outputs } = Template.fromStack(stack).toJSON();
-    assert.deepEqual(Object.keys(Resources).sort(), ['ConsoleOwner', 'Images']);
-    for (const r of Object.values(Resources)) {
+    assert.deepEqual(Object.keys(Resources).sort(), ['ConsoleOwner', 'Images','ReleaseTemplateTransport','ReleaseTemplates']);
+    for (const r of [Resources.ConsoleOwner,Resources.Images,Resources.ReleaseTemplates]) {
       assert.equal(r.DeletionPolicy, 'Retain');
       assert.equal(r.UpdateReplacePolicy, 'Retain');
     }
@@ -25,7 +25,7 @@ test('runtime bootstrap allocates an account-local registry, owner slot and scop
     assert.deepEqual(pull.Principal, { Service: 'lambda.amazonaws.com' });
     assert.deepEqual(pull.Action, ['ecr:BatchGetImage','ecr:GetDownloadUrlForLayer']);
     const sources = pull.Condition.ArnEquals['aws:SourceArn'];
-    assert.deepEqual(sources.map(a => a['Fn::Sub'].split('-r-').at(-1)).sort(), ['a','e','f','m','o']);
+    assert.deepEqual(sources.map(a => a['Fn::Sub'].split('-r-').at(-1)).sort(), ['a','b','e','f','g','m','o','s','u']);
     assert.ok(sources.every(a => a['Fn::Sub'].includes('${AWS::AccountId}:function:factory-${ProjectScope}')));
     assert.deepEqual(Outputs.ImageRepositoryUri.Value, { 'Fn::GetAtt': ['Images', 'RepositoryUri'] });
     assert.deepEqual(Outputs.OwnerSecretArn.Value, { Ref: 'ConsoleOwner' });

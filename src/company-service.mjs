@@ -5,6 +5,14 @@ import { makeCompanyJournal } from './company-journal.mjs';
 import { deliverNextGoalNotice } from './company-notifications.mjs';
 import { eventRows } from './company-events.mjs';
 
+import { createCompanyFiles } from './company-files.mjs';
+import { createSettings } from './company-settings.mjs';
+import { createKnowledge } from './company-knowledge.mjs';
+import { createGovernance } from './company-governance.mjs';
+import { createCompanyMail } from './company-mail.mjs';
+import { createInfrastructure } from './company-infrastructure.mjs';
+import { createProjects } from './company-projects.mjs';
+
 function problem(status, message) { return Object.assign(new Error(message), { status }); }
 function requireOwner(actor) { if (actor !== 'owner') throw problem(403, 'Owner access required.'); }
 function requireAgent(actor) { if (actor === 'owner') throw problem(403, 'Employee access required.'); }
@@ -26,18 +34,33 @@ function profile(row) {
     runtimeStatus: row.runtimeStatus ?? (desiredState === 'active' ? (row.taskArn ? 'Task registered' : 'Active') : desiredState) };
 }
 
-export function createCompanyService({ records, store, control, heartbeat }) {
+export function createCompanyService({ records, store, control, heartbeat, adapters = {} }) {
   const employee = id => store.employee(id);
   const conversations = createConversations({ records, employee });
   async function canReadSource(actor, source) {
     try { await conversations.execute(actor,'messages.get',source); return true; }
     catch (error) { if ([403,404].includes(error.status)) return false; throw error; }
   }
-  const work = createWork({ records, employee, canReadSource });
+  const governance = createGovernance({records,store});
+  const files = adapters.blobs && createCompanyFiles({records,blobs:adapters.blobs,employee});
+  const settings = createSettings({records,employee,modelIds:adapters.modelIds ?? [process.env.PEROTTINO_BEDROCK_MODEL || 'us.openai.gpt-6-sol']});
+  const mail = createCompanyMail({records,store,...adapters.mail,transport:adapters.mailTransport?.(records)});
+  const work = createWork({ records, employee, canReadSource, canUseMailSource:mail.canUseSource });
+  const projects = createProjects({records,store,work,git:adapters.git});
+  const infrastructure=createInfrastructure({records,projects,provider:adapters.infrastructure});
+  const knowledge = createKnowledge({records,employee,files,conversations,projects});
+  const browser = adapters.browser?.({records,employee,files});
+  const deployments = () => adapters.deployments?.({records,projects,governance});
+  const meter = adapters.meter?.({records,governance,settings});
+  async function directoryProfile(row) {
+    const person=profile(row);
+    return {...person,canHire:await governance.canHire(person.id),soulPath:'agents/'+person.handle+'/SOUL.md',
+      email:person.handle+'@'+(adapters.mail?.domain ?? 'company.invalid')};
+  }
   const journal = makeCompanyJournal({ records });
   async function directory(pulses) {
     const rows = store.listEmployees ? await store.listEmployees() : await Promise.all((await store.directory()).map(person => employee(person.id)));
-    const agents = rows.map(profile);
+    const agents = await Promise.all(rows.map(directoryProfile));
     if (pulses && store.getPulse) {
       for (let i = 0; i < rows.length; i += 16) {
         await Promise.all(rows.slice(i,i + 16).map(async (row, j) => {
@@ -83,7 +106,26 @@ export function createCompanyService({ records, store, control, heartbeat }) {
       throw problem(400,'Invalid company command.');
     if (actor !== 'owner' && (await employee(actor))?.desiredState !== 'active') throw problem(403,'Employee access denied.');
     if (op === 'directory' || op === 'directory.list') return directory(actor === 'owner');
-    if (op === 'directory.self') { requireAgent(actor); return { employee: profile(await employee(actor)) }; }
+    if (op === 'directory.self') { requireAgent(actor); const row = await employee(actor); if(files) await files.ensureSoul(row); return { employee: await directoryProfile(row) }; }
+    if (op.startsWith('files.') || op==='soul.get') {
+      if(!files) throw problem(503,'Corporate files storage unavailable.');
+      return files.execute(actor,op,input);
+    }
+    if(op.startsWith('settings.')) return settings.execute(actor,op,input);
+    if(op.startsWith('knowledge.')) return knowledge.execute(actor,op,input);
+    if(op.startsWith('mail.')) return mail.execute(actor,op,input);
+    if(op.startsWith('project.')) return projects.execute(actor,op,input);
+    if(op.startsWith('browser.') && browser) {
+      if(actor!=='owner' && ['browser.open','browser.start','browser.act','browser.navigate','browser.input','browser.download'].includes(op) &&
+        !(await settings.effective(actor,{})).settings.networkAccess) throw problem(403,'Network access is disabled for this employee.');
+      return browser.execute(actor,op,input);
+    }
+    if(op.startsWith('infra.') && ['provision','status','list','remove'].includes(op.slice(6))) return infrastructure[op.slice(6)](actor,input);
+    if(op.startsWith('delivery.') && adapters.deployments && ['build','preview','release','rollback','status','withdraw','expire'].includes(op.slice(9)))
+      return deployments()[op.slice(9)](actor,input);
+    if(op.startsWith('budget.model.') && meter) { requireAgent(actor);return meter.execute(actor,op,input); }
+    if(['budget.settle','budget.reserve','budget.release'].includes(op)) throw problem(403,'Trusted metering required.');
+    if(/^(policy|promotion|grant|budget|governance)\./.test(op)) return governance.execute(actor,op,input);
     if (op === 'company.overview') {
       requireOwner(actor);
       const [roster, goals, tasks, feed] = await Promise.all([directory(true), work.execute(actor,'goal.list',{limit:100}),
@@ -102,11 +144,14 @@ export function createCompanyService({ records, store, control, heartbeat }) {
     if (op.startsWith('employee.') && /^(hire|fire|pause|resume)$/.test(op.slice(9))) {
       uniqueRequest(input.requestId);
       if (op === 'employee.pause' || op === 'employee.resume') requireOwner(actor);
-      const { employee: affected } = await control(actor,op,input);
+      const perform=permit=>control(actor,op,input,permit);
+      const { employee: affected } = op==='employee.hire' ? await governance.hire(actor,input,perform) :
+        op==='employee.fire' ? await governance.fire(actor,input,perform) : await perform();
+      if(op==='employee.hire' && files) await files.ensureSoul(affected);
       const kind = {hire:'hired',fire:'fired',pause:'paused',resume:'resumed'}[op.slice(9)];
       const rows = eventRows('employee.'+kind,{actor,employeeId:affected.id,status:affected.desiredState},input.requestId);
       if (!await records.transact(rows) && !await records.get(rows[0].pk,rows[0].sk)) throw problem(503,'Retry the employee action.');
-      return { employee:profile(affected) };
+      return { employee:await directoryProfile(affected) };
     }
     if (op.startsWith('memory.')) return memory(actor,op,input);
     if (op.startsWith('journal.')) {
@@ -123,10 +168,13 @@ export function createCompanyService({ records, store, control, heartbeat }) {
       const cursors = input.after ?? {};
       if (typeof cursors !== 'object' || Array.isArray(cursors) || Object.keys(cursors).some(k=>!['review','plan','task','close'].includes(k)))
         throw problem(400,'Invalid queue cursors.');
+      const runtimeSettings=await settings.effective(actor,{});
       if (input.continuation !== true) {
-        await deliverNextGoalNotice({actor,records,conversations});
+        await deliverNextGoalNotice({actor,records,conversations,mail});
         const inbox = await conversations.execute(actor,'deliveries.claim',input);
-        if (inbox.delivery) return { inbox };
+        if (inbox.delivery) return { inbox,runtimeSettings };
+        const incoming=await mail.execute(actor,'mail.claim',input);
+        if(incoming.delivery) return {mail:incoming,runtimeSettings};
       }
       function queue(key,op,args) {
         if (input.continuation === true && !cursors[key]) return {};
@@ -140,7 +188,7 @@ export function createCompanyService({ records, store, control, heartbeat }) {
       ]);
       const next = Object.fromEntries([['task',ready],['review',reviews],['plan',unplanned],['close',closable]]
         .filter(([,page])=>page.next).map(([key,page])=>[key,page.next]));
-      return { readyTasks:ready.tasks ?? [],reviews:reviews.tasks ?? [],unplanned:unplanned.goals ?? [],
+      return { runtimeSettings,readyTasks:ready.tasks ?? [],reviews:reviews.tasks ?? [],unplanned:unplanned.goals ?? [],
         closable:closable.goals ?? [],...(Object.keys(next).length && {next}) };
     }
     if (op === 'worker.heartbeat') {

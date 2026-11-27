@@ -10,4 +10,4 @@ src/**
 public/**
 !public/index.html
 !public/chat.css
-!public/chat.js
+!public/*.js

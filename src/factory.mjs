@@ -7,6 +7,10 @@ import { createCompanyService } from './company-service.mjs';
 import { makeDynamoRecords } from './foundation-records.mjs';
 import { withSpan, flushTelemetry, operationFailure } from './telemetry.mjs';
 import { createCloudStore } from './cloud-store.mjs';
+import { hostedAdapters } from './company-adapters.mjs';
+import { reconcileInfrastructure } from './company-infrastructure.mjs';
+import { expirePreviews } from './company-deployments.mjs';
+import { createCompanyFiles } from './company-files.mjs';
 import { createFactoryState } from './factory-state.mjs';
 import { isValidEmployeeLimit, maxCompanyEmployees } from './headcount.mjs';
 
@@ -51,7 +55,7 @@ async function respondToCloudFormation(event, result) {
   if (!response.ok) throw new Error('CloudFormation response delivery failed');
 }
 
-export function createEmployeeFactory({ store, state, ecs, config, recordsFor, now = Date.now, sleep = delay, respond = respondToCloudFormation }) {
+export function createEmployeeFactory({ store, state, ecs, config, recordsFor, adapters, now = Date.now, sleep = delay, respond = respondToCloudFormation }) {
   const call = command => {
     const send = () => ecs.send(command,{abortSignal:AbortSignal.timeout(7_000)});
     if (command instanceof RunTaskCommand || command instanceof StopTaskCommand) return withSpan('factory.reconcile',
@@ -190,6 +194,12 @@ export function createEmployeeFactory({ store, state, ecs, config, recordsFor, n
   async function repair() {
     const company = await state.company();
     if (!company) return;
+    if(adapters && recordsFor) {
+      const records=recordsFor();
+      await expirePreviews(records);
+      if(adapters.infrastructure) await reconcileInfrastructure(records,adapters.infrastructure);
+      if(adapters.blobs) await createCompanyFiles({records,blobs:adapters.blobs,employee:id=>store.employee(id)}).repair();
+    }
     const page = await store.employeePage({ cursor: company.cursor, limit: maxPage });
     let replace = true, launches = 0;
     for (const employee of page.employees) {
@@ -271,6 +281,7 @@ export function createEmployeeFactory({ store, state, ecs, config, recordsFor, n
       }
       if (enabled && allowed(company)) {
         const ceo = await store.ensureCEO();
+        if(adapters?.blobs && recordsFor) await createCompanyFiles({records:recordsFor(),blobs:adapters.blobs,employee:id=>store.employee(id)}).ensureSoul(ceo);
         if (event.RequestType === 'Create' && ceo.desiredState === 'active') {
           const status = await reconcile(ceo.id);
           if (!['starting', 'running'].includes(status)) throw new Error('CEO launch not accepted');
@@ -310,13 +321,13 @@ export function createEmployeeFactory({ store, state, ecs, config, recordsFor, n
     const { op, input = {} } = event.command ?? {};
     if (!recordsFor || typeof op !== 'string' || !/^[a-z][a-z.]{0,63}$/.test(op)) reject(400,'INVALID_REQUEST');
     const records = recordsFor(common.binding, company?.version);
-    const service = createCompanyService({ records, store,
+    const service = createCompanyService({ records, store, adapters,
       heartbeat: data => store.recordPulse(common.binding,data,company.version),
-      control: async (_actor, command, args) => {
+      control: async (_actor, command, args, permit) => {
         if (!allowed(company) && command === 'employee.hire') reject(409,'COMPANY_SUSPENDED');
         // New assignments are explicit work records. Never pass through a legacy hire assignment.
         const {role,agentId,requestId} = args;
-        return lifecycle(actor,command.slice(9),{role,agentId,requestId},common,company);
+        return lifecycle(actor,command.slice(9),{role,agentId,requestId},{...common,governancePermit:permit},company);
       } });
     const run = () => service.execute(actor,op,input);
     const quiet = ['worker.poll','worker.heartbeat','directory','directory.self','company.overview','journal.get'].includes(op) ||
@@ -388,7 +399,7 @@ function factory() {
     if (!isValidEmployeeLimit(employeeLimit)) throw new Error('Invalid employee limit');
     const client = DynamoDBDocumentClient.from(new DynamoDBClient({maxAttempts:3}));
     const store = createCloudStore({tableName,client});
-    instance = createEmployeeFactory({ store, state:createFactoryState({tableName}),
+    instance = createEmployeeFactory({ store, adapters:hostedAdapters(), state:createFactoryState({tableName}),
       ...(process.env.PEROTTINO_FOUNDATIONS === '1' && {recordsFor:(binding,version) =>
         makeDynamoRecords({tableName,client,conditions:binding ? store.foundationGuards(binding,version) : []})}),
       ecs: new ECSClient({ maxAttempts: 2 }), config: { clusterArn, taskDefinitionArn, securityGroupId, employeeLimit,

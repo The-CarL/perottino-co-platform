@@ -25,7 +25,7 @@ test('one explicitly bootstrapped CEO uses standalone employee tasks with durabl
     'ECS::Service', 'Lambda::EventSourceMapping', 'StepFunctions::StateMachine', 'ElasticLoadBalancingV2::LoadBalancer']) {
     assert.ok(!types.includes('AWS::' + kind));
   }
-  assert.equal(types.filter(x => x === 'AWS::Lambda::Function').length, 4);
+  assert.equal(types.filter(x => x === 'AWS::Lambda::Function').length, 7);
   assert.equal(types.filter(x => x === 'AWS::ECS::TaskDefinition').length, 1);
   const table = props(r, 'State');
   assert.equal(table.BillingMode, 'PAY_PER_REQUEST');
@@ -34,7 +34,7 @@ test('one explicitly bootstrapped CEO uses standalone employee tasks with durabl
   assert.equal(table.StreamSpecification, undefined);
   for (const policy of ['DeletionPolicy', 'UpdateReplacePolicy']) {
     const retained = Object.keys(r).filter(id => r[id][policy] === 'Retain').sort();
-    assert.deepEqual(retained, ['Logs', 'State', 'WorkerTask']);
+    assert.deepEqual(retained, ['CorporateFiles','Logs', 'State', 'WorkerTask']);
   }
   assert.equal(r.WorkerTask.Properties.Family, 'factory-11111111-1111-4111-8111-111111111111-example-r-worker');
   const bootstrap = r.ResidentCompany;

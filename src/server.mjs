@@ -122,6 +122,7 @@ export function createApp({ dataDir, username, passwordHash, publicOrigin, runne
     return result;
   };
   const server = createServer(createConsoleHandler({ store, auth, publicDir, mode, onEnqueued: worker.wake, ownerControl, company: worker.company }));
+  server.once('listening',()=>{if(worker.start) worker.start().catch(()=>console.error('Local project hosting could not start.'));});
   server.headersTimeout = 15000;
   server.requestTimeout = 30000;
   let closing;

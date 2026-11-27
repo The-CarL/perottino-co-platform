@@ -1,8 +1,9 @@
 import { App, CfnOutput, CfnResource, LegacyStackSynthesizer, RemovalPolicy, Stack } from 'aws-cdk-lib';
+import { addProjectDelivery, deliveryTagIds } from './project-delivery.mjs';
 import { resourceTags } from './foundation.mjs';
 import { isValidEmployeeLimit, maxCompanyEmployees } from '../src/headcount.mjs';
 
-const taggedIds = ['Hosted', 'State', 'Logs', 'WorkerSecurityGroup', 'Cluster', 'WorkerTask', 'ExecutionRole',
+const taggedIds = [...deliveryTagIds, 'CorporateFiles','GitRole','GitFn','Hosted', 'State', 'Logs', 'WorkerSecurityGroup', 'Cluster', 'WorkerTask', 'ExecutionRole',
   'WorkerRole', 'WebRole', 'FactoryRole', 'WebFn', 'FactoryFn', 'OwnerFn', 'ManagerFn',
   'RepairRule', 'StoppedWork', 'HttpApi', 'Stage', 'Domain', 'ResidentFailureAlarm'];
 
@@ -35,13 +36,24 @@ function validate(c) {
   requireField(new RegExp('^arn:aws:secretsmanager:' + region + ':' + account + ':secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}$').test(ownerSecretArn)
     && !/:secret:\/?perottino-co\/github\/pat-[A-Za-z0-9]{6}$/.test(ownerSecretArn), 'full owner verifier ARN, distinct from the Git secret');
   requireField(new RegExp('^arn:aws:iam::' + account + ':policy/[A-Za-z0-9/+=,.@_-]+$').test(c.permissionsBoundaryArn), 'permissionsBoundaryArn');
-  requireField(/^(?:us|global)\.openai\.[a-z0-9.-]+$/.test(bedrockModel), 'Codex Bedrock model');
-  const profile = 'arn:aws:bedrock:' + region + ':' + account + ':inference-profile/' + bedrockModel;
-  const destinations = c.bedrockResourceArns;
-  requireField(Array.isArray(destinations) && destinations.includes(profile) && new Set(destinations).size === destinations.length
-    && destinations.length > 1 && destinations.every(arn => arn === profile
-      || (/^arn:aws:bedrock:[a-z]{2}-[a-z]+-\d+::foundation-model\/[a-z0-9.-]+$/.test(arn)
-        && arn.endsWith('/' + bedrockModel.slice(bedrockModel.indexOf('.') + 1)))), 'exact inference profile and destination model ARNs');
+  const models=[{id:bedrockModel,resourceArns:c.bedrockResourceArns},...(c.additionalBedrockModels ?? [])];
+  requireField(models.length<=8 && new Set(models.map(m=>m.id)).size===models.length,'unique Bedrock models');
+  const profiles=[], resources=[];
+  for(const {id,resourceArns} of models) {
+    requireField(typeof id==='string' && /^(?:us|global)\.openai\.[a-z0-9.-]+$/.test(id),'Codex Bedrock model');
+    const p='arn:aws:bedrock:'+region+':'+account+':inference-profile/'+id;
+    requireField(Array.isArray(resourceArns) && resourceArns.includes(p) && new Set(resourceArns).size===resourceArns.length
+      && resourceArns.length>1 && resourceArns.every(arn=>arn===p ||
+        /^arn:aws:bedrock:[a-z]{2}-[a-z]+-\d+::foundation-model\/[a-z0-9.-]+$/.test(arn) && arn.endsWith('/'+id.slice(id.indexOf('.')+1))),
+      'exact inference profile and destination model ARNs');
+    profiles.push(p);resources.push(...resourceArns);
+  }
+  if(c.mailDomain!==undefined)requireField(typeof c.mailDomain==='string' && /^(?:[a-z0-9-]+\.)+[a-z]{2,63}$/.test(c.mailDomain),'mailDomain');
+  if(c.mailOutbound)requireField(c.mailOutbound===true && !!c.mailDomain,'mail domain required for external sending');
+  const browserProfiles=c.browserProfiles ?? [];
+  requireField(Array.isArray(browserProfiles) && browserProfiles.length<=24 &&
+    browserProfiles.every(p=>typeof p.id==='string' && /^[A-Za-z0-9_-]{1,128}$/.test(p.id) && Array.isArray(p.origins) &&
+      p.origins.length>0 && p.origins.length<=12 && p.origins.every(raw=>{try{const u=new URL(raw);return u.origin===raw && u.protocol==='https:';}catch{return false;}})),'browserProfiles');
   if (c.customDomain !== undefined) {
     const { hostname, certificateArn, hostedZoneId } = c.customDomain;
     requireField(typeof hostname === 'string' && hostname.length <= 253
@@ -49,11 +61,11 @@ function validate(c) {
     requireField(new RegExp('^arn:aws:acm:' + region + ':' + account + ':certificate/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$').test(certificateArn), 'same-region certificateArn');
     if (hostedZoneId !== undefined) requireField(/^Z[A-Z0-9]+$/.test(hostedZoneId), 'hostedZoneId');
   }
-  return { repo: 'arn:aws:ecr:' + region + ':' + account + ':repository/' + repos[0], profile };
+  return { repo: 'arn:aws:ecr:' + region + ':' + account + ':repository/' + repos[0], profile:profiles.length===1?profiles[0]:profiles,models,resources:[...new Set(resources)] };
 }
 
 export function synthHosted(config, provenance, outdir) {
-  const { repo, profile } = validate(config);
+  const { repo, profile,models,resources } = validate(config);
   const tags = resourceTags(provenance, taggedIds);
   const scope = tags.Hosted['factory:s'];
   const prefix = 'factory-' + scope + '-r-';
@@ -80,6 +92,14 @@ export function synthHosted(config, provenance, outdir) {
     AttributeDefinitions: ['pk', 'sk'].map(AttributeName => ({ AttributeName, AttributeType: 'S' })),
     KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' }, { AttributeName: 'sk', KeyType: 'RANGE' }],
   }));
+  const files = retain(resource('CorporateFiles','S3::Bucket',{
+    BucketEncryption:{ServerSideEncryptionConfiguration:[{ServerSideEncryptionByDefault:{SSEAlgorithm:'AES256'}}]},
+    OwnershipControls:{Rules:[{ObjectOwnership:'BucketOwnerEnforced'}]},VersioningConfiguration:{Status:'Enabled'},
+    PublicAccessBlockConfiguration:{BlockPublicAcls:true,IgnorePublicAcls:true,BlockPublicPolicy:true,RestrictPublicBuckets:true}
+  }));
+  resource('CorporateFilesTransport','S3::BucketPolicy',{Bucket:files.ref,PolicyDocument:{Version:'2012-10-17',Statement:[{
+    Effect:'Deny',Principal:'*',Action:'s3:*',Resource:[arn(files),arn(files)+'/*'],Condition:{Bool:{'aws:SecureTransport':'false'}}
+  }]}});
   const logs = retain(resource('Logs', 'Logs::LogGroup', { LogGroupName: '/factory/' + scope + '/events', RetentionInDays: 14 }));
   const sg = resource('WorkerSecurityGroup', 'EC2::SecurityGroup', { GroupDescription: 'Outbound HTTPS from employee tasks',
     VpcId: config.vpcId, SecurityGroupEgress: [80, 443].map(port => ({ IpProtocol: 'tcp', FromPort: port, ToPort: port, CidrIp: '0.0.0.0/0' })) });
@@ -115,7 +135,7 @@ export function synthHosted(config, provenance, outdir) {
   const traceWrite = allow('xray:PutTraceSegments', '*');
   const workerRole = role('WorkerRole', ecs, [traceWrite,
     allow('lambda:InvokeFunction', functionArn('m')),
-    allow(['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], config.bedrockResourceArns),
+    allow(['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], resources),
     { ...allow('bedrock:InvokeModel', 'arn:aws:bedrock:' + region + ':' + account + ':project/default'),
       Condition: { ArnEquals: { 'bedrock:ModelArn': profile } } },
     allow(['bedrock-agentcore:StartBrowserSession', 'bedrock-agentcore:StopBrowserSession',
@@ -128,7 +148,7 @@ export function synthHosted(config, provenance, outdir) {
       Essential: true, StopTimeout: 30, LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: ['ALL'] } },
       Environment: Object.entries({ NODE_ENV: 'production', ...telemetryEnv, PEROTTINO_SERVICE: 'resident', PEROTTINO_RESIDENT: '1', PEROTTINO_COMPANY_GATE: '1',
         PEROTTINO_FACTORY_MANAGER_ARN: functionArn('m'), PEROTTINO_BEDROCK_MODEL: config.bedrockModel,
-        PEROTTINO_BROWSER_ID: 'aws.browser.v1' }).map(([Name, Value]) => ({ Name, Value })),
+        PEROTTINO_BEDROCK_MODELS:models.map(m=>m.id).join(','),PEROTTINO_BROWSER_ID: 'aws.browser.v1' }).map(([Name, Value]) => ({ Name, Value })),
       LogConfiguration: { LogDriver: 'awslogs', Options: { 'awslogs-region': region, 'awslogs-group': logs.ref, 'awslogs-stream-prefix': 'employee' } },
     }] }));
   function fn(id, suffix, handler, functionRole, variables, timeout = 30) {
@@ -145,7 +165,23 @@ export function synthHosted(config, provenance, outdir) {
 
   const taskArnPattern = ecsArn + 'task/' + clusterName + '/*';
   const sameCluster = { ArnEquals: { 'ecs:cluster': arn(cluster) } };
-  const factoryRole = role('FactoryRole', lambda, [logWrite, traceWrite, scopedItems(write, ['DIRECTORY', 'AGENT#*', 'FACTORY#*', 'V2#*']),
+  const delivery = addProjectDelivery({stack,resource,role,fn,arn,allow,logWrite,state,prefix,account,region});
+  const gitSecret = config.projectsGitSecretArn;
+  if(gitSecret) requireField(gitSecret!==config.ownerSecretArn && new RegExp('^arn:aws:secretsmanager:'+region+':'+account+':secret:[A-Za-z0-9/_.+=@-]+$').test(gitSecret),'projectsGitSecretArn');
+  const projectsRepo=config.projectsRepository ?? 'The-CarL/perottino-co-projects';
+  requireField(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(projectsRepo),'projectsRepository');
+  const gitRole=role('GitRole',lambda,[logWrite,...(gitSecret?[allow('secretsmanager:GetSecretValue',gitSecret)]:[])]);
+  const gitWorker=fn('GitFn','g','src/project-git.handler',gitRole,{PEROTTINO_PROJECTS_REPOSITORY:projectsRepo,...(gitSecret&&{PEROTTINO_PROJECTS_GIT_SECRET_ARN:gitSecret})},55);
+  const browserActions=['bedrock-agentcore:StartBrowserSession','bedrock-agentcore:StopBrowserSession',
+    'bedrock-agentcore:GetBrowserSession','bedrock-agentcore:ConnectBrowserAutomationStream'];
+  const sandbox=config.sandboxProvisioner;
+  if(sandbox) requireField(/^[0-9]{12}$/.test(sandbox.account) && /^[a-z]{2}-[a-z]+-\d$/.test(sandbox.region) &&
+    /^[a-z0-9]{10}$/.test(sandbox.apiId),'scoped sandboxProvisioner account/region/apiId');
+  const factoryRole = role('FactoryRole', lambda, [logWrite, traceWrite, delivery.invokeStatement,allow('lambda:InvokeFunction',arn(gitWorker)),
+    ...(sandbox?[allow('execute-api:Invoke','arn:aws:execute-api:'+sandbox.region+':'+sandbox.account+':'+sandbox.apiId+'/sandbox/POST/resources')]:[]),
+    allow('s3:ListBucket',arn(files)),allow(['s3:GetObject','s3:PutObject'],[arn(files)+'/objects/*',arn(files)+'/company/*']),allow(browserActions,browser),
+    ...(config.browserProfiles?.length?[allow(['bedrock-agentcore:StartBrowserSession','bedrock-agentcore:SaveBrowserSessionProfile'],
+      [browser,...config.browserProfiles.map(p=>'arn:aws:bedrock-agentcore:'+region+':'+account+':browser-profile/'+p.id)])]:[]),scopedItems(write, ['DIRECTORY', 'AGENT#*', 'FACTORY#*', 'V2#*']),
     scopedItems(['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:ConditionCheckItem'], ['COMPANY#GATE']),
     { ...allow('ecs:RunTask', workerTask.ref), Condition: sameCluster },
     { ...allow('ecs:ListTasks', '*'), Condition: sameCluster },
@@ -156,6 +192,15 @@ export function synthHosted(config, provenance, outdir) {
   const limit = String(config.employeeLimit ?? maxCompanyEmployees);
   const groupId = sg.getAtt('GroupId').toString();
   const factoryConfig = { PEROTTINO_RESIDENT: '1', PEROTTINO_COMPANY_GATE: '1', PEROTTINO_STATE_TABLE: state.ref,
+    ...(sandbox&&{PEROTTINO_SANDBOX_API_ORIGIN:'https://'+sandbox.apiId+'.execute-api.'+sandbox.region+'.amazonaws.com',PEROTTINO_SANDBOX_API_REGION:sandbox.region}),
+    PEROTTINO_PROJECTS_REPOSITORY:projectsRepo, PEROTTINO_FILES_BUCKET:files.ref, PEROTTINO_PROJECTS_GIT_ARN:arn(gitWorker),
+    PEROTTINO_DELIVERY_EXECUTOR_ARN:delivery.executorArn,PEROTTINO_DELIVERY_ORIGIN:delivery.origin,
+    PEROTTINO_BEDROCK_MODEL:config.bedrockModel,PEROTTINO_BEDROCK_MODELS:models.map(m=>m.id).join(','),
+    ...(config.browserProfiles?.length && {PEROTTINO_BROWSER_PROFILES:JSON.stringify(config.browserProfiles)}),
+    ...(config.mailDomain && {PEROTTINO_MAIL_DOMAIN:config.mailDomain}),
+    ...(config.mailOutbound===true && config.mailDomain && {PEROTTINO_MAIL_OUTBOUND:'1'}),
+    ...(config.deliveryPolicy && {PEROTTINO_DELIVERY_POLICY:JSON.stringify(config.deliveryPolicy)}),
+    ...(config.modelTariffs && {PEROTTINO_MODEL_TARIFFS:JSON.stringify(config.modelTariffs)}),
     PEROTTINO_CLUSTER_ARN: arn(cluster), PEROTTINO_TASK_DEFINITION_ARN: workerTask.ref,
     PEROTTINO_PUBLIC_SUBNET_IDS: config.publicSubnetIds.join(','), PEROTTINO_SECURITY_GROUP_ID: groupId,
     PEROTTINO_EMPLOYEE_LIMIT: limit };
@@ -231,7 +276,7 @@ export function synthHosted(config, provenance, outdir) {
   });
   new CfnOutput(stack, 'OperationsDashboard', { value: dashboard.ref });
   new CfnOutput(stack, 'ResidentFailureAlarmName', { value: alarm.ref });
-  for (const [id, value] of Object.entries({ Url: publicOrigin + '/chat', StateTableName: state.ref, ClusterName: cluster.ref,
+  for (const [id, value] of Object.entries({ Url: publicOrigin + '/chat', HostedBrokerRoleArn:arn(factoryRole), CorporateFilesBucketName:files.ref, StateTableName: state.ref, ClusterName: cluster.ref,
     FactoryArn: arn(factory), OwnerFactoryArn: arn(owner) })) new CfnOutput(stack, id, { value });
   return app.synth().getStackArtifact(stack.artifactId);
 }

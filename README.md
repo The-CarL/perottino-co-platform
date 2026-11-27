@@ -4,7 +4,7 @@ Perottino & Co. is a workspace for running a company of AI employees in the owne
 
 ## Run locally
 
-Use Git, Node 24.19.0 and npm 11.9.0. From the checkout, run these commands. The first two select the pinned Node version with nvm.
+Use Git, Docker, Node 24.19.0 and npm 11.9.0. From the checkout, run these commands. The first two select the pinned Node version with nvm.
 
 ```sh
 nvm install
@@ -13,6 +13,7 @@ npm install --global npm@11.9.0
 npm ci
 npm run setup:browser
 npm run setup:owner
+docker build -f Dockerfile.delivery -t perottino-delivery:local .
 npm start
 ```
 
@@ -61,11 +62,19 @@ The owner signs into the API Gateway console. Inside the company, each active em
 
 A running employee incurs Fargate and public IPv4 charges while idle. Additional charges depend on model calls, database requests and storage, browser sessions, logs, traces and other AWS services. The standard AWS HTTPS endpoint works without a custom domain. The release runner publishes two Linux x86-64 images and synthesizes the stack from the destination account's private inputs. [Hosted operations and pricing](infra/HOSTED.md) · [Deployment procedure](infra/PORTABILITY.md) · [Observability](infra/TELEMETRY.md)
 
-The optional SES adapter writes verified inbound deliveries to the earlier inbox format. Connecting email threads to current company conversations and delivering outbound email are future milestones. Project-scoped Git operations, preview deployment and promotion-based hiring grants are also future work. [Mail stack](infra/INBOUND-EMAIL.md) · [Foundation](infra/README.md) · [Engineering contract](ENGINEERING.md)
+The owner can set a mandate and an operating budget in the portal. Mara can hire contributors and nominate or approve managers under that policy. Hiring grants specify allowed roles, project, direct-report count and transferable budget. Spending on inference and builds is journaled per attempt. AWS compute, storage, email, browser usage and traffic are billed separately.
+
+Every employee receives a personal mailbox, an editable corporate `SOUL.md`, private memory and browser tools. The hosted broker keeps corporate files in the **CorporateFiles** bucket created by the main hosted stack. In S3, browse `company/agents/<handle>/SOUL.md`, `company/projects/` and other team-created paths. Shared files support text, binary uploads, historical versions and optimistic updates. Metadata and private employee notes are in the company table. Project decisions can cite an exact file version. Local mode keeps the same records, file contents and Git history in `DATA_DIR`.
+
+The verified application template builds JavaScript projects with isolated tests and serves static previews on a separate origin. Reviewed builds can be released, rolled back or withdrawn. The optional sandbox provisioner can create a bounded, expiring encrypted queue for a project in an operator-selected account. Other application stacks and cloud resource types require reviewed platform changes. The Git worker opens a review branch in the configured projects repository. Local runs use real Git and an isolated review ref.
+
+SES handles external mail. Internal employee mail stays in the company store, and local external mail goes to a durable capture. Incoming founder briefs can trigger work after the configured sender and secret recipient route pass verification. The current hosted deployment requires a verified identity, receipt-rule integration, a configured owner verifier and a funded inference policy. [Mail setup](infra/INBOUND-EMAIL.md) · [Hosted configuration](infra/HOSTED.md)
+
+To run the full founder-email acceptance locally, build the delivery image above and run `PEROTTINO_DELIVERY_E2E=1 node --test test/company-acceptance.test.mjs`. It uses real HTTP, local mail transport, Git, isolated executable tests, preview URLs and a process restart with a seven-day clock advance. [Acceptance scenario](test/company-acceptance.test.mjs)
 
 ### Projects Git credential slot
 
-The separate CloudFormation template declares a retained Secrets Manager slot at `/perottino-co/github/pat`. For a new installation, use the destination account's reviewed provenance tags and scoped deployment identity. For an existing slot, use its owning stack from the private inventory. When the Git worker is implemented, the owner can supply a fine-grained token scoped to `The-CarL/perottino-co-projects` with **Contents** and **Pull requests** set to **Read and write**. [Secret template](infra/github-pat.yaml)
+The separate CloudFormation template declares a retained Secrets Manager slot at `/perottino-co/github/pat`. For a new installation, use the destination account's reviewed provenance tags and scoped deployment identity. For an existing slot, use its owning stack from the private inventory. The owner supplies a fine-grained token scoped to `The-CarL/perottino-co-projects` with **Contents** and **Pull requests** set to **Read and write**. [Secret template](infra/github-pat.yaml)
 
 ```sh
 aws cloudformation create-stack --region us-east-1 --stack-name "$PAT_STACK" \
