@@ -30,15 +30,15 @@ async function verify({records,store,hireNative,fireNative,bind}) {
   assert.equal((await hire('ceo',request)).employee.id,eng.id);
   await assert.rejects(hire('ceo',{...request,allocationCents:499}),{status:409});
   assert.equal((await command(eng.id,'governance.get')).budget.availableCents,500);
-  const qa = {role:'QA',requestId:'hire-qa',projectId:'weather',allocationCents:75};
+  const qa = {role:'QA',requestId:'hire-qa',projectId:'weather',allocationCents:75,taskId:'tested'};
   await assert.rejects(hire(eng.id,qa),{status:403});
   const proposal = {requestId:'qa-case',employeeId:eng.id,evidenceTaskIds:['tested'],firstHireCase:'Verify weekly weather deployments against the published acceptance criteria.',
     projectId:'weather',roles:['QA'],maxDirectReports:1,maxAllocationCents:100};
   await assert.rejects(command(eng.id,'promotion.propose',proposal),{status:409});
-  await records.transact([{pk:'work:tasks',sk:'tested',expect:null,value:{assigneeId:eng.id,status:'done',review:{decision:'accept'},evidence:['recorded test results']}}]);
+  await records.transact([{pk:'work:tasks',sk:'tested',expect:null,value:{id:'tested',assigneeId:eng.id,goalId:'weather-goal',status:'done',review:{decision:'accept'},evidence:['recorded test results']}}]);
   const proposed = await command(eng.id,'promotion.propose',proposal);
   await assert.rejects(command(eng.id,'promotion.approve',{requestId:'self',proposalId:proposed.proposal.id}),{status:403});
-  await command('ceo','promotion.approve',{requestId:'within-policy',proposalId:proposed.proposal.id});
+  await command('ceo','promotion.approve',{requestId:'within-policy',proposalId:proposed.proposal.id,taskId:'tested'});
   assert.equal(await service.canHire(eng.id),true);
   await assert.rejects(hire(eng.id,{...qa,projectId:'salaries'}),{status:403});
   await assert.rejects(hire(eng.id,{...qa,role:'CFO'}),{status:403});
@@ -52,11 +52,20 @@ async function verify({records,store,hireNative,fireNative,bind}) {
   assert.equal(child.managerId,eng.id);
   assert.equal(await service.canHire(child.id),false);
   assert.equal((await command(eng.id,'governance.get')).budget.availableCents,425);
-  const funds = await Promise.allSettled(['preview','model'].map(purpose=>command(child.id,'budget.reserve',{requestId:purpose,amountCents:60,purpose})));
+  const workProject='p-'+'b'.repeat(32);
+  await records.transact([{pk:'work:tasks',sk:'qa-task',expect:null,value:{id:'qa-task',assigneeId:child.id,goalId:'weather-goal',status:'ready'}},
+    {pk:'projects:goal:weather-goal',sk:workProject,expect:null,value:{id:workProject}}]);
+  await assert.rejects(command(child.id,'budget.reserve',{requestId:'fake-task',amountCents:1,purpose:'model',taskId:'nonexistent'}),{status:404});
+  const otherProject='p-'+'a'.repeat(32);
+  await records.transact([{pk:'projects:catalog',sk:otherProject,expect:null,value:{goalIds:['unrelated-goal']}}]);
+  await assert.rejects(command(child.id,'budget.reserve',{requestId:'wrong-project',amountCents:1,purpose:'model',taskId:'qa-task',projectId:otherProject}),{status:409});
+  const funds = await Promise.allSettled(['preview','model'].map(purpose=>command(child.id,'budget.reserve',{requestId:purpose,amountCents:60,purpose,taskId:'qa-task'})));
   assert.equal(funds.filter(r=>r.status==='fulfilled').length,1);
   const held = funds.find(r=>r.status==='fulfilled').value.reservation;
-  assert.equal((await command(child.id,'budget.reserve',{requestId:held.purpose,amountCents:60,purpose:held.purpose})).replayed,true);
+  assert.equal((await command(child.id,'budget.reserve',{requestId:held.purpose,amountCents:60,purpose:held.purpose,taskId:'qa-task'})).replayed,true);
   await assert.rejects(command(eng.id,'budget.release',{requestId:'steal',reservationId:held.id}),{status:404});
+  await command('owner','policy.set',{requestId:'new-policy',totalBudgetCents:2050,allowCeoPromotions:true,...limit});
+  await assert.rejects(command(child.id,'budget.settle',{requestId:'relabel',reservationId:held.id,actualCents:2,taskId:'unrelated'}),{status:409});
   const settlement = {requestId:'settle',reservationId:held.id,actualCents:30};
   await command(child.id,'budget.settle',settlement);
   await command(child.id,'budget.settle',settlement);
@@ -83,6 +92,24 @@ async function verify({records,store,hireNative,fireNative,bind}) {
   await assert.rejects(hire('ceo',{...request,requestId:'while-revoked'}),{status:403});
   await command('owner','grant.restore',{requestId:'restore-ceo',employeeId:'ceo'});
   assert.equal(await service.canHire('ceo'),true);
+  const auditable = (await records.list('company-events',{limit:100})).items;
+  const approval = auditable.find(e=>e.kind==='promotion.approve'), grantedHire=auditable.find(e=>e.kind==='employee.hire' && e.actor===eng.id);
+  const settled = auditable.filter(e=>e.kind==='budget.settle' && e.employeeId===child.id);
+  assert.equal(settled.length,1);
+  for (const event of [approval,grantedHire]) {
+    assert.equal(event.grantId,proposed.proposal.id); assert.equal(event.projectId,'weather');
+    assert.equal(event.policyVersion,1); assert.equal(event.taskId,'tested');
+  }
+  assert.equal(approval.amountKind,'allocation-ceiling');assert.equal(approval.amountCents,100);
+  assert.equal(grantedHire.amountCents,75);assert.equal(grantedHire.managerId,eng.id);
+  const [charge]=settled;
+  assert.equal(charge.policyVersion,1);assert.equal(charge.reservationId,held.id);
+  assert.equal(charge.amountCents,30);assert.equal(charge.amountKind,'policy-ledger-charge');
+  assert.equal(charge.fundingGrantId,proposed.proposal.id);assert.equal(charge.taskId,'qa-task');
+  assert.equal(charge.resourceId,'budget:'+child.id);assert.equal(charge.purpose,held.purpose);assert.equal(charge.projectId,workProject);
+  assert.equal((await command('owner','policy.get')).policy.revision,2);
+  assert.doesNotMatch(JSON.stringify(auditable),/Verify weekly weather deployments|recorded test results/);
+  assert.match((await command('owner','governance.get')).accounting.basis,/AWS invoices/);
 }
 
 test('SQLite directory and governance commit promotion, hiring, revocation and spending atomically',async()=>{
