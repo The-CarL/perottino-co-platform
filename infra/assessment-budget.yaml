@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Monthly USD 100 cost monitor for one Perottino assessment scope.
+Parameters:
+  Scope:
+    Type: String
+    Description: The exact perottino:assessment tag value on this deployment.
+    AllowedPattern: '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}-[a-z0-9][a-z0-9-]{0,30}$'
+  NotificationEmail:
+    Type: String
+    NoEcho: true
+    Description: Private email address of the operator monitoring this assessment.
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+Resources:
+  AssessmentBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'factory-${Scope}-assessment-100'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: 100, Unit: USD}
+        CostFilters:
+          TagKeyValue:
+            - !Join ['$', ['user:perottino:assessment', !Ref Scope]]
+        CostTypes:
+          IncludeCredit: false
+          IncludeRefund: false
+          UseBlended: false
+          UseAmortized: false
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            ThresholdType: PERCENTAGE
+            Threshold: 70
+          Subscribers:
+            - {SubscriptionType: EMAIL, Address: !Ref NotificationEmail}
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            ThresholdType: PERCENTAGE
+            Threshold: 100
+          Subscribers:
+            - {SubscriptionType: EMAIL, Address: !Ref NotificationEmail}
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            ThresholdType: PERCENTAGE
+            Threshold: 100
+          Subscribers:
+            - {SubscriptionType: EMAIL, Address: !Ref NotificationEmail}
+      ResourceTags:
+        - {Key: 'factory:s', Value: !Ref Scope}
+        - {Key: 'perottino:assessment', Value: !Ref Scope}
+Outputs:
+  BudgetName:
+    Value: !Ref AssessmentBudget
