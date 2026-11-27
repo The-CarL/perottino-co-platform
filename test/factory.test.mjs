@@ -140,3 +140,17 @@ test('stack shutdown waits for confirmed stops and rejects old creation events a
     assert.equal((await fresh.custom('Create')).Status,'FAILED');
     assert.equal(fresh.launches.length,0);
   });
+
+test('a manager from before a company pause cannot hire after a rapid resume, even while its task is still bound',
+  {skip:!endpoint},async t=>{
+    const f=await fixture(t);
+    assert.equal((await f.custom('Create')).Status,'SUCCESS');
+    const ceo=await f.store.employee('ceo'), run=await f.state.run('ceo');
+    await f.state.suspend('pause',true);
+    await f.state.suspend('resume',false);
+    assert.equal((await f.store.employee('ceo')).taskArn,ceo.taskArn);
+    const response=await f.factory.manager({operation:'hire',callerId:'ceo',taskArn:ceo.taskArn,generation:ceo.generation,
+      capability:run.capability,requestId:'old-manager',role:'Engineer'});
+    assert.equal(response.status,403);
+    assert.equal((await f.store.listEmployees()).length,1);
+  });

@@ -291,7 +291,8 @@ export function createEmployeeFactory({ store, state, ecs, config, now = Date.no
     if (!requestFormat.test(event?.requestId ?? '') || !idFormat.test(event.callerId ?? '') ||
         !['hire', 'fire'].includes(event.operation)) reject(400, 'INVALID_REQUEST');
     const [company, caller, run] = await Promise.all([state.company(), store.employee(event.callerId), state.run(event.callerId)]);
-    if (!allowed(company) || !run?.capability || caller?.desiredState !== 'active' || !caller.canHire
+    if (!allowed(company) || !run?.capability || run.epoch !== company.epoch || run.stage === 'stopping'
+        || caller?.desiredState !== 'active' || !caller.canHire
         || caller.generation !== event.generation || caller.taskArn !== event.taskArn || run.arn !== event.taskArn
         || run.generation !== event.generation || typeof event.capability !== 'string' || event.capability.length !== run.capability.length
         || !timingSafeEqual(hash(event.capability), hash(run.capability))) reject(403, 'MANAGER_DENIED');
