@@ -1,0 +1,34 @@
+FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df AS deps
+WORKDIR /work
+COPY package.json package-lock.json ./
+# Derive a minimal install from the canonical lock. Keep the same tarball URLs
+# and integrity digests used by the hosted Lambda executor.
+RUN node --input-type=module <<'JS'
+import {readFileSync,writeFileSync} from 'node:fs';
+const lock=JSON.parse(readFileSync('package-lock.json'));
+const original=lock.packages;
+const manifest={name:'delivery-executor',version:'1.0.0',private:true,dependencies:{
+  'quickjs-emscripten':original[''].dependencies['quickjs-emscripten']
+}};
+const packages={'':manifest};
+function include(name) {
+  const path='node_modules/'+name;
+  if(packages[path]) return;
+  packages[path]=original[path];
+  for(const dependency of Object.keys(original[path].dependencies ?? {})) include(dependency);
+}
+include('quickjs-emscripten');
+writeFileSync('package.json',JSON.stringify(manifest));
+writeFileSync('package-lock.json',JSON.stringify({name:manifest.name,version:manifest.version,lockfileVersion:3,packages}));
+JS
+RUN --mount=type=secret,id=build_ca \
+    if [ -f /run/secrets/build_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/build_ca; fi; \
+    npm ci --ignore-scripts --no-audit --no-fund --fetch-retries=1
+
+FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df
+WORKDIR /app
+COPY --from=deps /work/node_modules/ ./node_modules/
+COPY src/project-source.mjs src/static-template.mjs src/delivery-executor.mjs src/delivery-cli.mjs ./src/
+RUN chmod 0555 src && chmod 0444 src/*.mjs
+USER 1000:1000
+ENTRYPOINT ["node","src/delivery-cli.mjs"]
