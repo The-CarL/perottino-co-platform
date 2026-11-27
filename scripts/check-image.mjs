@@ -69,9 +69,10 @@ try {
     '--env','PEROTTINO_TASK_DEFINITION_ARN=arn:aws:ecs:us-east-1:111111111111:task-definition/worker:1',
     '--env','PEROTTINO_PUBLIC_SUBNET_IDS=subnet-test','--env','PEROTTINO_SECURITY_GROUP_ID=sg-test','--env','PEROTTINO_EMPLOYEE_LIMIT=3',
     '--env','PEROTTINO_MAIL_DOMAIN=company.example.com','--env','PEROTTINO_MAIL_TOPIC_ARN=arn:aws:sns:us-east-1:111111111111:test-mail',
-    '--env','PEROTTINO_MAIL_CONFIGURATION_SET=fixture-mail','--env','AWS_ENDPOINT_URL_SES_V2=http://127.0.0.1:1'];
+    '--env','PEROTTINO_MAIL_CONFIGURATION_SET=fixture-mail','--env','AWS_ENDPOINT_URL_SESV2=http://127.0.0.1:1'];
   for (const [phase,handler] of Object.entries({factory:'src/factory.handler',owner:'src/factory.owner',manager:'src/factory.manager',
-    mail:'src/email-ingress.handler',mailSender:'src/company-mail-ses.handler'})) {
+    mail:'src/email-ingress.handler',mailSender:'src/company-mail-ses.handler',
+    projectGit:'src/project-git.handler',deliveryExecutor:'src/delivery-executor.handler'})) {
     const fn = start(phase,[...common,...lambdaLimits,...factoryEnv,lambda,handler]);
     try { runProbe(fn,phase); } finally { stop(fn); }
   }
@@ -83,6 +84,7 @@ try {
     '--env','AWS_ENDPOINT_URL_SECRETS_MANAGER=http://127.0.0.1:8098'];
   const noDirectStore = ['--env','AWS_ENDPOINT_URL_DYNAMODB=http://127.0.0.1:1'];
   const broker = start('company-broker',[...companyEnv,...lambdaLimits,...factoryEnv,'--env','PEROTTINO_SERVICE=factory',
+    '--env','PEROTTINO_DELIVERY_ORIGIN=https://sites.example.invalid','--env','PEROTTINO_DELIVERY_EXECUTOR_ARN=arn:aws:lambda:us-east-1:111111111111:function:test-executor',
     '--env','PEROTTINO_STATE_TABLE=CompanySmoke','--env','AWS_ENDPOINT_URL_DYNAMODB=http://127.0.0.1:8000',
     '--env','PEROTTINO_COMPANY_GATE=1','--entrypoint','node',lambda,'--input-type=module','-e',companyProbe,'broker']);
   const web = start('company-api',[...companyEnv,...lambdaLimits,...noDirectStore,'--env','PEROTTINO_SERVICE=api',
