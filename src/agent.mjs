@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { listenPrivateSocket, listenServer } from './private-socket.mjs';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -214,6 +214,16 @@ export async function sdkDecision(context, signal, CodexImplementation, protocol
     const workspace = path.join(base, 'work');
     const codexHome = path.join(base, 'codex');
     await Promise.all([mkdir(workspace), mkdir(codexHome)]);
+    // The native CLI derives some tool definitions (including apply_patch) from its
+    // model catalog, independently of the shell feature and filesystem permissions.
+    const catalog = path.join(codexHome, 'decision-model.json');
+    await writeFile(catalog, JSON.stringify({ models: [{
+      slug: model, display_name: model, supported_in_api: true, visibility: 'list', priority: 1,
+      base_instructions: 'Return the employee decision requested by the application.',
+      supported_reasoning_levels: [], support_verbosity: false, shell_type: 'disabled',
+      apply_patch_tool_type: null, experimental_supported_tools: [],
+      truncation_policy: { mode: 'tokens', limit: 10_000 },
+    }] }));
     const env = { PATH: '/usr/bin:/bin', HOME: base, CODEX_HOME: codexHome, TMPDIR: base, AWS_REGION: region };
     // ECS task-role credentials only. No application secrets, OpenAI credentials or inherited user config.
     for (const key of ['AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', 'AWS_CONTAINER_CREDENTIALS_FULL_URI',
@@ -222,12 +232,17 @@ export async function sdkDecision(context, signal, CodexImplementation, protocol
     }
     const client = new Codex({
       env, config: {
-        model_provider: 'amazon-bedrock-runtime', model,
+        model_provider: 'amazon-bedrock-runtime', model, model_catalog_json: catalog,
+        // This empty workdir has no project instructions. Looking for AGENTS.md
+        // otherwise launches a filesystem helper that requires user namespaces.
+        project_doc_max_bytes: 0,
+        tools: { experimental_request_user_input: { enabled: false } },
         model_providers: { 'amazon-bedrock-runtime': { aws: { region } } },
         default_permissions: 'decision',
         permissions: { decision: { network: { enabled: false } } },
         web_search: 'disabled', shell_environment_policy: { inherit: 'none' },
-        features: { shell_tool: false, unified_exec: false, multi_agent: false, plugins: false, apps: false },
+        features: { shell_tool: false, unified_exec: false, multi_agent: false, plugins: false, apps: false,
+          view_image: false, goals: false },
       },
       // The legacy read-only mode permits reading all files. Restrict local tool reads
       // to this empty workdir, excluding other runs, process environments and the IPC volume.
