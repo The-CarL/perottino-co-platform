@@ -92,9 +92,9 @@ function configuredSocket() {
   return value;
 }
 
-function socketDecision(socketPath, context, signal) {
+function socketDecision(socketPath, context, signal, endpoint, validate) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ socketPath, path: '/decision', method: 'POST', agent: false, signal,
+    const req = http.request({ socketPath, path: endpoint, method: 'POST', agent: false, signal,
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + workerToken() }
     }, res => {
       res.on('error', reject);
@@ -114,7 +114,7 @@ function socketDecision(socketPath, context, signal) {
         chunks.push(chunk);
       });
       res.on('end', () => {
-        try { resolve(checkDecision(JSON.parse(Buffer.concat(chunks)))); }
+        try { resolve(validate(JSON.parse(Buffer.concat(chunks)))); }
         catch (error) { reject(error); }
       });
     });
@@ -128,16 +128,22 @@ export function validateWorkerConnection() {
   if (!configuredSocket()) workerUrl();
 }
 
-async function requestDecision(context, signal) {
+async function requestWorkerDecision(context, signal, endpoint, validate) {
   const socketPath = configuredSocket();
-  if (socketPath) return socketDecision(socketPath, context, signal);
-  const response = await fetch(workerUrl(), {
+  if (socketPath) return socketDecision(socketPath, context, signal, endpoint, validate);
+  const response = await fetch(new URL(endpoint,workerUrl()), {
     method: 'POST', redirect: 'error', signal, headers: {
       'Content-Type': 'application/json', Authorization: 'Bearer ' + workerToken(),
     }, body: JSON.stringify(context),
   });
   if (!response.ok) throw new Error('The Bedrock worker could not complete this turn.');
-  return checkDecision(await response.json());
+  return validate(await response.json());
+}
+
+const requestDecision = (context, signal) => requestWorkerDecision(context,signal,'/decision',checkDecision);
+export async function requestCompanyDecision(context, signal) {
+  const { checkCompanyDecision } = await import('./company-decisions.mjs');
+  return requestWorkerDecision(context,signal,'/company-decision',checkCompanyDecision);
 }
 
 export function createTurnTools(job, browser, signal) {
@@ -277,12 +283,13 @@ function sameSecret(a, b) {
   return timingSafeEqual(hash(a), hash(b));
 }
 
-export function createDecisionServer(decide = sdkDecision) {
+export function createDecisionServer(decide = sdkDecision, decideCompany) {
   const expected = 'Bearer ' + workerToken();
   let active = 0;
   return http.createServer({ requestTimeout: 15_000, headersTimeout: 10_000 }, async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    if (req.method !== 'POST' || req.url !== '/decision') { res.writeHead(404).end(); return; }
+    const company = req.url === '/company-decision';
+    if (req.method !== 'POST' || (!company && req.url !== '/decision')) { res.writeHead(404).end(); return; }
     if (!sameSecret(req.headers.authorization || '', expected)) { res.writeHead(401).end(); return; }
     if ((req.headers['content-type'] || '').split(';')[0] !== 'application/json') { res.writeHead(415).end(); return; }
     if (active >= 2) { res.writeHead(429).end(); return; }
@@ -300,9 +307,18 @@ export function createDecisionServer(decide = sdkDecision) {
       let context;
       try { context = JSON.parse(Buffer.concat(chunks)); }
       catch { res.writeHead(400).end(); return; }
-      if (typeof context?.message !== 'string') { res.writeHead(400).end(); return; }
-      const result = await decide(context, AbortSignal.any([disconnect.signal, AbortSignal.timeout(60_000)]));
-      const body = JSON.stringify(checkDecision(result));
+      const signal = AbortSignal.any([disconnect.signal, AbortSignal.timeout(60_000)]);
+      let decision;
+      if (company) {
+        if (!['message','plan','task','review','close'].includes(context?.kind) || !context.agent?.id ||
+            !Array.isArray(context.allowed)) { res.writeHead(400).end(); return; }
+        const { companySdkDecision, checkCompanyDecision } = await import('./company-decisions.mjs');
+        decision = checkCompanyDecision(await (decideCompany ?? companySdkDecision)(context,signal));
+      } else {
+        if (typeof context?.message !== 'string') { res.writeHead(400).end(); return; }
+        decision = checkDecision(await decide(context,signal));
+      }
+      const body = JSON.stringify(decision);
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(body);
     } catch {
       if (!res.destroyed && !res.headersSent) res.writeHead(502).end();

@@ -1,0 +1,156 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import test from 'node:test';
+import { createCompanyService } from '../src/company-service.mjs';
+import { makeSqliteRecords } from '../src/foundation-records.mjs';
+import { companyCommand } from '../src/resident.mjs';
+import { runCompanyPulse } from '../src/company-worker.mjs';
+import { createDecisionServer, requestCompanyDecision } from '../src/agent.mjs';
+import { once } from 'node:events';
+
+function fixture(t) {
+  const records = makeSqliteRecords({ filename:':memory:' });
+  t.after(() => records.close());
+  const staff = new Map([['ceo',{ id:'ceo',handle:'mara',name:'Mara',role:'CEO',desiredState:'active',canHire:true }]]);
+  const hires = new Map();
+  const service = createCompanyService({ records,store:{ employee:id => staff.get(id),listEmployees:() => [...staff.values()] },
+    async control(actor,op,input) {
+      assert.equal(actor,'ceo'); assert.equal(op,'employee.hire');
+      if (!hires.has(input.requestId)) {
+        const id = 'e-' + (hires.size + 1);
+        const person = {id,handle:'kai-'+id,name:'Kai',role:input.role,desiredState:'active',managerId:actor,canHire:false};
+        staff.set(id,person); hires.set(input.requestId,person);
+      }
+      return { employee:hires.get(input.requestId) };
+    } });
+  const exec = (id,op,input) => service.execute(id,op,input);
+  const pulse = (id,decide,options = {}) => runCompanyPulse({ actor:staff.get(id), mode:'local',decide,
+    execute:(op,input) => exec(id,op,input), ...options });
+  const send = async (text, to='ceo') => {
+    const { conversation } = await exec('owner','conversations.dm',{peerId:to});
+    await exec('owner','messages.post',{conversationId:conversation.id,text,requestId:randomUUID()});
+    return conversation;
+  };
+  return { pulse,exec,send,staff,hires };
+}
+const choice = (op,input={}) => ({op,input});
+
+test('conversation decisions survive a lost hire response and persist one delegated task until reviewed', async t => {
+  const {pulse,exec,send,hires} = fixture(t);
+  const dm = await send('Please investigate the sample dataset and report the number of records.');
+  let plannedHires = 0;
+  const plan = ctx => {
+    assert.equal(ctx.kind,'message');
+    if (!ctx.steps.length) return choice('goal.create',{outcome:'Count sample rows',successCriteria:'A cited public result'});
+    if (ctx.steps.length === 1) {
+      plannedHires++;
+      return choice('employee.hire',{role:'Engineer',goalId:ctx.steps[0].result.goal.id,
+        title:'Count the sample rows.',acceptance:'Cite the source and row count.'});
+    }
+    return choice('reply',{text:'Kai is checking the sample and will bring back a count.'});
+  };
+  let lost = false;
+  await assert.rejects(pulse('ceo',plan,{execute:async (op,input) => {
+    const value = await exec('ceo',op,input);
+    if (op === 'employee.hire' && !lost) { lost = true; throw new Error('Response lost after committed hire.'); }
+    return value;
+  }}),/Response lost/);
+  assert.equal(await pulse('ceo',plan),'worked');
+  assert.equal(plannedHires,1); assert.equal(hires.size,1);
+  const engineer = [...hires.values()][0];
+  const roster = await exec('owner','company.overview',{});
+  assert.equal(roster.goals.length,1); assert.equal(roster.tasks.length,1);
+  const taskId = roster.tasks[0].id, goalId = roster.goals[0].id;
+  assert.equal(roster.tasks[0].assigneeId,engineer.id);
+  const {messages} = await exec('owner','messages.list',{conversationId:dm.id});
+  assert.equal(messages.length,2);assert.equal(messages[1].text,'Kai is checking the sample and will bring back a count.');
+  assert.equal(await pulse(engineer.id,ctx => {
+    assert.equal(ctx.history,undefined); assert.equal(ctx.kind,'task');
+    if (!ctx.steps.length) return choice('browse',{url:'https://example.test/sample'});
+    assert.match(ctx.steps[0].result.text,/three rows/);
+    return choice('task.submit',{note:'The sample contains three rows.',evidence:['https://example.test/sample','Three rows were present.']});
+  },{browse:async url => ({url,title:'Sample',text:'The sample contains three rows.'})}),'worked');
+  await pulse('ceo',ctx => {
+    assert.equal(ctx.kind,'review'); assert.equal(ctx.task.evidence[0],'https://example.test/sample');
+    return choice('task.review',{decision:'accept',note:'Count and citation match the criteria.'});
+  });
+  assert.equal((await exec('owner','task.get',{taskId})).task.status,'done');
+  await pulse('ceo',ctx => { assert.equal(ctx.kind,'close'); assert.equal(ctx.results[0].status,'done'); return choice('goal.close'); });
+  assert.equal((await exec('owner','goal.get',{goalId})).goal.status,'done');
+  assert.equal(await pulse('ceo',() => assert.fail('idle inference')),'idle');
+});
+
+test('local commands use the shared runtime; private chat is absent from independent group decisions', async t => {
+  const {pulse,exec,send,hires} = fixture(t);
+  const dm = await send('remember Private milestone');
+  await pulse('ceo'); await send('recall'); await pulse('ceo');
+  const saved = await exec('owner','messages.list',{conversationId:dm.id});
+  assert.equal(saved.messages.at(-1).text,'Private milestone');
+  await send('hire Engineer'); await pulse('ceo');
+  const kai = [...hires.values()][0];
+  assert.equal(kai.role,'Engineer');
+  const { conversation } = await exec('owner','conversations.group',{title:'Project',members:['ceo',kai.id],requestId:randomUUID()});
+  await exec('owner','messages.post',{conversationId:conversation.id,text:'What should we measure first?',responders:['ceo'],requestId:randomUUID()});
+  await pulse('ceo',ctx => {
+    assert.equal(ctx.conversation.id,conversation.id); assert.deepEqual(ctx.history,[]);
+    assert.equal(JSON.stringify(ctx).includes('Private milestone'),false);
+    return choice('reply',{text:'I would measure the current error rate first.'});
+  });
+  assert.equal((await exec('owner','messages.list',{conversationId:conversation.id})).messages.at(-1).text,'I would measure the current error rate first.');
+  const overview = await exec('owner','company.overview',{});
+  assert.equal(overview.tasks.length,0); assert.equal(overview.goals.length,0);
+});
+
+test('hosted command wraps business input with the bound identity and propagates broker revocation', async () => {
+  const binding = {agentId:'ceo',generation:2,taskArn:'fixture-task'};
+  const received = [];
+  const execute = companyCommand(binding,{ client:{async send(command) {
+    received.push(JSON.parse(command.input.Payload)); return {Payload:Buffer.from('{"ok":false,"status":403,"error":"MANAGER_DENIED"}')};
+  }},InvokeCommand:class { constructor(input) { this.input=input; } },functionName:'broker',capability:'fixture' });
+  await assert.rejects(execute('directory.self',{}),{code:'MANAGER_DENIED',status:403});
+  const [{requestId,...event}] = received;
+  assert.match(requestId,/^[\w-]{36}$/);
+  assert.deepEqual(event,{operation:'company',callerId:'ceo',generation:2,taskArn:'fixture-task',capability:'fixture',
+    command:{op:'directory.self',input:{}}});
+});
+
+test('isolated company sidecar authenticates and validates the company decision protocol', async t => {
+  const settings = ['PEROTTINO_BEDROCK_WORKER_TOKEN','PEROTTINO_BEDROCK_WORKER_SOCKET','PEROTTINO_BEDROCK_WORKER_URL'];
+  const previous = settings.map(key => process.env[key]);
+  t.after(() => settings.forEach((key,i) => {
+    if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i];
+  }));
+  delete process.env.PEROTTINO_BEDROCK_WORKER_SOCKET;
+  process.env.PEROTTINO_BEDROCK_WORKER_TOKEN = randomUUID();
+  const server = createDecisionServer(() => assert.fail('Legacy decision route invoked'), ctx =>
+    choice('reply',{text:'I received ' + ctx.message.text}));
+  server.listen(0,'127.0.0.1'); await once(server,'listening');
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  process.env.PEROTTINO_BEDROCK_WORKER_URL = 'http://127.0.0.1:' + server.address().port;
+  const context = {kind:'message',agent:{id:'ceo'},message:{text:'the brief'},allowed:['reply']};
+  assert.deepEqual(await requestCompanyDecision(context),choice('reply',{text:'I received the brief'}));
+  process.env.PEROTTINO_BEDROCK_WORKER_TOKEN = randomUUID();
+  await assert.rejects(requestCompanyDecision(context),/worker could not complete/);
+});
+
+test('a held planning page and a task claimed by another worker do not hide the next available item', async t => {
+  const {pulse,exec} = fixture(t);
+  const g = (await exec('owner','goal.create',{accountableId:'ceo',outcome:'Find the available work',
+    successCriteria:'A first task exists',requestId:randomUUID()})).goal;
+  const pages = [];
+  const state = await pulse('ceo',ctx => {
+    assert.equal(ctx.goal.id,g.id); return choice('task.create',{goalId:g.id,assigneeId:'ceo',title:'Trace work',acceptance:'A record'});
+  }, {execute:async (op,input) => {
+    if (op === 'worker.poll') {
+      pages.push(input);
+      if (!input.continuation) return {unplanned:[{id:'held'}],readyTasks:[{id:'taken'}],next:{plan:'page-2'}};
+      return {unplanned:[g]};
+    }
+    if (op === 'task.claim' && input.taskId === 'taken') throw Object.assign(new Error('Already claimed'),{status:409});
+    if (op === 'journal.get' && pages.length === 1 && !pages[0].testedHold) {
+      pages[0].testedHold = true;return {entry:{steps:[],failures:0,retryAt:Date.now()+60_000}};
+    }
+    return exec('ceo',op,input);
+  }});
+  assert.equal(state,'worked'); assert.equal(pages.length,2); assert.deepEqual(pages[1].after,{plan:'page-2'});
+});

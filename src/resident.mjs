@@ -1,9 +1,10 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createTurnTools, runTurn, sdkDecision } from './agent.mjs';
 import { makeAgentCoreBrowser } from './agentcore-browser.mjs';
+import { flushTelemetry, traceCarrier } from './telemetry.mjs';
 
 const actions = ['goal', 'reply', 'work', 'finish', 'wait', 'blocked', 'remember', 'recall', 'browse', 'hire', 'fire', 'message'];
 const effects = ['hire', 'fire', 'message'];
@@ -383,6 +384,22 @@ export function managerTool(binding, { client, InvokeCommand, functionName, capa
   };
 }
 
+export function companyCommand(binding, { client, InvokeCommand, functionName, capability }) {
+  if (!functionName || !capability) throw new Error('Incomplete company broker configuration.');
+  return async (op, input, signal) => {
+    const trace = traceCarrier();
+    const event = { operation:'company', requestId:randomUUID(), command:{op,input}, callerId:binding.agentId, generation:binding.generation,
+      taskArn:binding.taskArn, capability, ...(trace && {trace}) };
+    const response = await client.send(new InvokeCommand({ FunctionName:functionName, InvocationType:'RequestResponse',
+      Payload:Buffer.from(JSON.stringify(event)) }), { abortSignal:signal });
+    if (response.FunctionError || !response.Payload?.length) throw new Error('Company broker invocation failed.');
+    const body = JSON.parse(Buffer.from(response.Payload).toString('utf8'));
+    if (!body.ok) throw Object.assign(new Error('Company broker declined the operation.'),
+      { status:body.status, code:body.error });
+    return body.result;
+  };
+}
+
 async function main() {
   const stop = new AbortController();
   const abort = () => stop.abort();
@@ -391,17 +408,26 @@ async function main() {
   let client, store;
   try {
     const binding = await readBinding();
-    const { createCloudStore } = await import('./cloud-store.mjs');
     const { LambdaClient, InvokeCommand } = await import('@aws-sdk/client-lambda');
-    store = createCloudStore({ resident: true });
     client = new LambdaClient({});
-    const recruit = managerTool(binding, { client, InvokeCommand, functionName: process.env.PEROTTINO_FACTORY_MANAGER_ARN,
-      capability: process.env.PEROTTINO_EMPLOYEE_CAPABILITY });
+    const broker = { client, InvokeCommand, functionName:process.env.PEROTTINO_FACTORY_MANAGER_ARN,
+      capability:process.env.PEROTTINO_EMPLOYEE_CAPABILITY };
+    if (process.env.PEROTTINO_FOUNDATIONS === '1') {
+      const { runCompanyResident } = await import('./company-worker.mjs');
+      await runCompanyResident({ actor:{ id:binding.agentId },workerId:binding.taskArn,
+        execute:companyCommand(binding,broker),browse:makeAgentCoreBrowser(),signal:stop.signal,
+        reportFailure:record => console.log(JSON.stringify(record)) });
+      return;
+    }
+    const { createCloudStore } = await import('./cloud-store.mjs');
+    store = createCloudStore({ resident: true });
+    const recruit = managerTool(binding,broker);
     await runResident({ binding, store, recruit, signal: stop.signal,
       reportFailure: record => console.log(JSON.stringify(record)) });
   } finally {
     client?.destroy();
     await store?.close?.();
+    await flushTelemetry();
     process.removeListener('SIGTERM', abort);
     process.removeListener('SIGINT', abort);
   }
