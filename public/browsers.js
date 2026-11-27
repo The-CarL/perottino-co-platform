@@ -143,7 +143,8 @@ async function browserDialog(session) {
     active = session.status === 'active';
   let owned = session.controller === 'owner',
     timer,
-    updating = false,
+    pendingFrame,
+    failedFrames = 0,
     frameWidth = 0,
     frameHeight = 0;
   const frame = el('img', {
@@ -175,13 +176,13 @@ async function browserDialog(session) {
   async function refresh() {
     clearTimeout(timer);
     if (!active || !frame.isConnected || !dialog.open) return;
-    if (!live() || updating) {
+    if (!live() || pendingFrame) {
       timer = setTimeout(refresh, 3000);
       return;
     }
-    updating = true;
+    pendingFrame = api('browser.frame', { sessionId });
     try {
-      const shot = await api('browser.frame', { sessionId });
+      const shot = await pendingFrame;
       if (!frame.isConnected || !dialog.open) return;
       if (
         !/^data:image\/(?:jpeg|png);base64,[a-zA-Z0-9+/=]+$/.test(shot.dataUrl) ||
@@ -197,15 +198,18 @@ async function browserDialog(session) {
         enable();
         draw();
       }
+      failedFrames = 0;
       message.hidden = true;
     } catch (err) {
+      if (!live()) return;
+      failedFrames++;
       message.textContent = err.message;
       message.hidden = false;
-      return;
     } finally {
-      updating = false;
+      pendingFrame = undefined;
     }
-    if (frame.isConnected && dialog.open) timer = setTimeout(refresh, 2000);
+    if (frame.isConnected && dialog.open && failedFrames <= 3 && session.expiresAt > Date.now())
+      timer = setTimeout(refresh, Math.min(10000, 2000 * 2 ** failedFrames));
   }
   async function action(op, data = {}) {
     message.hidden = true;
@@ -234,6 +238,7 @@ async function browserDialog(session) {
         btn(
           'Stop session',
           () => {
+            clearTimeout(timer);
             const save = el('input', { type: 'checkbox', name: 'save' });
             form(
               'Stop browser session',
@@ -245,6 +250,9 @@ async function browserDialog(session) {
               ],
               'Stop session',
               saveAndClose(async (data) => {
+                // The old view was detached when the confirmation opened. Finish the
+                // one frame it already requested before closing the provider session.
+                await pendingFrame?.catch(() => {});
                 await change('browser.stop', {
                   sessionId,
                   ...(session.profileId && { saveProfile: data.has('save') }),

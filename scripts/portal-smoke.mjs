@@ -320,11 +320,32 @@ export async function checkBrowserControl({ page, nav }) {
     .click({ position: { x: 20, y: 20 } });
   await page.getByLabel('Browser key').selectOption('Enter');
   await button(page, 'Send key').click();
-  await button(page, 'Hand back control').click();
-  await page.getByText('Employee has control.', { exact: true }).waitFor();
-  await button(page, 'Stop session').click();
-  await dialog(page).getByRole('button', { name: 'Stop session', exact: true }).click();
+  // Hold one real frame on the wire while the owner confirms stop.
+  const frameGate = Promise.withResolvers(), order = [];
+  const framePath = '**/api/company/browser.frame';
+  const onStop = request => {
+    if (request.url().endsWith('/api/company/browser.stop')) order.push('stop');
+  };
+  page.on('request', onStop);
+  await page.route(framePath, async route => {
+    await frameGate.promise;
+    const response = await route.fetch();
+    order.push('frame');
+    await route.fulfill({ response });
+  }, { times: 1 });
+  const pending = page.waitForRequest(framePath, { timeout: 10000 });
+  try {
+    await button(page, 'Hand back control').click();
+    await page.getByText('Employee has control.', { exact: true }).waitFor();
+    await pending;
+    await button(page, 'Stop session').click();
+    await dialog(page).getByRole('button', { name: 'Stop session', exact: true }).click();
+  } finally {
+    frameGate.resolve();
+  }
   await page.getByText('Stopped', { exact: true }).waitFor();
+  page.off('request', onStop);
+  assert.deepEqual(order, ['frame', 'stop']);
   await button(page, 'Revoke profile').click();
   await button(page, 'Revoke access').click();
   await page.getByText('No profiles assigned.', { exact: true }).waitFor();
