@@ -11,6 +11,14 @@ import { createStore } from '../src/store.mjs';
 import { makeSqliteRecords } from '../src/foundation-records.mjs';
 import { randomBytes } from 'node:crypto';
 import { chromium } from 'playwright-core';
+import { checkPortalFileLinks } from './portal-links-smoke.mjs';
+import {
+  checkOwnerTools,
+  checkProjectCreation,
+  prepareProjectHandoff,
+  checkHandoffAndPromotion,
+  checkBrowserControl,
+} from './portal-smoke.mjs';
 
 export async function runCompanySmoke() {
   // Exercise the documented entry points with a temporary owner and a real browser.
@@ -24,6 +32,11 @@ export async function runCompanySmoke() {
     PORT: '0',
     NODE_ENV: 'test',
     PEROTTINO_AGENT_MODE: 'local',
+    // The browser fixture below opens only about:blank inside the isolated test runner.
+    PEROTTINO_BROWSER_EXTERNAL_SANDBOX: '1',
+    PEROTTINO_BROWSER_PROFILES: JSON.stringify([
+      { id: 'smokelocal-0123456789', label: 'Offline smoke', origins: ['https://example.org'] },
+    ]),
   };
   for (const key of ['OWNER_USERNAME', 'OWNER_PASSWORD', 'OWNER_PASSWORD_HASH', 'PUBLIC_ORIGIN'])
     delete env[key];
@@ -168,6 +181,8 @@ export async function runCompanySmoke() {
     const engineer = employees.find((a) => a.role.toLowerCase() === 'engineer');
     assert(engineer && engineer.managerId === 'ceo', 'CEO hire should be a distinct direct report');
 
+    await checkOwnerTools({ page, nav, employeeId: engineer.id });
+    await checkPortalFileLinks({ page, nav, api: authenticatedApi, employeeId: engineer.id });
     // Seed an employee-to-employee exchange through the real domain boundary.
     // The public owner API intentionally cannot impersonate either employee.
     const records = makeSqliteRecords({ filename: join(dataDir, 'company.sqlite') });
@@ -209,6 +224,14 @@ export async function runCompanySmoke() {
     await nav(page, 'dashboard');
     await page.getByRole('button', { name: 'Goal ' + goal, exact: true }).waitFor();
     await snapshot(page, 'desktop-dashboard');
+    const sourceProject = await checkProjectCreation({
+      page,
+      nav,
+      send,
+      api: authenticatedApi,
+      engineer,
+      goalOutcome: goal,
+    });
     await nav(page, 'chat');
     assert.equal(await page.locator('[data-conversation-id="' + hidden.id + '"]').count(), 0);
     await page.getByRole('button', { name: 'New group', exact: true }).click();
@@ -245,6 +268,14 @@ export async function runCompanySmoke() {
     const workRecords = makeSqliteRecords({ filename: join(dataDir, 'company.sqlite') });
     try {
       const work = createWork({ records: workRecords, employee: storedEmployees.employee });
+      await prepareProjectHandoff({
+        records: workRecords,
+        store: storedEmployees,
+        work,
+        dataDir,
+        project: sourceProject,
+        employeeId: engineer.id,
+      });
       const command = (actor, op, input) =>
         work.execute(actor, op, { ...input, requestId: crypto.randomUUID() });
       const { goal: evidenceGoal } = await command('owner', 'goal.create', {
@@ -272,6 +303,9 @@ export async function runCompanySmoke() {
 
     const second = await openPage(await startServer(), { width: 390, height: 844 }, '/chat');
     const mobile = second.page;
+    await checkHandoffAndPromotion({ page: mobile, nav, project: sourceProject, employeeId: engineer.id });
+    await checkBrowserControl({ page: mobile, nav });
+    await nav(mobile, 'chat');
     await mobile.locator('#conversation-list').getByRole('button', { name: 'Mara', exact: true }).click();
     await mobile
       .locator('#timeline')
@@ -336,7 +370,10 @@ export async function runCompanySmoke() {
     assert.deepEqual(second.errors, []);
     await second.context.close();
     console.log(
-      'Company browser smoke passed for authenticated dashboard, explicit work, participant chat, scoped memory, task evidence and independent review, group messages, audited inspection, hiring, employee controls, mobile and restart recovery.',
+      'Company portal smoke passed for desktop, mobile, restart recovery, reviewed work, private chat and mail, protected file versions, model configuration, budgeted promotion, Git handoffs and browser takeover.',
+      process.env.PEROTTINO_UI_DELIVERY === '1'
+        ? 'Docker build, preview, release, withdrawal and temporary sandbox queue passed.'
+        : '',
     );
   } finally {
     await browser?.close();

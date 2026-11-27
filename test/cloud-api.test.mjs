@@ -39,6 +39,15 @@ test('only health is public and owner authentication protects the packaged chat 
   assert.equal(html.statusCode, 200);
   assert.equal(html.isBase64Encoded, false);
   assert.match(html.body, /id="composer"/);
+  const scripts = [...html.body.matchAll(/<script\b[^>]*\bsrc="([^"]+)"/g)].map(match => match[1]);
+  assert.ok(scripts.includes('/workspace.js'));
+  for (const script of scripts) {
+    assert.equal((await api(event(script))).statusCode, 401, script);
+    const asset = await api(event(script, { headers: authorized }));
+    assert.equal(asset.statusCode, 200, script);
+    assert.match(asset.headers['content-type'], /^text\/javascript\b/);
+    assert.ok(asset.body.length > 0, script);
+  }
   assert.match(html.headers['content-security-policy'], /frame-ancestors 'none'/);
   const head = await api(event('/chat.css', { method: 'HEAD', headers: authorized }));
   assert.equal(head.statusCode, 200);

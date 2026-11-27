@@ -11,6 +11,11 @@ const sections = {
   chat: 'Chat',
   directory: 'Directory',
   admin: 'Admin',
+  files: 'Files',
+  settings: 'Settings',
+  projects: 'Projects',
+  mail: 'Email',
+  browsers: 'Browsers',
 };
 let page = '',
   revision = 0,
@@ -98,8 +103,11 @@ function facts(items) {
     if (val !== undefined && val !== '' && val !== null) dl.append(el('dt', {}, key), el('dd', {}, val));
   return dl;
 }
+let fieldNumber = 0;
 function field(name, node) {
-  return el('label', { class: 'field' }, el('span', {}, name), node);
+  const labelId = 'field-label-' + ++fieldNumber;
+  node.setAttribute('aria-labelledby', labelId);
+  return el('label', { class: 'field' }, el('span', { id: labelId }, name), node);
 }
 function input(name, max = 200) {
   return el('input', { name, required: true, maxlength: max });
@@ -125,7 +133,9 @@ function staffSelect(name) {
 }
 function showDialog(title, ...children) {
   byId('dialog-title').textContent = title;
-  byId('dialog-content').replaceChildren(...children);
+  byId('dialog-content').replaceChildren(
+    ...children.filter((child) => child !== null && child !== undefined),
+  );
   if (!dialog.open) dialog.showModal();
 }
 function form(title, fields, submitLabel, handle) {
@@ -172,7 +182,7 @@ byId('sidebar').addEventListener('click', (event) => {
 });
 byId('dialog-close').addEventListener('click', () => dialog.close());
 function pageName() {
-  const hash = location.hash.slice(1);
+  const hash = location.hash.slice(1).split('?')[0];
   return Object.hasOwn(sections, hash) ? hash : location.pathname === '/chat' ? 'chat' : 'dashboard';
 }
 function navigate(target) {
@@ -205,6 +215,14 @@ async function render() {
     if (page === 'goals' || page === 'tasks') await workPage(page, token);
     if (page === 'activity') await activityPage(token);
     if (page === 'directory') directoryPage();
+    const extraPages = {
+      files: filesPage,
+      settings: settingsPage,
+      projects: projectsPage,
+      mail: mailPage,
+      browsers: browsersPage,
+    };
+    if (Object.hasOwn(extraPages, page)) await extraPages[page](token);
     if (page === 'chat' || page === 'admin') await chatPage(page === 'admin', token);
   } catch (error) {
     if (token === revision) {
@@ -725,6 +743,12 @@ function profile(a) {
         ),
       );
   }
+  controls.append(
+    btn('SOUL.md', () => showSoul(a.id)),
+    btn('Employee memory', () => knowledgeDialog(a.id)),
+    btn('Effective settings', () => effectiveSettingsDialog(a.id)),
+    btn('Authority and budget', () => employeeAuthority(a.id)),
+  );
   showDialog(
     a.name,
     facts([
@@ -744,18 +768,18 @@ async function openDM(peerId) {
   pendingConversation = conversation;
   await navigate('chat');
 }
-function groupForm() {
+function groupForm(title = '') {
   const options = activeEmployees().map((a) => [a.id, a.name + ' · ' + a.role]);
   form(
     'New group',
-    [field('Group name', input('title', 160)), checks('Members', 'members', options)],
+    [field('Group name', textControl('title', title, { max: 160 })), checks('Members', 'members', options)],
     'Create group',
     async (data) => {
       const members = data.getAll('members');
       if (!members.length) throw new Error('Choose at least one employee.');
       const result = await change('conversations.group', { title: data.get('title'), members });
       pendingConversation = result.conversation;
-      await render();
+      await navigate('chat');
     },
   );
 }
@@ -922,7 +946,7 @@ function transcriptMessage(msg, showDelivery = false) {
       ' · ',
       el('time', { datetime: msg.createdAt }, date(msg.createdAt)),
     ),
-    el('p', { class: 'bubble' }, msg.text),
+    el('p', { class: 'bubble' }, protectedMessageText(msg.text)),
     showDelivery && own && msg.responders?.length
       ? btn('Delivery', () => deliveryStatus(msg), { class: 'link delivery' })
       : null,
@@ -1055,6 +1079,7 @@ function composer(state, c) {
     send = form.querySelector('#send');
   const current = drafts.get(c.id) || { text: '', responders: [] };
   text.value = current.text;
+  form.querySelector('.composer-foot').before(fileLinkPicker(text));
   if (c.type === 'group') {
     const options = c.members
       .filter((id) => id !== 'owner' && person(id)?.desiredState !== 'fired')
