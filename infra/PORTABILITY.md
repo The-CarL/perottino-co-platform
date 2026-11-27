@@ -22,8 +22,8 @@ Pass the complete project provenance through the stack’s `--tags` option at cr
 
 | Template | What it provisions |
 | --- | --- |
-| [Runtime bootstrap](runtime-bootstrap.yaml) | A provider-named ECR repository with immutable tags and permission for the project-scoped console, factory and optional mail functions to pull their image, and an empty Secrets Manager slot for the owner verifier. |
-| [Git credential](github-pat.yaml) | The retained projects Git credential slot at `/perottino-co/github/pat`. The owner supplies the value separately. The current runtime has no grant to read it. Reuse its owning stack if it already exists in the destination account and region. |
+| [Runtime bootstrap](runtime-bootstrap.yaml) | A provider-named immutable ECR repository, a private versioned release-template bucket and an empty Secrets Manager slot for the owner verifier. |
+| [Git credential](github-pat.yaml) | The retained projects Git credential slot at `/perottino-co/github/pat`. The owner supplies the value separately. Only the configured projects Git worker reads its exact ARN. Reuse its owning stack if it already exists in the destination account and region. |
 
 For a fresh target, create the runtime bootstrap stack with the scope used in hosted synthesis. The Git credential template takes no parameters. Use a distinct stack name for each. For existing stacks, review a change set against the recorded stack instead of creating another copy.
 
@@ -35,7 +35,7 @@ aws cloudformation wait stack-create-complete --region "$AWS_REGION" --stack-nam
 aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$BOOTSTRAP_STACK" --query 'Stacks[0].Outputs'
 ```
 
-Before initializing owner access, check the owner slot's version metadata. For a new installation, use the owner setup command with a temporary protected `DATA_DIR` and a password supplied on stdin. Save the resulting `owner.json` as the bootstrap `OwnerSecretArn`'s value from a protected file. This JSON contains only `username` and the salted Argon2id `passwordHash`. Preserve existing secrets across ordinary releases. The PAT is independent of sign-in, browser and model access.
+Before initializing owner access, check the owner slot's version metadata. For a new installation, use the owner setup command with a temporary protected `DATA_DIR` and a password supplied on stdin. Save the resulting `owner.json` as the bootstrap `OwnerSecretArn`'s value from a protected file. This JSON contains only `username` and the salted Argon2id `passwordHash`. Preserve existing secrets across ordinary releases. Set the projects Git worker’s `projectsGitSecretArn` and `projectsRepository` when enabling GitHub delivery. Pass a raw fine-grained PAT scoped to the selected repository. A public projects repository publishes the committed code and PR publicly. [Projects and handoffs](PROJECTS.md)
 
 ## Publish and synthesize
 
@@ -52,12 +52,20 @@ Fill the private hosted configuration with `workerImage` and `lambdaImage` from 
 
 ## Review and execute the change set
 
-Use `artifacts.Hosted.properties.stackName` from the generated assembly manifest as `HOSTED_STACK`, and supply its tags. Choose `CREATE` for a fresh stack and `UPDATE` for a subsequent release. Preserve the existing DynamoDB table, employee directory and owner secret. V2 conversation, work and audit records use a new `V2#` partition-key namespace within that table. Earlier messages, notes, goals and leases stay in their original format. They require a separately verified migration to appear in V2. When upgrading an active installation, quiesce older workers and writes, reconcile in-flight effects and retain a recovery point. Review the change set for replacements of durable resources before proceeding.
+The hosted template exceeds CloudFormation’s 51,200-byte inline limit. The release stager verifies the assembly target, source tags, pinned images, caller identity, bootstrap stack and the private bucket’s versioning and public-access configuration. It conditionally writes `releases/<source-sha>/<template-sha256>/Hosted.template.json`, verifies the S3 checksum and version, and prints the exact HTTPS URL used for the change set. A retry with identical bytes reuses the stored object version. CloudFormation accepts up to 1 MiB using `TemplateURL`. [CreateChangeSet](https://docs.aws.amazon.com/AWSCloudFormation/latest/APIReference/API_CreateChangeSet.html) · [Conditional S3 writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+
+For an existing release bootstrap, review and apply its update first if its outputs do not include `ReleaseTemplateBucketName`. The staging identity needs `sts:GetCallerIdentity`, `cloudformation:DescribeStacks`, and `s3:GetBucketLocation`, `s3:GetBucketTagging`, `s3:GetBucketVersioning` and `s3:GetBucketPublicAccessBlock` on that bucket. Limit `s3:PutObject`, `s3:PutObjectTagging`, `s3:GetObject` and `s3:GetObjectVersion` to its `releases/*` prefix. The identity used by CloudFormation must be able to fetch the pinned template. The bootstrap provisioner additionally needs the S3 bucket configuration and policy actions declared in the template. Application employees and deployable previews need no permissions on the release bucket.
+
+Use AWS CLI v2 with conditional S3 PutObject support, Node 24 and the verified release identity. Set the source revision to the 40-character commit recorded in `factory:last-source-commit`. Supply the same project scope as the bootstrap and use the account, region, source, assembly and tags selected for this release. Put the receipt in the private release inventory.
 
 ```sh
+TEMPLATE_URL=$(node scripts/stage-hosted-template.mjs \
+  --assembly "$PRIVATE_ASSEMBLY" --account "$DESTINATION_ACCOUNT" --region "$AWS_REGION" \
+  --scope "$PROJECT_SCOPE" --source "$SOURCE_SHA" --bootstrap-stack "$BOOTSTRAP_STACK" \
+  --receipt "$PRIVATE_RELEASE_DIR/hosted-template-receipt.json") || exit 1
 aws cloudformation create-change-set --region "$AWS_REGION" --stack-name "$HOSTED_STACK" \
   --change-set-name "$RELEASE_ID" --change-set-type "$CHANGE_TYPE" \
-  --template-body file://"$PRIVATE_ASSEMBLY/Hosted.template.json" \
+  --client-token "$RELEASE_ID" --template-url "$TEMPLATE_URL" \
   --capabilities CAPABILITY_NAMED_IAM --tags file://"$PRIVATE_TAG_FILE"
 aws cloudformation wait change-set-create-complete --region "$AWS_REGION" \
   --stack-name "$HOSTED_STACK" --change-set-name "$RELEASE_ID"
@@ -65,7 +73,7 @@ aws cloudformation describe-change-set --region "$AWS_REGION" \
   --stack-name "$HOSTED_STACK" --change-set-name "$RELEASE_ID"
 ```
 
-If the private template exceeds CloudFormation's 51,200-byte inline limit, stage it under a versioned key in the account's private release bucket and supply its HTTPS S3 URL with `--template-url`. Execute the reviewed named change set when a deployment is authorized. Wait for stack completion, enable termination protection, and keep stack IDs, target configuration, secret references, source SHA and image digests in the private inventory.
+Choose `CREATE` for a fresh stack and `UPDATE` for an existing one. Read `HOSTED_STACK` from `artifacts.Hosted.properties.stackName` in the assembly manifest. Review IAM permissions, source attribution and replacement of retained resources before executing the named change set. Wait for stack completion and enable termination protection. Retain the private target parameters, template receipt, both image digests and stack ID. V2 conversations, work and audit records live under the `V2#` namespace. An upgrade from the pre-V2 pilot needs a separately verified migration to include earlier messages, notes, goals and leases in V2 views.
 
 Verify the existing roster and owner login after the update. Use a fresh V2 DM and an explicit goal to validate conversation delivery, evidence submission and review. For an installation built on the older single-host SQLite design, preserve its data and suspended work, test a separate import and rehearse rollback before switching traffic.
 
@@ -75,7 +83,7 @@ Capture the deployed stack IDs, physical resource IDs, project tags, protection 
 
 1. Suspend the company through the owner factory and verify that the cluster drains. Keep the factory and its permissions available for the hosted stack's deletion callback.
 2. Delete the hosted stack and check its terminal events. Reconcile the retained employee table, log group and every revision of the worker task-definition family against the inventory. Check for running tasks and remaining task network interfaces before removing a dedicated network stack.
-3. After the functions and workers are gone, remove the release-bootstrap and Git-secret stacks. Their retention policies leave the image repository and credential slots for explicit cleanup. Verify each physical resource and its scope before deleting it. Record the chosen Secrets Manager recovery deadline.
+3. After the functions and workers are gone, remove the release-bootstrap and Git-secret stacks. Their retention policies leave the image repository, release-template bucket and credential slots for explicit cleanup. Inventory every version and delete marker in the release bucket before deleting it. Its lifecycle expires current template objects after 365 days and noncurrent versions after 30 further days. Keep any longer-lived archive under the owner’s retention policy. The hosted corporate-files bucket has separate owners, version history and data-retention decisions. Verify each physical resource and its scope before deleting it. Record the chosen Secrets Manager recovery deadline.
 4. Apply the owner's data decision to the retained table and any backups. Check DynamoDB backup inventory again after deletion. Verify the former API, compute, images, IAM roles, monitoring and project-owned network resources individually. Record provider-managed history and any pending deletion separately.
 
 ## Cost at pilot scale
