@@ -32,10 +32,11 @@ test('one explicitly bootstrapped CEO uses standalone employee tasks with durabl
   assert.ok(table.DeletionProtectionEnabled && table.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled);
   assert.deepEqual(table.KeySchema.map(k => k.AttributeName), ['pk', 'sk']);
   assert.equal(table.StreamSpecification, undefined);
-  for (const id of ['State', 'Logs']) {
-    assert.equal(r[id].DeletionPolicy, 'Retain');
-    assert.equal(r[id].UpdateReplacePolicy, 'Retain');
+  for (const policy of ['DeletionPolicy', 'UpdateReplacePolicy']) {
+    const retained = Object.keys(r).filter(id => r[id][policy] === 'Retain').sort();
+    assert.deepEqual(retained, ['Logs', 'State', 'WorkerTask']);
   }
+  assert.equal(r.WorkerTask.Properties.Family, 'factory-11111111-1111-4111-8111-111111111111-example-r-worker');
   const bootstrap = r.ResidentCompany;
   assert.equal(bootstrap.Type, 'Custom::ResidentCompany');
   assert.equal(bootstrap.DeletionPolicy, undefined);

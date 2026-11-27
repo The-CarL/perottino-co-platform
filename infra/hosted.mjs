@@ -115,7 +115,7 @@ export function synthHosted(config, provenance, outdir) {
     allow(['bedrock-agentcore:StartBrowserSession', 'bedrock-agentcore:StopBrowserSession',
       'bedrock-agentcore:ConnectBrowserAutomationStream'], browser)], ecsArn + '*');
   const [cpu, memory] = workerSizes[config.workerSize ?? 'small'];
-  const workerTask = resource('WorkerTask', 'ECS::TaskDefinition', { Family: prefix + 'worker', NetworkMode: 'awsvpc',
+  const workerTask = retain(resource('WorkerTask', 'ECS::TaskDefinition', { Family: prefix + 'worker', NetworkMode: 'awsvpc',
     RequiresCompatibilities: ['FARGATE'], Cpu: cpu, Memory: memory, RuntimePlatform: { OperatingSystemFamily: 'LINUX', CpuArchitecture: 'X86_64' },
     TaskRoleArn: arn(workerRole), ExecutionRoleArn: arn(executionRole), ContainerDefinitions: [{
       Name: 'worker', Image: config.workerImage, User: '1000:1000', Command: ['node', 'src/resident.mjs'],
@@ -124,7 +124,7 @@ export function synthHosted(config, provenance, outdir) {
         PEROTTINO_FACTORY_MANAGER_ARN: functionArn('m'), PEROTTINO_BEDROCK_MODEL: config.bedrockModel,
         PEROTTINO_BROWSER_ID: 'aws.browser.v1' }).map(([Name, Value]) => ({ Name, Value })),
       LogConfiguration: { LogDriver: 'awslogs', Options: { 'awslogs-region': region, 'awslogs-group': logs.ref, 'awslogs-stream-prefix': 'employee' } },
-    }] });
+    }] }));
   function fn(id, suffix, handler, functionRole, variables, timeout = 30) {
     return resource(id, 'Lambda::Function', { FunctionName: prefix + suffix, PackageType: 'Image', Architectures: ['x86_64'],
       Code: { ImageUri: config.lambdaImage }, ImageConfig: { Command: [handler] }, Role: arn(functionRole), Timeout: timeout,
