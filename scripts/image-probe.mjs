@@ -207,7 +207,27 @@ async function mail() {
     receipt:{recipients:[to],spamVerdict:{status:'PASS'},virusVerdict:{status:'PASS'}},content:Buffer.from(rawMessage).toString('base64')};
   const event = {Records:[{EventSource:'aws:sns',Sns:{TopicArn:topicArn,Message:JSON.stringify(payload)}}]};
   assert.deepEqual(await eventually(() => invoke(event)),{delivered:1,ignored:0});
+  assert.deepEqual(await invoke(event),{delivered:1,ignored:0});
+  const {makeDynamoRecords} = await import('./src/foundation-records.mjs');
+  const {createCompanyMail} = await import('./src/company-mail.mjs');
+  const records = makeDynamoRecords({tableName});
+  const employees = await store();
+  try {
+    const inbox = createCompanyMail({records,store:employees,domain:'company.example.com'});
+    const {threads} = await inbox.execute('owner','mail.list',{employeeId:'ceo'});
+    assert.equal(threads.length,1);
+    const {messages} = await inbox.execute('owner','mail.get',{threadId:threads[0].id});
+    assert.equal(messages.length,1);
+    assert.equal(messages[0].direction,'inbound');
+    assert.equal(messages[0].trustedOwner,false);
+    assert.equal(messages[0].text,'Hello Mara.');
+  } finally {records.close();employees.close();}
 }
-const phases = {fixtures, setup, native, secondMessage, verify, pause, goals, factory, owner, manager, mail};
+async function mailSender() {
+  // The test table contains only received email. Exercise the packaged outbox handler
+  // without creating a send intent or connecting to a mail recipient.
+  assert.deepEqual(await eventually(()=>invoke({operation:'dispatch'})),{ok:true});
+}
+const phases = {fixtures, setup, native, secondMessage, verify, pause, goals, factory, owner, manager, mail, mailSender};
 if (!Object.hasOwn(phases, phase)) throw new Error('Unknown image smoke phase');
 await phases[phase]();

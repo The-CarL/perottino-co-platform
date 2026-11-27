@@ -68,9 +68,10 @@ try {
   const factoryEnv = ['--env','PEROTTINO_CLUSTER_ARN=arn:aws:ecs:us-east-1:111111111111:cluster/resident',
     '--env','PEROTTINO_TASK_DEFINITION_ARN=arn:aws:ecs:us-east-1:111111111111:task-definition/worker:1',
     '--env','PEROTTINO_PUBLIC_SUBNET_IDS=subnet-test','--env','PEROTTINO_SECURITY_GROUP_ID=sg-test','--env','PEROTTINO_EMPLOYEE_LIMIT=3',
-    '--env','PEROTTINO_MAIL_DOMAIN=company.example.com','--env','PEROTTINO_MAIL_TOPIC_ARN=arn:aws:sns:us-east-1:111111111111:test-mail'];
+    '--env','PEROTTINO_MAIL_DOMAIN=company.example.com','--env','PEROTTINO_MAIL_TOPIC_ARN=arn:aws:sns:us-east-1:111111111111:test-mail',
+    '--env','PEROTTINO_MAIL_CONFIGURATION_SET=fixture-mail','--env','AWS_ENDPOINT_URL_SES_V2=http://127.0.0.1:1'];
   for (const [phase,handler] of Object.entries({factory:'src/factory.handler',owner:'src/factory.owner',manager:'src/factory.manager',
-    mail:'src/email-ingress.handler'})) {
+    mail:'src/email-ingress.handler',mailSender:'src/company-mail-ses.handler'})) {
     const fn = start(phase,[...common,...lambdaLimits,...factoryEnv,lambda,handler]);
     try { runProbe(fn,phase); } finally { stop(fn); }
   }
@@ -106,7 +107,7 @@ try {
   stop(web);
   stop(broker);
   console.log('Packaged foundation owner API and employer broker, real worker heartbeat, scoped message delivery and durable employee reply passed.');
-  console.log('Packaged API, two successive messages served by one resident, source memory, goal checkpoints, pause, factory handlers and mail ingress passed.');
+  console.log('Packaged API, two successive messages served by one resident, source memory, goal checkpoints, pause, factory handlers, threaded mail ingress and outbox startup passed.');
 } finally {
   for (const name of [...tasks].reverse()) stop(name);
 }

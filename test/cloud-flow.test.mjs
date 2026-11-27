@@ -8,6 +8,11 @@ import { hashPassword } from '../src/auth.mjs';
 import { createCloudHandler } from '../src/cloud-api.mjs';
 import { createCloudStore } from '../src/cloud-store.mjs';
 import { createEmailIngress } from '../src/email-ingress.mjs';
+import { createCompanyMail } from '../src/company-mail.mjs';
+import { createLocalMailTransport } from '../src/company-mail-outbox.mjs';
+import { createCompanyService } from '../src/company-service.mjs';
+import { runCompanyPulse } from '../src/company-worker.mjs';
+import { makeDynamoRecords } from '../src/foundation-records.mjs';
 import { createFactoryState } from '../src/factory-state.mjs';
 import { createEmployeeFactory } from '../src/factory.mjs';
 import { executeResidentPulse, managerTool } from '../src/resident.mjs';
@@ -71,8 +76,8 @@ const tick = {source:'aws.events','detail-type':'Scheduled Event'};
 
 function publicMail(to) {
   const content = 'From: Person <person@example.test>\r\nTo: ' + to + '\r\nSubject: Dataset\r\n'
-    + 'Content-Type: text/plain; charset=utf-8\r\n\r\nPlease check the public dataset.';
-  const envelope = {notificationType:'Received',receipt:{recipients:[to],spamVerdict:{status:'PASS'},virusVerdict:{status:'PASS'}},
+    + 'Message-ID: <dataset@example.test>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlease check the public dataset.';
+  const envelope = {notificationType:'Received',receipt:{recipients:[to],spamVerdict:{status:'PASS'},virusVerdict:{status:'PASS'},spfVerdict:{status:'PASS'}},
     mail:{messageId:'resident-integration-mail',source:'person@example.test'},content:Buffer.from(content).toString('base64')};
   return {Records:[{EventSource:'aws:sns',Sns:{TopicArn:topicArn,Message:JSON.stringify(envelope)}}]};
 }
@@ -155,16 +160,44 @@ test('standalone employees process existing mailboxes, recover goals, recruit un
     ]);
     const memories = await api('ceo','memory');
     assert.deepEqual(memories.memories.map(({text,sourceMessageId})=>[text,sourceMessageId]),[[note,first.message.id]]);
-    const mail = createEmailIngress({store:freshStore(),domain,topicArn});
+    const records = makeDynamoRecords({tableName,client:doc});
+    const mailbox = createCompanyMail({records,store:freshStore(),domain});
+    const receive = createEmailIngress({mail:mailbox,store:freshStore(),domain,topicArn});
     const letter = publicMail('ceo@' + domain);
-    assert.equal((await mail(letter)).delivered,1);
-    assert.equal((await mail(letter)).delivered,1);
-    await pulse(ceoTask);
-    const mailbox = (await api('ceo','messages')).messages;
-    const incoming = mailbox.filter(message=>message.sourceKind === 'email');
-    assert.equal(incoming.length,1,'Duplicate SES delivery must produce one durable inbox message');
-    assert.match(incoming[0].text,/Please check the public dataset/);
-    assert.match(mailbox.at(-1).text,/received external correspondence/i);
+    await receive(letter);
+    await receive(letter);
+    // Use a fresh service just as the broker does, backed by the same hosted record format.
+    // The local capture transport exercises the real outbox without calling an external service.
+    const company = createCompanyService({records:makeDynamoRecords({tableName,client:doc}),store:freshStore(),
+      adapters:{mail:{domain},mailTransport:records=>createLocalMailTransport({records})}});
+    const {threads} = await company.execute('owner','mail.list',{employeeId:'ceo'});
+    assert.equal(threads.length,1);
+    const readThread = () => company.execute('owner','mail.get',{threadId:threads[0].id});
+    const incoming = (await readThread()).messages;
+    assert.equal(incoming.length,1,'Duplicate SES delivery must produce one durable email');
+    assert.equal(incoming[0].from,'person@example.test');
+    assert.equal(incoming[0].trustedOwner,false);
+    let calls = 0;
+    const state = await runCompanyPulse({actor:await freshStore().employee('ceo'),workerId:ceoTask.taskArn,
+      mode:'local',execute:(op,input)=>company.execute('ceo',op,input),decide:context=>{
+        calls++;
+        assert.deepEqual(context.allowed.slice().sort(),['pass','reply']);
+        assert.equal(context.message.text,'Please check the public dataset.');
+        assert.equal(context.history,undefined);
+        assert.equal(context.directory,undefined);
+        return {op:'reply',input:{text:'Received the dataset question.'}};
+      }});
+    assert.equal(state,'worked');
+    assert.equal(calls,1);
+    const thread = await readThread();
+    assert.equal(thread.messages.length,2);
+    const reply = thread.messages[1];
+    assert.equal(reply.status,'sent');
+    assert.equal(reply.to,'person@example.test');
+    assert.equal(reply.inReplyTo,'<dataset@example.test>');
+    assert.equal(reply.text,'Received the dataset question.');
+    assert.deepEqual((await api('ceo','messages')).messages,history.messages,
+      'Private owner DMs remain separate from email correspondence');
     assert.equal(ecs.startRequests.length,1,'Chat and email must never request another task');
 
     // Drive recruitment from a model decision inside the resident. Only the
