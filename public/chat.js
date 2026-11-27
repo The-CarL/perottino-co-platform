@@ -1,733 +1,1157 @@
 'use strict';
-
-const get = id => document.getElementById(id);
-const picker = get('picker');
-const historyPane = get('history');
-const input = get('messageText');
-const narrow = matchMedia('(max-width: 700px)');
-const overlayMemory = matchMedia('(max-width: 1050px)');
-const timeLabel = new Intl.DateTimeFormat(undefined, {hour:'numeric', minute:'2-digit'});
-const dayLabel = new Intl.DateTimeFormat(undefined, {month:'long', day:'numeric', year:'numeric'});
-const state = {
-  agents: [], agent: null, recent: [], messages: [], memories: [], status: 'idle',
-  drafts: new Map(), requests: new Map(), sending: new Set(), sendErrors: new Map(),
-  loaded: false, directoryLoaded: false, readError: '', memoryError: '', pollVersion: 0
+const byId = (id) => document.getElementById(id);
+const content = byId('content');
+const actions = byId('page-actions');
+const dialog = byId('dialog');
+const sections = {
+  dashboard: 'Dashboard',
+  goals: 'Goals',
+  tasks: 'Tasks',
+  activity: 'Activity',
+  chat: 'Chat',
+  directory: 'Directory',
+  admin: 'Admin',
 };
-let directoryRequest = null;
-let pollTimer;
-let directoryCheckedAt = 0;
-let lastFocus = null;
-let noteAction = null;
-let sourceRequest = 0;
-const employment = new Map();
-const employeeRequests = new Map();
-let profileRead = 0;
-let actionPending = false;
-const pages = {
-  messages:{button:get('earlierMessages'),label:'Load earlier messages',items:'messages'},
-  memory:{button:get('moreNotes'),label:'More notes',items:'memories'}
-};
-function resetPages() {
-  for (const page of Object.values(pages)) {
-    page.cursor = null;
-    page.expanded = false;
-    page.button.hidden = true;
-    page.button.disabled = false;
-    page.button.textContent = page.label;
-  }
-}
-function uniqueRows(rows) {
-  return Array.from(new Map(rows.map(row => [row.id,row])).values());
-}
-function applyLatest(kind, data) {
-  const page = pages[kind];
-  const previous = state[page.items];
-  const head = data[page.items];
-  let rows = head;
-  if (page.expanded && data.nextCursor && head.length) {
-    const boundary = kind === 'messages' ? head[0] : head.at(-1);
-    const at = previous.findIndex(row => row.id === boundary.id);
-    if (at >= 0) rows = kind === 'messages' ? [...previous.slice(0,at),...head] : [...head,...previous.slice(at+1)];
-    else page.expanded = false;
-  } else page.expanded = false;
-  if (!page.expanded) page.cursor = data.nextCursor;
-  page.button.hidden = !page.cursor;
-  state[page.items] = rows;
-  return JSON.stringify(previous) !== JSON.stringify(rows);
-}
-async function loadEarlier(kind) {
-  const page = pages[kind];
-  const agent = state.agent;
-  const cursor = page.cursor;
-  if (!agent || !cursor || page.button.disabled) return;
-  page.button.disabled = true;
-  try {
-    const response = await api(url(agent.id,kind) + '?cursor=' + encodeURIComponent(cursor));
-    const data = await response.json();
-    if (state.agent?.id !== agent.id || page.cursor !== cursor) return;
-    const older = data[page.items];
-    const previous = state[page.items];
-    state[page.items] = uniqueRows(kind === 'messages' ? [...older,...previous] : [...previous,...older]);
-    page.expanded = true;
-    page.cursor = data.nextCursor;
-    page.button.hidden = !page.cursor;
-    page.button.textContent = page.label;
-    if (kind === 'messages') {
-      renderTimeline(false);
-      historyPane.scrollTop = 0;
-    } else renderMemory();
-  } catch {
-    if (state.agent?.id === agent.id) page.button.textContent = 'Retry loading ' + (kind === 'messages' ? 'messages' : 'notes');
-  } finally { page.button.disabled = false; }
-}
-async function openSource(messageId) {
-  const source = get('message-' + messageId);
-  if (source) {
-    if (overlayMemory.matches) toggleMemory(false);
-    source.focus({preventScroll:true});
-    source.scrollIntoView({block:'center'});
-    return;
-  }
-  const version = ++sourceRequest;
-  get('sourceMeta').textContent = '';
-  get('sourceBody').textContent = 'Loading source message…';
-  get('sourceDialog').showModal();
-  try {
-    const response = await api(url(state.agent.id,'messages/' + encodeURIComponent(messageId)));
-    const {message} = await response.json();
-    if (version !== sourceRequest) return;
-    const stamp = new Date(message.createdAt);
-    const date = Number.isNaN(stamp.getTime()) ? '' : dayLabel.format(stamp);
-    get('sourceMeta').textContent = [messageAuthor(message),date].filter(Boolean).join(' · ');
-    get('sourceBody').textContent = message.text;
-  } catch {
-    if (version === sourceRequest) get('sourceBody').textContent = 'The source message is unavailable.';
-  }
-}
+let page = '',
+  revision = 0,
+  roster = [],
+  chat = null,
+  refreshTimer;
+const drafts = new Map();
+const requestKeys = new Map();
 
-function element(tag, className, content) {
-  const result = document.createElement(tag);
-  if (className) result.className = className;
-  if (content !== undefined) result.textContent = content;
-  return result;
-}
-function messageAuthor(message) {
-  if (message.author === 'owner') return 'You';
-  if (message.author === 'employee') return state.agents.find(person => person.id === message.senderAgentId)?.name || 'Coworker';
-  if (message.author === 'external') return message.email?.from ? 'Email from ' + message.email.from : 'External email';
-  return state.agent.name;
-}
-function showEmployeeState(profile) {
-  employment.set(profile.id, profile.desiredState);
-  if (state.agent?.id !== profile.id) return;
-  input.disabled = profile.desiredState === 'fired';
-  updateComposer();
-  renderStatus();
-}
-function renderEmployee({employee, goals}) {
-  showEmployeeState(employee);
-  const manager = state.agents.find(person => person.id === employee.managerId);
-  const fields = [['Employment', employee.desiredState], ['Runtime', employee.runtimeStatus],
-    ['Reports to', manager?.name || employee.managerId || 'Owner'], ['Can hire', employee.canHire ? 'Yes' : 'No']];
-  get('employeeFacts').replaceChildren(...fields.flatMap(([key,value]) => [element('dt','',key), element('dd','',value)]));
-  const archived = employee.desiredState === 'fired';
-  get('toggleEmployment').hidden = archived;
-  get('toggleEmployment').textContent = employee.desiredState === 'paused' ? 'Resume employee' : 'Pause employee';
-  get('fireEmployee').hidden = archived;
-  get('goalForm').hidden = archived;
-  const rows = goals.map(goal => {
-    const article = element('article','goal-summary');
-    article.append(element('strong','',goal.text), element('p','muted',goal.status + ' · ' + goal.stepCount + (goal.stepCount === 1 ? ' step' : ' steps')));
-    if (goal.checkpoint) {
-      let progress = goal.checkpoint;
-      try {
-        const checkpoint = JSON.parse(progress);
-        if (Array.isArray(checkpoint?.progress)) progress = checkpoint.progress.filter(item => typeof item === 'string').join('\n');
-      } catch { /* Local checkpoints contain human-readable progress. */ }
-      if (progress) article.append(element('p','',progress));
-    }
-    if (goal.status === 'waiting' && goal.nextRunAt) {
-      const next = new Date(goal.nextRunAt);
-      if (Number.isFinite(next.getTime())) article.append(element('p','muted','Next check ' + next.toLocaleString()));
-    }
-    return article;
-  });
-  get('employeeGoals').replaceChildren(...(rows.length ? rows : [element('p','muted','No goals assigned.')]));
-}
-async function refreshEmployee() {
-  const id = state.agent?.id;
-  const version = ++profileRead;
-  try {
-    const result = await (await api(url(id,'employee'))).json();
-    if (version === profileRead && id === state.agent?.id && get('employeeDialog').open) renderEmployee(result);
-  } catch {
-    if (version === profileRead && get('employeeDialog').open) get('employeeStatus').textContent = 'Employee details could not be loaded. Select Refresh to try again.';
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (value === undefined || value === null || value === false) continue;
+    if (key === 'class') node.className = value;
+    else if (key === 'onClick') node.addEventListener('click', () => run(value));
+    else node.setAttribute(key, value === true ? '' : String(value));
   }
-}
-function openEmployee() {
-  const agent = state.agent;
-  if (!agent) return;
-  get('employeeHeading').textContent = agent.name;
-  get('employeeRole').textContent = fullRole(agent);
-  get('goalText').value = employeeRequests.get(agent.id + '/goals')?.text || '';
-  get('employeeFacts').replaceChildren();
-  get('employeeGoals').replaceChildren();
-  get('toggleEmployment').hidden = get('fireEmployee').hidden = get('goalForm').hidden = true;
-  get('employeeStatus').textContent = '';
-  get('employeeDialog').showModal();
-  void refreshEmployee();
-}
-async function employeeAction(operation) {
-  const agent = state.agent;
-  if (!agent || actionPending) return;
-  const goal = operation === 'goals';
-  const text = goal ? get('goalText').value.trim() : '';
-  if (goal && !text) return;
-  if (operation === 'fire' && !window.confirm('Fire ' + agent.name + '? Their work will stop permanently. Their history will remain available.')) return;
-  const resource = goal ? operation : 'lifecycle/' + operation;
-  const key = agent.id + '/' + resource;
-  let request = employeeRequests.get(key);
-  if (!request || (goal && request.text !== text)) {
-    request = {requestId:crypto.randomUUID(), ...(goal ? {text} : {})};
-    employeeRequests.set(key,request);
-  }
-  actionPending = true;
-  const controls = ['assignGoal','toggleEmployment','fireEmployee','refreshEmployee','goalText'];
-  for (const id of controls) get(id).disabled = true;
-  const sameEmployee = () => state.agent?.id === agent.id && get('employeeDialog').open;
-  get('employeeStatus').textContent = 'Saving…';
-  try {
-    const response = await api(url(agent.id,resource),{method:'POST',
-      headers:{'Content-Type':'application/json','X-Requested-With':'owner-console'}, body:JSON.stringify(request)});
-    const result = await response.json();
-    employeeRequests.delete(key);
-    if (result.employee) showEmployeeState(result.employee);
-    if (sameEmployee()) {
-      if (goal) get('goalText').value = '';
-      get('employeeStatus').textContent = goal ? 'Goal assigned.' : 'Employment updated.';
-      await refreshEmployee();
-    }
-  } catch (error) {
-    if (sameEmployee()) {
-      get('employeeStatus').textContent = error.status === 409 ? 'This action conflicts with the current employee state or a previous request.' :
-        'The action could not be confirmed. Retry it to check the same request.';
-      if (error.status === 409) await refreshEmployee();
-    }
-  } finally {
-    actionPending = false;
-    for (const id of controls) get(id).disabled = false;
-  }
-}
-function icon(id) {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
-  const use = document.createElementNS(svg.namespaceURI,'use');
-  use.setAttribute('href','#i-' + id);
-  svg.setAttribute('aria-hidden','true');
-  svg.append(use);
-  return svg;
-}
-async function api(path, options = {}) {
-  const r = await fetch(path, {credentials:'same-origin', cache:'no-store', ...options});
-  if (!r.ok) {
-    const e = new Error('Request failed');
-    e.status = r.status;
-    throw e;
-  }
-  return r;
-}
-function url(id, resource) {
-  return '/api/agents/' + encodeURIComponent(id) + '/' + resource;
-}
-function handle(agent) { return '@' + String(agent.handle || agent.id).replace(/^@/, ''); }
-function fullRole(agent) { return [agent.role, handle(agent)].filter(Boolean).join(' · '); }
-function headerMeta(agent) {
-  return [fullRole(agent), get('runtime').textContent === 'Local simulator' ? 'Local simulator' : ''].filter(Boolean).join(' · ');
-}
-function initials(name) {
-  return String(name).trim().split(/\s+/).slice(0,2).map(part => Array.from(part)[0]).join('').toUpperCase() || '·';
-}
-function identifyAvatar(node, agent) {
-  const tone = /^(ceo|chief executive officer)$/i.test(agent.role) ? 0 :
-    Array.from(String(agent.id)).reduce((sum, c) => sum + c.codePointAt(0), 0) % 4;
-  node.classList.remove('tone-0','tone-1','tone-2','tone-3');
-  node.classList.add('tone-' + tone);
-  node.textContent = initials(agent.name);
-}
-function avatar(agent) {
-  const node = element('span','avatar');
-  node.setAttribute('aria-hidden','true');
-  identifyAvatar(node, agent);
+  node.append(...children.flat().filter((child) => child !== undefined && child !== null));
   return node;
 }
-function agentRow(agent, active, select, arrow = false) {
-  const button = element('button','contact-row');
-  button.type = 'button';
-  if (active) button.setAttribute('aria-current','page');
-  const info = element('span','contact-info');
-  info.append(element('strong','',agent.name), element('small','',fullRole(agent)));
-  button.append(avatar(agent),info);
-  if (arrow) button.append(icon('arrow'));
-  button.addEventListener('click', select);
-  return button;
+const btn = (label, onClick, options = {}) => el('button', { type: 'button', onClick, ...options }, label);
+const link = (pageName, label) => el('a', { href: '#' + pageName }, label);
+const empty = (text) => el('p', { class: 'empty' }, text);
+function notify(message = '') {
+  const notice = byId('notice');
+  notice.textContent = message;
+  notice.hidden = !message;
 }
-function renderNav() {
-  const rows = state.recent.map(id => state.agents.find(a => a.id === id)).filter(Boolean)
-    .map(a => agentRow(a, state.agent?.id === a.id, () => selectAgent(a)));
-  if (!rows.length && state.directoryLoaded) rows.push(element('p','no-results','No conversations yet.'));
-  get('conversations').replaceChildren(...rows);
+async function run(fn) {
+  try {
+    await fn();
+  } catch (error) {
+    notify(error.message || 'The request could not be completed.');
+  }
 }
-function renderResults() {
-  const query = get('search').value.trim().toLowerCase().replace(/^@/, '');
-  const matches = state.agents.filter(agent => {
-    const role = String(agent.role || '').toLowerCase();
-    const alias = role === 'chief executive officer' ? 'ceo' : '';
-    return [agent.name, handle(agent), role, alias].some(s => String(s).toLowerCase().includes(query));
+async function api(op, input = {}) {
+  return request('/api/company/' + op, input);
+}
+async function request(path, body) {
+  const response = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'owner-console' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
-  const content = matches.map(a => agentRow(a,false,() => { picker.close(); selectAgent(a, true); },true));
-  if (!content.length) content.push(element('p','no-results',
-    !state.directoryLoaded ? 'The employee directory is loading.' :
-      query ? 'No employees match your search.' : 'The directory has no employees yet.'));
-  get('results').replaceChildren(...content);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || 'Unable to load this record. Please retry.');
+  return data;
 }
-function showPicker(title) {
-  closeNavigation();
-  get('pickerTitle').textContent = title;
-  get('search').value = '';
-  renderResults();
-  picker.showModal();
-  get('search').focus();
-  void loadDirectory();
+// An ambiguous response can be retried without creating a duplicate record.
+async function change(op, input, transport = api) {
+  const key = JSON.stringify([op, input]);
+  const requestId = requestKeys.get(key) || crypto.randomUUID();
+  requestKeys.set(key, requestId);
+  const result = await transport(op, { ...input, requestId });
+  requestKeys.delete(key);
+  return result;
 }
-function showNavigation() {
-  lastFocus = document.activeElement;
-  get('sidebar').classList.add('open');
-  get('sidebarShade').hidden = false;
-  get('openSidebar').setAttribute('aria-expanded','true');
-  updateOverlay();
-  get('closeSidebar').focus();
+const person = (id) => roster.find((a) => a.id === id);
+const nameOf = (id) => (id === 'owner' ? 'Owner' : person(id)?.name || id || 'Unassigned');
+const label = (value) =>
+  String(value || '')
+    .replace(/[_.-]/g, ' ')
+    .replace(/^./, (c) => c.toUpperCase());
+function date(value) {
+  const time = new Date(value);
+  return Number.isNaN(time.getTime())
+    ? ''
+    : time.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
-function closeNavigation() {
-  if (!get('sidebar').classList.contains('open')) return;
-  get('sidebar').classList.remove('open');
-  get('sidebarShade').hidden = true;
-  get('openSidebar').setAttribute('aria-expanded','false');
-  updateOverlay();
-  if (lastFocus?.isConnected) lastFocus.focus();
-  lastFocus = null;
+function status(value) {
+  return el('span', { class: 'badge ' + value }, label(value));
 }
-function toggleMemory(open) {
-  get('memoryPanel').hidden = !open;
-  get('memoryButton').setAttribute('aria-expanded', String(open));
-  get('memoryButton').setAttribute('aria-label', open ? 'Close memory' : 'Open memory');
-  updateOverlay();
-  if (open) {
-    get('closeMemory').focus();
-    void refresh(false);
-  } else get('memoryButton').focus();
+function panel(title, body, extra) {
+  return el(
+    'section',
+    { class: 'panel' },
+    el('div', { class: 'section-head' }, el('h2', {}, title), extra),
+    body,
+  );
 }
-function updateOverlay() {
-  const sideOpen = narrow.matches && get('sidebar').classList.contains('open');
-  const memoryOpen = !get('memoryPanel').hidden && overlayMemory.matches;
-  get('memoryShade').hidden = !memoryOpen;
-  document.querySelector('.chat').inert = sideOpen || memoryOpen;
-  get('sidebar').inert = memoryOpen;
-  get('memoryPanel').inert = sideOpen;
+function facts(items) {
+  const dl = el('dl', { class: 'details' });
+  for (const [key, val] of items)
+    if (val !== undefined && val !== '' && val !== null) dl.append(el('dt', {}, key), el('dd', {}, val));
+  return dl;
 }
-function selectAgent(agent, focus = false) {
-  closeNavigation();
-  const changed = state.agent?.id !== agent.id;
-  if (changed) {
-    state.agent = agent;
-    resetPages();
-    state.messages = [];
-    state.memories = [];
-    state.loaded = false;
-    state.readError = '';
-    state.memoryError = '';
-    state.status = 'idle';
-    state.pollVersion++;
-    input.value = state.drafts.get(agent.id) || '';
-    get('timeline').replaceChildren();
-    get('memoryButton').disabled = false;
-    get('employeeButton').disabled = false;
-    get('memoryOwner').textContent = agent.name + '’s notes';
-    renderMemory();
-  }
-  state.recent = [agent.id, ...state.recent.filter(id => id !== agent.id)];
-  renderNav();
-  get('contactName').textContent = agent.name;
-  get('contactMeta').textContent = headerMeta(agent);
-  identifyAvatar(get('headerAvatar'),agent);
-  input.disabled = employment.get(agent.id) === 'fired';
-  input.placeholder = 'Message ' + agent.name + '…';
-  document.title = agent.name + ' · Company chat · Perottino & Co.';
-  renderStatus();
-  updateComposer();
-  if (focus) input.focus();
-  if (changed) void refresh(true);
+function field(name, node) {
+  return el('label', { class: 'field' }, el('span', {}, name), node);
 }
-function renderStatus() {
-  const agent = state.agent;
-  const notice = state.sendErrors.get(agent?.id) || state.readError;
-  get('notice').hidden = !notice;
-  get('notice').textContent = notice || '';
-  const welcome = get('welcome');
-  welcome.hidden = !!state.messages.length || (!state.loaded && !!agent);
-  if (!welcome.hidden) {
-    get('starters').hidden = !agent;
-    get('welcomeAvatar').hidden = !agent;
-    if (agent) identifyAvatar(get('welcomeAvatar'),agent);
-    get('welcomeTitle').textContent = agent ? 'Your conversation with ' + agent.name : 'Company chat';
-    get('welcomeCopy').textContent = agent ? 'Send a brief, ask a question, or share something to remember.' :
-      state.directoryLoaded ? 'Your employees will appear here when they join the company.' : 'Loading your workspace…';
-  }
-  const activity = get('activity');
-  const busy = state.status === 'queued' || state.status === 'working';
-  activity.classList.toggle('busy', busy);
-  activity.textContent = !agent ? '' : state.sending.has(agent.id) ? 'Sending…' :
-    employment.get(agent.id) === 'fired' ? 'Employment ended. This conversation is archived.' :
-    employment.get(agent.id) === 'paused' ? 'Employee paused. New work will wait until they resume.' :
-    state.status === 'queued' ? 'Message queued for ' + agent.name + '.' :
-    state.status === 'working' ? agent.name + ' is working…' :
-    state.status === 'error' ? 'The last agent run encountered an error.' :
-    !state.loaded && !state.readError ? 'Loading conversation…' : '';
+function input(name, max = 200) {
+  return el('input', { name, required: true, maxlength: max });
 }
-function renderTimeline(scrollToBottom) {
-  const previousEnd = historyPane.scrollHeight - historyPane.scrollTop - historyPane.clientHeight < 90;
-  let previousDate = '';
-  const fragment = document.createDocumentFragment();
-  for (const msg of state.messages) {
-    const date = new Date(msg.createdAt);
-    const valid = !Number.isNaN(date.getTime());
-    const day = valid ? dayLabel.format(date) : '';
-    if (day && day !== previousDate) {
-      fragment.append(element('div','date-line',day));
-      previousDate = day;
+function area(name, max = 2000) {
+  return el('textarea', { name, rows: 3, maxlength: max, required: true });
+}
+function select(name, options) {
+  return el(
+    'select',
+    { name, required: true },
+    options.map(([val, text]) => el('option', { value: val }, text)),
+  );
+}
+function activeEmployees() {
+  return roster.filter((a) => a.desiredState !== 'fired');
+}
+function staffSelect(name) {
+  return select(
+    name,
+    activeEmployees().map((a) => [a.id, a.name + ' · ' + a.role]),
+  );
+}
+function showDialog(title, ...children) {
+  byId('dialog-title').textContent = title;
+  byId('dialog-content').replaceChildren(...children);
+  if (!dialog.open) dialog.showModal();
+}
+function form(title, fields, submitLabel, handle) {
+  const failure = el('div', { class: 'error', role: 'alert', hidden: true });
+  const submit = el('button', { type: 'submit', class: 'primary' }, submitLabel);
+  const node = el(
+    'form',
+    {},
+    ...fields,
+    failure,
+    el(
+      'div',
+      { class: 'form-actions' },
+      btn('Cancel', () => dialog.close()),
+      submit,
+    ),
+  );
+  node.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (submit.disabled) return;
+    submit.disabled = true;
+    failure.hidden = true;
+    try {
+      await handle(new FormData(node));
+    } catch (error) {
+      failure.hidden = false;
+      failure.textContent = error.message;
+    } finally {
+      submit.disabled = false;
     }
-    const owner = msg.author === 'owner';
-    const row = element('article','message ' + (owner ? 'owner' : 'employee'));
-    row.id = 'message-' + msg.id;
-    row.tabIndex = -1;
-    const body = element('div','message-body');
-    const meta = element('div','message-meta');
-    const author = messageAuthor(msg);
-    meta.append(element('strong','',author));
-    if (valid) {
-      const time = element('time','',timeLabel.format(date));
-      time.dateTime = date.toISOString();
-      meta.append(time);
-    }
-    body.append(meta);
-    if (msg.author === 'external' && msg.email?.subject) body.append(element('p','email-subject',msg.email.subject));
-    body.append(element('div','bubble',msg.text));
-    if (msg.status === 'error') body.append(element('small','failed-message','Reply failed'));
-    const sender = msg.author === 'agent' ? state.agent : state.agents.find(person => person.id === msg.senderAgentId);
-    if (sender) row.append(avatar(sender));
-    row.append(body);
-    fragment.append(row);
-  }
-  get('timeline').replaceChildren(fragment);
-  if (scrollToBottom || previousEnd) historyPane.scrollTop = historyPane.scrollHeight;
+  });
+  showDialog(title, node);
 }
-function renderMemory() {
-  if (state.memoryError) {
-    get('memories').replaceChildren(element('p','empty-note',state.memoryError));
+function setMenu(open) {
+  byId('sidebar').classList.toggle('open', open);
+  byId('menu').setAttribute('aria-expanded', String(open));
+}
+byId('menu').addEventListener('click', () => setMenu(!byId('sidebar').classList.contains('open')));
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') setMenu(false);
+});
+byId('sidebar').addEventListener('click', (event) => {
+  if (event.target.closest('a')) setMenu(false);
+});
+byId('dialog-close').addEventListener('click', () => dialog.close());
+function pageName() {
+  const hash = location.hash.slice(1);
+  return Object.hasOwn(sections, hash) ? hash : location.pathname === '/chat' ? 'chat' : 'dashboard';
+}
+function navigate(target) {
+  if (page !== target) location.hash = target;
+  else return render();
+}
+async function render() {
+  const token = ++revision;
+  clearTimeout(refreshTimer);
+  page = pageName();
+  chat = null;
+  if (dialog.open) dialog.close();
+  notify();
+  setMenu(false);
+  byId('page-title').textContent = sections[page];
+  document.title = sections[page] + ' · Perottino & Co.';
+  for (const key of Object.keys(sections)) {
+    if (key === page) byId('nav-' + key).setAttribute('aria-current', 'page');
+    else byId('nav-' + key).removeAttribute('aria-current');
+  }
+  content.setAttribute('aria-busy', 'true');
+  content.replaceChildren(empty('Loading…'));
+  actions.replaceChildren();
+  try {
+    const overview = await api(page === 'dashboard' ? 'company.overview' : 'directory');
+    if (token !== revision) return;
+    roster = overview.agents || [];
+    if (!['chat', 'admin'].includes(page)) actions.append(btn('Refresh', render));
+    if (page === 'dashboard') dashboard(overview);
+    if (page === 'goals' || page === 'tasks') await workPage(page, token);
+    if (page === 'activity') await activityPage(token);
+    if (page === 'directory') directoryPage();
+    if (page === 'chat' || page === 'admin') await chatPage(page === 'admin', token);
+  } catch (error) {
+    if (token === revision) {
+      content.replaceChildren(empty('The workspace could not be loaded.'), btn('Retry', render));
+      notify(error.message);
+    }
+  } finally {
+    if (token === revision) content.removeAttribute('aria-busy');
+  }
+}
+window.addEventListener('hashchange', () => {
+  byId('main-content').focus();
+  void render();
+});
+const workOps = { goals: 'goal', tasks: 'task' };
+function workRow(kind, row) {
+  const task = kind === 'tasks';
+  return el(
+    'li',
+    { class: 'row' },
+    btn('', () => showWork(kind, row.id), {
+      class: 'row-link',
+      'aria-label': (task ? 'Task ' : 'Goal ') + (task ? row.title : row.outcome),
+    }),
+  );
+}
+function workList(kind, items, emptyText) {
+  if (!items.length) return empty(emptyText);
+  const rows = el('ul', { class: 'rows' });
+  for (const row of items) {
+    const task = kind === 'tasks',
+      li = workRow(kind, row);
+    li.firstElementChild.append(
+      el('div', { class: 'item-line' }, el('strong', {}, task ? row.title : row.outcome), status(row.status)),
+      el(
+        'p',
+        {},
+        task
+          ? nameOf(row.assigneeId)
+          : nameOf(row.accountableId) +
+              ' · ' +
+              Number(row.taskCount || 0) +
+              (row.taskCount === 1 ? ' task' : ' tasks'),
+      ),
+    );
+    rows.append(li);
+  }
+  return rows;
+}
+function eventList(events) {
+  if (!events.length) return empty('Company activity will appear here.');
+  return el(
+    'ol',
+    { class: 'rows' },
+    events.map((event) => {
+      const what = label(event.kind);
+      const who = event.employeeId
+        ? nameOf(event.actor) + ' → ' + nameOf(event.employeeId)
+        : nameOf(event.actor);
+      const details = [who, date(event.at || event.createdAt)].filter(Boolean).join(' · ');
+      const related = event.taskId
+        ? btn('Open task', () => showWork('tasks', event.taskId), { class: 'link' })
+        : event.goalId
+          ? btn('Open goal', () => showWork('goals', event.goalId), { class: 'link' })
+          : null;
+      const trace = event.traceId
+        ? el(
+            'details',
+            { class: 'event-trace' },
+            el('summary', {}, 'Trace ID'),
+            el('code', {}, event.traceId),
+          )
+        : null;
+      return el(
+        'li',
+        { class: 'row event' },
+        el('span', { class: 'event-mark', 'aria-hidden': 'true' }),
+        el('div', {}, el('strong', {}, what), el('small', {}, details), related, trace),
+      );
+    }),
+  );
+}
+function dashboard(data) {
+  const goals = data.goals || [],
+    tasks = data.tasks || [],
+    attention = tasks.filter((t) => ['blocked', 'submitted', 'waiting'].includes(t.status));
+  actions.append(btn('Create goal', goalForm, { class: 'primary' }));
+  const stats = el('div', { class: 'stats' });
+  for (const [text, number, href] of [
+    ['Active goals', goals.filter((g) => g.status === 'active').length, 'goals'],
+    ['Open tasks', tasks.filter((t) => t.status !== 'done').length, 'tasks'],
+    ['Employees', roster.filter((a) => a.desiredState !== 'fired').length, 'directory'],
+  ]) {
+    stats.append(
+      el(
+        'a',
+        { class: 'stat', href: '#' + href },
+        el('span', {}, text),
+        el('strong', {}, String(number) + (data.more?.[href] ? '+' : '')),
+      ),
+    );
+  }
+  content.replaceChildren(
+    stats,
+    el(
+      'div',
+      { class: 'dashboard-grid' },
+      el(
+        'div',
+        { class: 'stack' },
+        panel(
+          'Needs attention',
+          workList(
+            'tasks',
+            attention.slice(0, 5),
+            data.more?.tasks
+              ? 'No tasks in this snapshot need attention. Open Tasks for the full list.'
+              : 'No tasks need review or intervention.',
+          ),
+          link('tasks', 'View tasks'),
+        ),
+        panel(
+          'Active goals',
+          workList(
+            'goals',
+            goals.filter((g) => g.status === 'active').slice(0, 5),
+            'Create a goal to set an outcome and name the employee accountable for it.',
+          ),
+          link('goals', 'View goals'),
+        ),
+      ),
+      panel('Recent activity', eventList((data.events || []).slice(0, 8)), link('activity', 'View activity')),
+    ),
+  );
+}
+async function workPage(kind, token) {
+  const states =
+    kind === 'tasks' ? ['ready', 'running', 'waiting', 'blocked', 'submitted', 'done'] : ['active', 'done'];
+  const pick = select('status', [['', 'All statuses'], ...states.map((s) => [s, label(s)])]);
+  const rows = el('div');
+  const more = btn('Load more', load);
+  const records = [];
+  let after,
+    loading = false;
+  function draw() {
+    rows.replaceChildren(
+      workList(
+        kind,
+        records.filter((r) => !pick.value || r.status === pick.value),
+        'No ' + kind + ' match this view.',
+      ),
+    );
+  }
+  pick.addEventListener('change', draw);
+  async function load() {
+    if (loading) return;
+    loading = true;
+    more.disabled = true;
+    try {
+      const res = await api(workOps[kind] + '.list', { limit: 50, ...(after ? { after } : {}) });
+      if (token !== revision) return;
+      records.push(...res[kind]);
+      after = res.next;
+      more.hidden = !after;
+      draw();
+    } finally {
+      loading = false;
+      more.disabled = false;
+    }
+  }
+  actions.append(
+    btn(kind === 'goals' ? 'Create goal' : 'Create task', kind === 'goals' ? goalForm : () => taskForm(), {
+      class: 'primary',
+    }),
+  );
+  content.replaceChildren(
+    el('div', { class: 'tools' }, el('label', {}, 'Status', pick)),
+    el('section', { class: 'panel' }, rows, el('div', { class: 'page-more' }, more)),
+  );
+  await load();
+}
+async function activityPage(token) {
+  const rows = el('div'),
+    events = [];
+  let after;
+  const more = btn('Load more activity', load);
+  async function load() {
+    more.disabled = true;
+    try {
+      const data = await api('activity.list', { limit: 40, ...(after ? { after } : {}) });
+      if (token !== revision) return;
+      events.push(...data.events);
+      after = data.next;
+      more.hidden = !after;
+      rows.replaceChildren(eventList(events));
+    } finally {
+      more.disabled = false;
+    }
+  }
+  content.replaceChildren(panel('Company events', rows), el('div', { class: 'page-more' }, more));
+  await load();
+}
+function goalForm() {
+  form(
+    'Create goal',
+    [
+      field('Outcome', area('outcome')),
+      field('Success criteria', area('successCriteria')),
+      field('Accountable employee', staffSelect('accountableId')),
+    ],
+    'Create goal',
+    async (data) => {
+      await change('goal.create', Object.fromEntries(data));
+      await render();
+    },
+  );
+}
+async function collect(op, key, input = {}) {
+  const all = [];
+  let after;
+  do {
+    const result = await api(op, { ...input, limit: 100, ...(after ? { after } : {}) });
+    all.push(...result[key]);
+    after = result.next;
+  } while (after);
+  return all;
+}
+async function taskForm(goalId) {
+  const goals = (await collect('goal.list', 'goals')).filter((g) => g.status === 'active');
+  if (!goals.length) {
+    showDialog(
+      'Create task',
+      empty('Create an active goal before assigning a task.'),
+      btn('Create goal', goalForm),
+    );
     return;
   }
-  const cards = state.memories.map(note => {
-    const card = element('article','memory-note');
-    card.append(element('p','',note.text));
-    const stamp = new Date(note.updatedAt || note.createdAt);
-    if (!Number.isNaN(stamp.getTime())) {
-      const time = element('time','',(note.updatedBy === 'owner' ? 'Edited by you · ' : '') + dayLabel.format(stamp));
-      time.dateTime = stamp.toISOString();
-      card.append(time);
-    }
-    if (note.sourceMessageId) {
-      const link = element('button','source','Source message');
-      link.type = 'button';
-      link.append(icon('arrow'));
-      link.addEventListener('click', () => void openSource(note.sourceMessageId));
-      card.append(link);
-    }
-    const controls = element('div','memory-controls');
-    for (const [label, method] of [['Edit','PATCH'], ['Forget','DELETE']]) {
-      const button = element('button','note-action',label);
-      button.type = 'button';
-      button.addEventListener('click', () => openNote(note, method));
-      controls.append(button);
-    }
-    card.append(controls);
-    return card;
-  });
-  get('memories').replaceChildren(...(cards.length ? cards : [element('p','empty-note', 'No saved notes yet.')]));
-}
-function openNote(note, method) {
-  noteAction = {agentId:state.agent.id, noteId:note.id, method, request:null, saving:false};
-  const edit = method === 'PATCH';
-  get('noteTitle').textContent = edit ? 'Edit note' : 'Forget this note?';
-  get('noteField').hidden = !edit;
-  get('noteText').disabled = !edit;
-  get('noteText').value = note.text;
-  get('forgetPreview').hidden = edit;
-  get('forgetText').textContent = note.text;
-  get('saveNote').textContent = edit ? 'Save changes' : 'Forget note';
-  get('saveNote').classList.toggle('destructive',!edit);
-  get('saveNote').disabled = false;
-  get('noteError').textContent = '';
-  get('noteEditor').showModal();
-  (edit ? get('noteText') : get('cancelNote')).focus();
-}
-async function saveNote(event) {
-  event.preventDefault();
-  const action = noteAction;
-  if (!action || action.saving) return;
-  const edit = action.method === 'PATCH';
-  const value = edit ? get('noteText').value.trim() : '';
-  if (edit && !value) return;
-  if (!action.request || action.request.text !== (edit ? value : undefined)) {
-    action.request = edit ? {text:value,requestId:crypto.randomUUID()} : {requestId:crypto.randomUUID()};
+  const goalPick = select(
+    'goalId',
+    goals.map((g) => [g.id, g.outcome]),
+  );
+  if (goalId) goalPick.value = goalId;
+  const deps = el('div');
+  let latest = 0;
+  async function dependencies() {
+    const token = ++latest;
+    deps.replaceChildren();
+    const tasks = await collect('task.list', 'tasks', { goalId: goalPick.value });
+    if (token !== latest || !tasks.length) return;
+    deps.append(
+      checks(
+        'Dependencies (optional)',
+        'dependency',
+        tasks.map((t) => [t.id, t.title]),
+      ),
+    );
   }
-  action.saving = true;
-  get('saveNote').disabled = true;
-  get('noteError').textContent = '';
-  try {
-    await api(url(action.agentId,'memory/' + encodeURIComponent(action.noteId)), {
-      method:action.method, headers:{'Content-Type':'application/json','X-Requested-With':'owner-console'},
-      body:JSON.stringify(action.request)
-    });
-    if (noteAction === action) get('noteEditor').close();
-    if (state.agent?.id === action.agentId) {
-      if (edit) state.memories = state.memories.map(row => row.id === action.noteId ? {...row,text:value,updatedAt:new Date().toISOString(),updatedBy:'owner'} : row);
-      else state.memories = state.memories.filter(row => row.id !== action.noteId);
-      renderMemory();
-      await refresh(false);
-    }
-    get('announcer').textContent = edit ? 'Memory note updated.' : 'Memory note removed.';
-  } catch (error) {
-    if (noteAction === action) {
-      get('noteError').textContent = error.status === 409 ? 'This change conflicts with a saved note. Check the text and try again.' :
-        error.status === 404 ? 'This note is no longer available.' : 'The change could not be confirmed. Try again.';
-    }
-  } finally {
-    action.saving = false;
-    if (noteAction === action) get('saveNote').disabled = false;
-  }
+  goalPick.addEventListener('change', () => run(dependencies));
+  form(
+    'Create task',
+    [
+      field('Goal', goalPick),
+      field('Title', input('title', 320)),
+      field('Acceptance criteria', area('acceptance')),
+      field('Assignee', staffSelect('assigneeId')),
+      deps,
+    ],
+    'Create task',
+    async (data) => {
+      const payload = {
+        goalId: data.get('goalId'),
+        title: data.get('title'),
+        acceptance: data.get('acceptance'),
+        assigneeId: data.get('assigneeId'),
+        dependencies: data.getAll('dependency'),
+      };
+      await change('task.create', payload);
+      await render();
+    },
+  );
+  await dependencies();
 }
-async function refresh(scrollToBottom) {
-  if (!state.agent) return;
-  const agent = state.agent;
-  const version = ++state.pollVersion;
-  const memoryOpen = !get('memoryPanel').hidden;
-  const tasks = [api(url(agent.id, 'messages')).then(r => r.json())];
-  if (memoryOpen) tasks.push(api(url(agent.id, 'memory')).then(r => r.json()));
-  const [messages, notes] = await Promise.allSettled(tasks);
-  if (version !== state.pollVersion) return;
-  if (messages.status === 'fulfilled') {
-    const data = messages.value;
-    const before = state.messages.at(-1)?.id;
-    const changed = applyLatest('messages',data) || !state.loaded;
-    state.loaded = true;
-    state.readError = '';
-    const statusChanged = state.status !== data.status;
-    state.status = data.status;
-    if (statusChanged) schedulePoll();
-    renderStatus();
-    if (changed) {
-      renderTimeline(scrollToBottom);
-      const latest = state.messages.at(-1);
-      if (before && latest?.id !== before && latest?.author === 'agent') get('announcer').textContent = 'New message from ' + agent.name;
-    }
-  } else {
-    state.readError = 'Conversation updates are unavailable. Reconnecting…';
-    renderStatus();
-  }
-  if (notes) {
-    const changed = notes.status === 'fulfilled' && applyLatest('memory',notes.value);
-    const oldError = state.memoryError;
-    state.memoryError = notes.status === 'fulfilled' ? '' : 'Notes are unavailable. Reconnecting…';
-    if (changed || oldError !== state.memoryError) renderMemory();
-  }
+function checks(title, name, options) {
+  return el(
+    'fieldset',
+    { class: 'checks' },
+    el('legend', {}, title),
+    options.map(([value, text]) => el('label', {}, el('input', { type: 'checkbox', name, value }), text)),
+  );
 }
-async function loadDirectory() {
-  if (directoryRequest) return directoryRequest;
-  directoryRequest = (async () => {
+function evidence(values) {
+  const list = el('ul', { class: 'evidence' });
+  for (const value of values || []) {
+    let node = value;
     try {
-      const r = await api('/api/directory');
-      const {agents, mode} = await r.json();
-      get('runtime').textContent = mode === 'local' ? 'Local simulator' : mode === 'bedrock' ? 'Bedrock' : 'Workspace owner';
-      state.agents = agents;
-      state.directoryLoaded = true;
-      const current = agents.find(a => a.id === state.agent?.id);
-      if (!current && agents.length) {
-        selectAgent(agents.find(a => /^(ceo|chief executive officer)$/i.test(a.role)) || agents[0]);
-      } else if (current) {
-        state.agent = current;
-        get('contactName').textContent = current.name;
-        get('contactMeta').textContent = headerMeta(current);
-        renderNav();
-      } else {
-        state.pollVersion++;
-        state.agent = null;
-        resetPages();
-        state.messages = [];
-        state.memories = [];
-        state.status = 'idle';
-        state.readError = '';
-        get('timeline').replaceChildren();
-        get('memoryPanel').hidden = true;
-        get('memoryButton').setAttribute('aria-expanded','false');
-        get('contactName').textContent = 'Company chat';
-        get('contactMeta').textContent = 'Private workspace';
-        get('headerAvatar').textContent = '·';
-        input.value = '';
-        input.placeholder = 'Write a message…';
-        document.title = 'Company chat · Perottino & Co.';
-        updateOverlay();
-        input.disabled = true;
-        get('send').disabled = true;
-        get('memoryButton').disabled = true;
-        get('employeeButton').disabled = true;
-        renderNav();
-        renderStatus();
-      }
-    } catch {
-      if (!state.directoryLoaded) {
-        state.readError = 'The employee directory is unavailable. Reconnecting…';
-        renderStatus();
-      }
-    }
-    if (picker.open) renderResults();
-  })();
-  try { await directoryRequest; } finally { directoryRequest = null; }
-}
-function updateComposer() {
-  const agent = state.agent;
-  get('send').disabled = !agent || input.disabled || !input.value.trim() || state.sending.has(agent?.id);
-  input.rows = 1;
-  // Size to the text while keeping long drafts scrollable under a restrictive CSP.
-  const style = getComputedStyle(input);
-  const lineHeight = parseFloat(style.lineHeight) || 22;
-  const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
-  input.classList.remove('multiline');
-  const rows = Math.max(1, Math.ceil((input.scrollHeight - padding) / lineHeight));
-  input.rows = Math.min(7, rows);
-  if (rows > 1) input.classList.add('multiline');
-}
-async function send(event) {
-  event.preventDefault();
-  const agent = state.agent;
-  const text = input.value.trim();
-  if (!agent || input.disabled || !text || state.sending.has(agent.id)) return;
-  let request = state.requests.get(agent.id);
-  if (!request || request.text !== text) {
-    request = {text, requestId:crypto.randomUUID()};
-    state.requests.set(agent.id,request);
+      const url = new URL(value);
+      if (url.protocol === 's3:' && /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(url.hostname)) {
+        const object = new URL('https://s3.console.aws.amazon.com/s3/object/' + url.hostname);
+        object.searchParams.set('prefix', decodeURIComponent(url.pathname.slice(1)));
+        node = el('a', { href: object.href, rel: 'noopener noreferrer', target: '_blank' }, value);
+      } else if (['http:', 'https:'].includes(url.protocol))
+        node = el('a', { href: url.href, rel: 'noopener noreferrer', target: '_blank' }, value);
+    } catch {}
+    list.append(el('li', {}, node));
   }
-  state.sendErrors.delete(agent.id);
-  state.sending.add(agent.id);
-  updateComposer();
-  renderStatus();
-  try {
-    await api(url(agent.id, 'messages'), {
-      method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'owner-console'},
-      body:JSON.stringify(request)
+  return list;
+}
+async function showWork(kind, id) {
+  const goal = kind === 'goals',
+    key = workOps[kind],
+    prop = goal ? 'goalId' : 'taskId',
+    cur = revision;
+  const res = await api(key + '.get', { [prop]: id });
+  if (cur !== revision) return;
+  const row = res[key],
+    controls = el('div', { class: 'actions' });
+  if (goal) {
+    const tasks = await collect('task.list', 'tasks', { goalId: id });
+    if (cur !== revision) return;
+    if (row.status === 'active') {
+      controls.append(btn('Create task', () => taskForm(id), { class: 'primary' }));
+      if (row.taskCount > 0 && row.openTaskCount === 0)
+        controls.append(
+          btn('Close goal', async () => {
+            await change('goal.close', { goalId: id });
+            await render();
+          }),
+        );
+    }
+    showDialog(
+      'Goal details',
+      el('h3', {}, row.outcome),
+      facts([
+        ['Status', status(row.status)],
+        ['Accountable', nameOf(row.accountableId)],
+        ['Success criteria', row.successCriteria],
+      ]),
+      el('h3', {}, 'Tasks'),
+      workList('tasks', tasks, 'No tasks assigned.'),
+      controls,
+    );
+  } else {
+    if (row.status === 'submitted') {
+      controls.append(btn('Review submission', () => reviewForm(row), { class: 'primary' }));
+    } else if (['blocked', 'waiting'].includes(row.status)) {
+      controls.append(
+        btn('Resume task', async () => {
+          await change('task.resume', { taskId: id });
+          await render();
+        }),
+      );
+    }
+    const goalRecord = (await api('goal.get', { goalId: row.goalId })).goal;
+    if (cur !== revision) return;
+    const depRows = await Promise.all(
+      (row.dependencies || []).map(async (dep) => (await api('task.get', { taskId: dep })).task),
+    );
+    if (cur !== revision) return;
+    showDialog(
+      'Task details',
+      el('h3', {}, row.title),
+      facts([
+        ['Status', status(row.status)],
+        ['Goal', btn(goalRecord.outcome, () => showWork('goals', row.goalId), { class: 'link' })],
+        ['Assignee', nameOf(row.assigneeId)],
+        ['Reviewer', nameOf(row.reviewerId)],
+        ['Acceptance criteria', row.acceptance],
+        ['Dependencies', depRows.length ? depRows.map((d) => d.title).join(', ') : null],
+        ['Attempt', row.attempt],
+        ['Progress', row.progress],
+        [
+          'Review',
+          row.review ? [label(row.review.decision), row.review.note].filter(Boolean).join(' · ') : null,
+        ],
+      ]),
+      ...(row.evidence?.length ? [el('h3', {}, 'Evidence'), evidence(row.evidence)] : []),
+      controls,
+      btn('Task history', () => taskHistory(row), { class: 'link' }),
+    );
+  }
+}
+async function taskHistory(task) {
+  const list = el('ol', { class: 'rows' });
+  let after;
+  const more = btn('More history', load);
+  async function load() {
+    more.disabled = true;
+    try {
+      const res = await api('task.history', { taskId: task.id, limit: 40, ...(after ? { after } : {}) });
+      for (const entry of res.entries)
+        list.append(
+          el(
+            'li',
+            { class: 'row' },
+            el('strong', {}, label(entry.kind || entry.status)),
+            el('p', {}, nameOf(entry.actor) + ' · ' + date(entry.at)),
+            entry.note ? el('p', {}, entry.note) : null,
+            entry.evidence?.length ? evidence(entry.evidence) : null,
+          ),
+        );
+      after = res.next;
+      more.hidden = !after;
+    } finally {
+      more.disabled = false;
+    }
+  }
+  showDialog('Task history', el('h3', {}, task.title), list, more);
+  await load();
+}
+function reviewForm(task) {
+  form(
+    'Review submission',
+    [
+      el('p', {}, task.title),
+      evidence(task.evidence),
+      field(
+        'Decision',
+        select('decision', [
+          ['accept', 'Accept work'],
+          ['changes', 'Request changes'],
+        ]),
+      ),
+      field('Review note', area('note')),
+    ],
+    'Save review',
+    async (data) => {
+      await change('task.review', { taskId: task.id, ...Object.fromEntries(data) });
+      await render();
+    },
+  );
+}
+function directoryPage() {
+  const filter = el('input', {
+    type: 'search',
+    class: 'search',
+    id: 'directory-search',
+    'aria-label': 'Find employees',
+    placeholder: 'Find by name, role or @handle',
+  });
+  const grid = el('div', { class: 'people-grid' });
+  const draw = () => {
+    const query = filter.value.trim().toLowerCase().replace(/^@/, '');
+    const employees = roster.filter((a) =>
+      [a.name, a.handle, a.role].some((s) => s?.toLowerCase().includes(query)),
+    );
+    grid.replaceChildren(
+      ...employees.map((a) => {
+        const controls = el(
+          'div',
+          { class: 'actions' },
+          btn('Profile', () => profile(a)),
+        );
+        if (a.desiredState !== 'fired')
+          controls.prepend(btn('Message', () => openDM(a.id), { 'aria-label': 'Message ' + a.name }));
+        return el(
+          'article',
+          { class: 'panel panel-pad' },
+          el(
+            'div',
+            { class: 'person' },
+            el('span', { class: 'avatar', 'aria-hidden': 'true' }, (a.name || '?').slice(0, 1)),
+            el(
+              'div',
+              {},
+              el('h2', {}, a.name),
+              el('small', {}, [a.role, a.handle].filter(Boolean).join(' · ')),
+            ),
+          ),
+          controls,
+        );
+      }),
+    );
+    if (!employees.length) grid.append(empty('No employees found.'));
+  };
+  filter.addEventListener('input', draw);
+  actions.append(
+    btn('Hire employee', () =>
+      form('Hire employee', [field('Role', input('role', 160))], 'Hire employee', async (data) => {
+        await change('employee.hire', { role: data.get('role') });
+        await render();
+      }),
+    ),
+  );
+  content.replaceChildren(el('div', { class: 'tools' }, filter), grid);
+  draw();
+}
+function profile(a) {
+  const controls = el('div', { class: 'actions' });
+  if (a.desiredState !== 'fired') {
+    const operation = a.desiredState === 'paused' ? 'resume' : 'pause';
+    controls.append(
+      btn(label(operation) + ' employee', async () => {
+        await change('employee.' + operation, { agentId: a.id });
+        await render();
+      }),
+    );
+    if (a.id !== 'ceo')
+      controls.append(
+        btn(
+          'Fire employee',
+          () =>
+            form(
+              'Fire employee',
+              [
+                el(
+                  'p',
+                  {},
+                  'End employment for ' + a.name + '? This employee will lose access to company work.',
+                ),
+              ],
+              'Confirm firing',
+              async () => {
+                await change('employee.fire', { agentId: a.id });
+                await render();
+              },
+            ),
+          { class: 'danger' },
+        ),
+      );
+  }
+  showDialog(
+    a.name,
+    facts([
+      ['Role', a.role],
+      ['Handle', a.handle],
+      ['Manager', nameOf(a.managerId || 'owner')],
+      ['Employment', label(a.desiredState || 'active')],
+      ['Runtime', a.runtimeStatus],
+      ['Last pulse', a.lastPulseAt ? date(a.lastPulseAt) : null],
+    ]),
+    controls,
+  );
+}
+let pendingConversation;
+async function openDM(peerId) {
+  const { conversation } = await api('conversations.dm', { peerId });
+  pendingConversation = conversation;
+  await navigate('chat');
+}
+function groupForm() {
+  const options = activeEmployees().map((a) => [a.id, a.name + ' · ' + a.role]);
+  form(
+    'New group',
+    [field('Group name', input('title', 160)), checks('Members', 'members', options)],
+    'Create group',
+    async (data) => {
+      const members = data.getAll('members');
+      if (!members.length) throw new Error('Choose at least one employee.');
+      const result = await change('conversations.group', { title: data.get('title'), members });
+      pendingConversation = result.conversation;
+      await render();
+    },
+  );
+}
+function convoTitle(c, admin) {
+  if (c.type === 'group') return c.title;
+  const members = admin && !c.members.includes('owner') ? c.members : c.members.filter((m) => m !== 'owner');
+  return members.map(nameOf).join(' & ');
+}
+function threadRow(state, c) {
+  const active = state.id === c.id;
+  return btn('', () => selectThread(state, c), {
+    class: 'thread',
+    'data-conversation-id': c.id,
+    'aria-label': convoTitle(c, state.admin),
+    'aria-current': active ? 'true' : undefined,
+  });
+}
+function drawThreads(state) {
+  state.list.replaceChildren(
+    ...state.threads.map((c) => {
+      const b = threadRow(state, c);
+      b.append(
+        el('strong', {}, convoTitle(c, state.admin)),
+        el('small', {}, c.type === 'group' ? 'Group · ' + c.members.length + ' members' : 'Direct message'),
+      );
+      return b;
+    }),
+  );
+  if (!state.threads.length)
+    state.list.append(
+      empty(state.admin ? 'No conversations to inspect.' : 'Your direct messages and groups appear here.'),
+    );
+  if (state.cursor)
+    state.list.append(btn('Load more conversations', () => loadThreads(state, true), { class: 'link' }));
+}
+async function loadThreads(state, more = false) {
+  if (state !== chat) return;
+  const out = await api(state.admin ? 'admin.conversations' : 'conversations.list', {
+    limit: 50,
+    ...(more && state.cursor ? { after: state.cursor } : {}),
+  });
+  if (state !== chat) return;
+  const incoming = (out.conversations || []).filter((c) => state.admin || c.members.includes('owner'));
+  const entries = new Map((more ? state.threads : []).map((c) => [c.id, c]));
+  for (const c of incoming) entries.set(c.id, c);
+  state.threads = [...entries.values()];
+  state.cursor = out.next;
+  state.lastDirectoryCheck = Date.now();
+  drawThreads(state);
+}
+async function chatPage(admin, token) {
+  const list = el('div', { id: 'conversation-list' }),
+    detail = el('section', {
+      class: 'panel conversation',
+      'aria-label': admin ? 'Inspected conversation' : 'Selected conversation',
     });
-    state.requests.delete(agent.id);
-    if (state.drafts.get(agent.id)?.trim() === text) state.drafts.delete(agent.id);
-    if (state.agent.id === agent.id) {
-      if (input.value.trim() === text) input.value = '';
-      get('announcer').textContent = 'Message sent to ' + agent.name;
-      await refresh(true);
-      schedulePoll();
-    }
-  } catch (error) {
-    state.sendErrors.set(agent.id,
-      error.status === 400 || error.status === 413 ? 'The message could not be accepted. Check its length and try again.' :
-      error.status === 409 ? 'This message conflicts with an earlier request or the employee has left the company. Open Employee for details.' :
-      'The send could not be confirmed. Try sending the same message again.');
-  } finally {
-    state.sending.delete(agent.id);
-    updateComposer();
-    renderStatus();
+  const state = { admin, threads: [], list, detail, selection: 0 };
+  chat = state;
+  if (admin) actions.append(btn('Audit log', auditLog));
+  if (!admin)
+    actions.append(
+      btn('New DM', () => navigate('directory')),
+      btn('New group', groupForm, { class: 'primary' }),
+    );
+  const intro = admin
+    ? el(
+        'p',
+        { class: 'information' },
+        'Read-only conversation inspector. Opening the index, a conversation, or another page of messages records an administrative access event.',
+      )
+    : null;
+  content.replaceChildren(
+    ...(intro ? [intro] : []),
+    el(
+      'div',
+      { class: 'chat-layout' },
+      panel(admin ? 'All conversations' : 'Your conversations', list),
+      detail,
+    ),
+  );
+  detail.append(
+    empty(
+      admin
+        ? 'Select a conversation to inspect its messages.'
+        : 'Choose a conversation or start a DM from Directory.',
+    ),
+  );
+  await loadThreads(state);
+  if (token !== revision) return;
+  // An explicit selection is required before any administrative transcript read.
+  if (!admin) {
+    const target = pendingConversation || state.threads[0];
+    pendingConversation = null;
+    if (target?.members.includes('owner')) {
+      if (!state.threads.some((c) => c.id === target.id)) state.threads.unshift(target);
+      await selectThread(state, target);
+    } else scheduleRefresh(state, 15000);
   }
 }
-function setDraft(text) {
-  input.value = text;
-  input.dispatchEvent(new Event('input'));
-  input.focus();
-}
-get('newMessage').addEventListener('click', () => showPicker('New message'));
-get('directory').addEventListener('click', () => showPicker('Directory'));
-get('employeeButton').addEventListener('click',openEmployee);
-get('closeEmployee').addEventListener('click',() => get('employeeDialog').close());
-get('employeeDialog').addEventListener('close',() => { profileRead++; });
-get('refreshEmployee').addEventListener('click',() => { get('employeeStatus').textContent = ''; void refreshEmployee(); });
-get('toggleEmployment').addEventListener('click',() => void employeeAction(employment.get(state.agent?.id) === 'paused' ? 'resume' : 'pause'));
-get('fireEmployee').addEventListener('click',() => void employeeAction('fire'));
-get('goalForm').addEventListener('submit',event => { event.preventDefault(); void employeeAction('goals'); });
-get('earlierMessages').addEventListener('click',() => void loadEarlier('messages'));
-get('moreNotes').addEventListener('click',() => void loadEarlier('memory'));
-get('closeSource').addEventListener('click',() => get('sourceDialog').close());
-get('sourceDialog').addEventListener('close',() => { sourceRequest++; });
-get('closePicker').addEventListener('click', () => picker.close());
-picker.addEventListener('click', event => {
-  if (event.target !== picker) return;
-  const bounds = picker.getBoundingClientRect();
-  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) picker.close();
-});
-get('search').addEventListener('input',renderResults);
-get('openSidebar').addEventListener('click', showNavigation);
-get('closeSidebar').addEventListener('click', closeNavigation);
-get('sidebarShade').addEventListener('click', closeNavigation);
-get('memoryButton').addEventListener('click', () => toggleMemory(get('memoryPanel').hidden));
-get('closeMemory').addEventListener('click', () => toggleMemory(false));
-get('memoryShade').addEventListener('click', () => toggleMemory(false));
-narrow.addEventListener('change', () => { if (!narrow.matches) closeNavigation(); updateOverlay(); });
-overlayMemory.addEventListener('change', updateOverlay);
-document.addEventListener('keydown', event => {
-  if (event.key !== 'Escape' || picker.open || get('noteEditor').open || get('sourceDialog').open || get('employeeDialog').open) return;
-  if (!get('memoryPanel').hidden) toggleMemory(false);
-  else closeNavigation();
-});
-get('cancelNote').addEventListener('click', () => get('noteEditor').close());
-get('closeNote').addEventListener('click', () => get('noteEditor').close());
-get('noteEditor').addEventListener('close', () => { noteAction = null; });
-get('noteForm').addEventListener('submit', saveNote);
-get('composer').addEventListener('submit', send);
-input.addEventListener('input', () => {
-  if (state.agent) state.drafts.set(state.agent.id, input.value);
-  updateComposer();
-});
-input.addEventListener('keydown', event => {
-  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
-    event.preventDefault();
-    if (!get('send').disabled) get('composer').requestSubmit();
-  }
-});
-get('intro').addEventListener('click', () => setDraft('Introduce yourself and tell me how we can work together.'));
-get('brief').addEventListener('click', () => setDraft('I’d like your help with '));
-
-function schedulePoll(delay) {
-  clearTimeout(pollTimer);
-  if (document.hidden) return;
-  const busy = state.status === 'queued' || state.status === 'working';
-  const retry = !state.agent || state.readError;
-  pollTimer = window.setTimeout(poll, delay ?? (busy ? 2500 : retry ? 10000 : 60000));
-}
-async function poll() {
-  if (document.hidden) return;
-  const selected = state.agent?.id;
-  try {
-    if (!selected || Date.now() - directoryCheckedAt >= 300000) {
-      await loadDirectory();
-      directoryCheckedAt = Date.now();
+async function auditLog() {
+  const rows = el('div');
+  const events = [];
+  let after;
+  const more = btn('Load more events', load);
+  async function load() {
+    more.disabled = true;
+    try {
+      const result = await api('admin.activity', { limit: 40, ...(after ? { after } : {}) });
+      events.push(...result.events);
+      after = result.next;
+      more.hidden = !after;
+      rows.replaceChildren(eventList(events));
+    } finally {
+      more.disabled = false;
     }
-    // Selecting an employee in loadDirectory already fetches the first message page.
-    if (selected && state.agent?.id === selected) await Promise.all([refresh(false),
-      get('employeeDialog').open && !actionPending ? refreshEmployee() : undefined]);
-  } finally { schedulePoll(); }
+  }
+  showDialog(
+    'Audit log',
+    el('p', { class: 'section-note' }, 'Company-wide event metadata. Each read is audited.'),
+    rows,
+    more,
+  );
+  await load();
 }
-document.addEventListener('visibilitychange', () => schedulePoll(0));
-renderStatus();
-void poll();
+async function deliveryStatus(message) {
+  const result = await api('messages.status', {
+    conversationId: message.conversationId,
+    messageId: message.id,
+  });
+  showDialog(
+    'Reply delivery',
+    el(
+      'ul',
+      { class: 'rows' },
+      result.deliveries.map((delivery) =>
+        el(
+          'li',
+          { class: 'row' },
+          el('strong', {}, nameOf(delivery.recipientId)),
+          el(
+            'p',
+            {},
+            label(delivery.status) +
+              ' · ' +
+              delivery.attempts +
+              ' attempt' +
+              (delivery.attempts === 1 ? '' : 's'),
+          ),
+        ),
+      ),
+    ),
+    btn('Refresh', () => deliveryStatus(message)),
+  );
+}
+function transcriptMessage(msg, showDelivery = false) {
+  const own = msg.senderId === 'owner';
+  return el(
+    'article',
+    { class: 'message ' + (own ? 'own' : 'employee'), 'data-message-id': msg.id },
+    el(
+      'header',
+      {},
+      nameOf(msg.senderId),
+      ' · ',
+      el('time', { datetime: msg.createdAt }, date(msg.createdAt)),
+    ),
+    el('p', { class: 'bubble' }, msg.text),
+    showDelivery && own && msg.responders?.length
+      ? btn('Delivery', () => deliveryStatus(msg), { class: 'link delivery' })
+      : null,
+  );
+}
+function renderMessages(state, keepScroll = false) {
+  const transcript = state.timeline;
+  if (!transcript) return;
+  const bottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 50;
+  const first = transcript.firstElementChild,
+    offset = first?.getBoundingClientRect().top;
+  const prevId = first?.dataset.messageId;
+  const rows = [...state.messages.values()].sort((a, b) => a.seq - b.seq);
+  transcript.replaceChildren(
+    ...(rows.length ? rows.map((msg) => transcriptMessage(msg, !state.admin)) : [empty('No messages yet.')]),
+  );
+  if (keepScroll && prevId) {
+    const next = [...transcript.children].find((n) => n.dataset.messageId === prevId);
+    if (next) transcript.scrollTop += next.getBoundingClientRect().top - offset;
+  } else if (bottom || state.scrollAfterSend) transcript.scrollTop = transcript.scrollHeight;
+  state.scrollAfterSend = false;
+}
+async function readMessages(state, older = false) {
+  const selection = state.selection;
+  const payload = { conversationId: state.id, ...(older ? { beforeSeq: state.before } : { latest: true }) };
+  const data = await api(state.admin ? 'admin.messages' : 'messages.list', payload);
+  if (chat !== state || state.selection !== selection) return;
+  const beforeCount = state.messages.size;
+  const oldMin = beforeCount ? Math.min(...[...state.messages.values()].map((m) => m.seq)) : Infinity;
+  for (const m of data.messages) state.messages.set(m.id, m);
+  if (older || !beforeCount || !data.messages.length || data.messages[0].seq <= oldMin)
+    state.before = data.previousBeforeSeq;
+  // A long absence can leave a gap between the cached transcript and the latest window.
+  let reset = false;
+  if (!older && data.messages.length && beforeCount) {
+    const first = data.messages[0].seq,
+      min = Math.min(first, oldMin);
+    if (first > min && ![...state.messages.values()].some((m) => m.seq === first - 1)) {
+      reset = true;
+      state.messages = new Map(data.messages.map((m) => [m.id, m]));
+      state.before = data.previousBeforeSeq;
+    }
+  }
+  state.earlier.hidden = !state.before;
+  if (older || reset || state.messages.size !== beforeCount || !beforeCount || state.scrollAfterSend)
+    renderMessages(state, older);
+}
+function scheduleRefresh(state, ms = 10000) {
+  clearTimeout(refreshTimer);
+  if (state.admin || chat !== state) return;
+  refreshTimer = setTimeout(async () => {
+    if (chat !== state) return;
+    try {
+      if (!document.hidden && !dialog.open) {
+        if (!state.lastDirectoryCheck || Date.now() - state.lastDirectoryCheck > 60000) {
+          // Refresh the first page without discarding conversation pages the owner already loaded.
+          const result = await api('conversations.list', { limit: 50 });
+          if (chat !== state) return;
+          const existing = new Set(state.threads.map((c) => c.id));
+          const added = result.conversations.filter(
+            (c) => c.members.includes('owner') && !existing.has(c.id),
+          );
+          if (added.length) {
+            state.threads.unshift(...added);
+            if (!state.cursor) state.cursor = result.next;
+            drawThreads(state);
+          }
+          state.lastDirectoryCheck = Date.now();
+        }
+        if (state.id) await readMessages(state);
+      }
+    } catch (error) {
+      if (chat === state) notify(error.message);
+    } finally {
+      if (chat === state) scheduleRefresh(state, Date.now() < (state.fastUntil || 0) ? 1600 : 30000);
+    }
+  }, ms);
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && chat && !chat.admin) scheduleRefresh(chat, 100);
+});
+async function selectThread(state, c) {
+  if (chat !== state || (!state.admin && !c.members.includes('owner'))) return;
+  const selection = ++state.selection;
+  clearTimeout(refreshTimer);
+  state.id = c.id;
+  state.messages = new Map();
+  state.before = null;
+  drawThreads(state);
+  const earlier = btn(
+    'Load earlier messages',
+    async () => {
+      earlier.disabled = true;
+      try {
+        await readMessages(state, true);
+      } finally {
+        earlier.disabled = false;
+      }
+    },
+    { class: 'link', hidden: true },
+  );
+  const timeline = el('div', { id: 'timeline', class: 'transcript', tabindex: 0, 'aria-label': 'Messages' });
+  state.earlier = earlier;
+  state.timeline = timeline;
+  const peer = c.members.find((id) => id !== 'owner');
+  const head = el(
+    'div',
+    { class: 'section-head' },
+    el(
+      'div',
+      {},
+      el('h2', {}, convoTitle(c, state.admin)),
+      el('small', {}, c.members.map(nameOf).join(' · ')),
+    ),
+    !state.admin && c.type === 'dm' ? btn('Memory', () => showMemory(c, peer), { id: 'memoryButton' }) : null,
+  );
+  const foot = el('div', { class: 'chat-tools' }, earlier);
+  state.detail.replaceChildren(head, foot, timeline);
+  if (!state.admin) {
+    const archived = c.type === 'dm' && c.members.some((id) => person(id)?.desiredState === 'fired');
+    if (archived) state.detail.append(empty('This conversation is archived.'));
+    else state.detail.append(composer(state, c));
+  }
+  await readMessages(state);
+  if (chat === state && selection === state.selection && !state.admin) scheduleRefresh(state);
+}
+function composer(state, c) {
+  const form = byId('compose-template').content.firstElementChild.cloneNode(true);
+  const text = form.querySelector('textarea'),
+    send = form.querySelector('#send');
+  const current = drafts.get(c.id) || { text: '', responders: [] };
+  text.value = current.text;
+  if (c.type === 'group') {
+    const options = c.members
+      .filter((id) => id !== 'owner' && person(id)?.desiredState !== 'fired')
+      .map((id) => [id, nameOf(id)]);
+    form.querySelector('#responders').append(checks('Request a reply from', 'responders', options));
+    for (const check of form.querySelectorAll('[name=responders]'))
+      check.checked = current.responders.includes(check.value);
+  }
+  const responders = () => [...form.querySelectorAll('[name=responders]:checked')].map((b) => b.value);
+  const cache = () => {
+    drafts.set(c.id, { text: text.value, responders: responders() });
+    send.disabled = !text.value.trim();
+  };
+  cache();
+  form.addEventListener('input', cache);
+  text.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      form.requestSubmit();
+    }
+  });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (send.disabled || !text.value.trim()) return;
+    const message = text.value.trim(),
+      selection = state.selection;
+    send.disabled = true;
+    text.readOnly = true;
+    try {
+      await change('messages.post', {
+        conversationId: c.id,
+        text: message,
+        ...(c.type === 'group' ? { responders: responders() } : {}),
+      });
+      drafts.delete(c.id);
+      text.value = '';
+      state.scrollAfterSend = true;
+      if (chat === state && state.selection === selection) {
+        state.fastUntil = Date.now() + 60000;
+        await readMessages(state);
+        scheduleRefresh(state, 500);
+        text.focus();
+      }
+    } catch (error) {
+      notify(error.message);
+    } finally {
+      text.readOnly = false;
+      send.disabled = !text.value.trim();
+    }
+  });
+  return form;
+}
+async function showMemory(conversation, employeeId) {
+  let after;
+  const list = el('ul', { class: 'rows' }),
+    more = btn('More notes', load);
+  async function load() {
+    more.disabled = true;
+    try {
+      const result = await api('memory.list', {
+        conversationId: conversation.id,
+        employeeId,
+        limit: 30,
+        ...(after ? { after } : {}),
+      });
+      for (const item of result.memories) {
+        const source = btn(
+          'Source message',
+          async () => {
+            const { message } = await api('messages.get', {
+              conversationId: conversation.id,
+              messageId: item.sourceMessageId,
+            });
+            showDialog(
+              'Source message',
+              transcriptMessage(message),
+              btn('Back to memory', () => showMemory(conversation, employeeId), { class: 'link' }),
+            );
+          },
+          { class: 'link' },
+        );
+        list.append(el('li', { class: 'row' }, el('p', {}, item.text), source));
+      }
+      if (!list.childElementCount)
+        list.append(el('li', { class: 'empty' }, 'No notes saved in this conversation.'));
+      after = result.next;
+      more.hidden = !after;
+    } finally {
+      more.disabled = false;
+    }
+  }
+  showDialog(
+    'Conversation memory',
+    el('p', { class: 'section-note' }, nameOf(employeeId) + '’s notes from this direct message.'),
+    list,
+    more,
+  );
+  await load();
+}
+void render();
