@@ -24,18 +24,18 @@ export function makeModelMeter({records,governance,settings,tariffs=JSON.parse(p
         const current=await settings.effective(actor,{});
         if(current.version!==input.settingsVersion||current.settings.modelId!==input.modelId) fail(409,'Model settings changed.');
         const rate=checkedRate(tariffs[input.modelId]);
-        const value={modelId:input.modelId,settingsVersion:current.version,rate,maximum:price(rate.maxInputTokens,rate.maxOutputTokens,rate),state:'created'};
+        const value={modelId:input.modelId,...(input.taskId&&{taskId:input.taskId}),settingsVersion:current.version,rate,maximum:price(rate.maxInputTokens,rate.maxOutputTokens,rate),state:'created'};
         await records.transact([{pk,sk,expect:null,value}]);
         continue;
       }
       const {version,pk:ignoredPk,sk:ignoredSk,...data}=row;
       if(op==='budget.model.begin') {
-        if(row.modelId!==input.modelId ||row.settingsVersion!==input.settingsVersion) fail(409,'Model attempt already used.');
+        if(row.modelId!==input.modelId ||row.settingsVersion!==input.settingsVersion || row.taskId!==input.taskId) fail(409,'Model attempt already used.');
         if(row.state!=='created')return {permitted:false,settled:row.state==='settled'};
         const current=await settings.effective(actor,{});
         if(current.version!==row.settingsVersion || current.settings.modelId!==row.modelId ||
             digest(checkedRate(tariffs[row.modelId]))!==digest(row.rate)) fail(409,'Model settings or tariff changed.');
-        const {reservation}=await governance.execute(actor,'budget.reserve',{purpose:'model',amountCents:row.maximum,requestId:digest([actor,sk,'hold'])});
+        const {reservation}=await governance.execute(actor,'budget.reserve',{purpose:'model',amountCents:row.maximum,...(row.taskId&&{taskId:row.taskId}),requestId:digest([actor,sk,'hold'])});
         if(await records.transact([{pk,sk,expect:version,value:{...data,state:'issued',reservationId:reservation.id}}]))
           return {permitted:true};
         continue;
@@ -52,7 +52,7 @@ export function makeModelMeter({records,governance,settings,tariffs=JSON.parse(p
         await records.transact([{pk,sk,expect:version,value:{...data,state:'settling',charge}}]);
         continue;
       }
-      await governance.execute(actor,'budget.settle',{reservationId:row.reservationId,actualCents:row.charge,requestId:digest([actor,sk,'charge'])});
+      await governance.execute(actor,'budget.settle',{reservationId:row.reservationId,actualCents:row.charge,...(row.taskId&&{taskId:row.taskId}),requestId:digest([actor,sk,'charge'])});
       if(await records.transact([{pk,sk,expect:version,value:{...data,state:'settled'}}]))return {chargedCents:row.charge};
     }
     fail(503,'Model meter is busy.');

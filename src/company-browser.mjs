@@ -1,4 +1,6 @@
 import {createHash,randomUUID} from 'node:crypto';
+import {eventRows} from './company-events.mjs';
+import {spanAttributes} from './telemetry.mjs';
 
 const digest=(...args)=>createHash('sha256').update(JSON.stringify(args)).digest('hex');
 const fail=(status,message)=>{throw Object.assign(new Error(message),{status});};
@@ -22,6 +24,21 @@ function summary(s,now) {
 
 export function createManagedBrowser({records,employee,provider,profiles=[],files,now=Date.now}) {
   const pk='browser-sessions',locks='browser-locks';
+  function audit(kind,actor,employeeId,{sessionId,profileId,status},key) {
+    // Profile names can identify a customer or service. Only correlate their
+    // opaque fingerprint. Never pass browser input, URLs or provider references.
+    const ids={...(sessionId && {browserSessionId:sessionId}),
+      ...(profileId && {browserProfileId:'bp-'+digest(profileId).slice(0,32)})};
+    spanAttributes(ids);
+    return eventRows(kind,{actor,employeeId,status,...ids},key);
+  }
+  async function reconcileExpiry(row) {
+    if(!row||row.expiresAt>now()||row.busyUntil>now()||!['active','starting'].includes(row.status))return row;
+    if(await records.transact([write(pk,row.id,row,{...clean(row),status:'expired'}),
+      ...audit('browser.expired','system',row.employeeId,{sessionId:row.id,profileId:row.profileId,status:'expired'},row.id)]))
+      return {...row,status:'expired'};
+    return records.get(pk,row.id);
+  }
   const catalog=new Map(profiles.map(p=>{
     if(typeof p.id!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(p.id))fail(400,'Invalid configured browser profile.');
     return [p.id,{id:p.id,label:p.label??p.id,origins:(p.origins??[]).map(origin)}];
@@ -37,7 +54,7 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
       const employeeId=await person(actor,input.employeeId);
       const all=actor==='owner'&&!input.employeeId;
       const page=await records.list(all?'browser-catalog':'browser-list#'+employeeId,{limit:40});
-      const sessions=await Promise.all(page.items.map(x=>records.get(pk,x.id)));
+      const sessions=await Promise.all(page.items.map(async x=>reconcileExpiry(await records.get(pk,x.id))));
       const grants=await records.list(all?'browser-grants-catalog':'browser-grants#'+employeeId,{limit:100});
       return {sessions:sessions.filter(Boolean).map(s=>summary(s,now())),profiles:grants.items.filter(g=>catalog.has(g.id)).map(clean),
         ...(actor==='owner'&&{catalog:[...catalog.values()]})};
@@ -56,14 +73,16 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
       const value=op.endsWith('revoke')?null:{id:p.id,employeeId,label:p.label,allowedOrigins:allowed};
       const indexKey=employeeId+'#'+p.id;
       const index=await records.get('browser-grants-catalog',indexKey);
-      if(!await records.transact([write(grantPk,p.id,prior,value),write('browser-grants-catalog',indexKey,index,value),write('browser-controls',key,null,{signature})]))fail(409,'Grant changed.');
+      if(!await records.transact([write(grantPk,p.id,prior,value),write('browser-grants-catalog',indexKey,index,value),write('browser-controls',key,null,{signature}),
+        ...audit(op==='browser.profile.grant'?'browser.profile.granted':'browser.profile.revoked',actor,employeeId,
+          {profileId:p.id,status:value?'granted':'revoked'},input.requestId)]))fail(409,'Grant changed.');
       return {ok:true};
     }
     if(op==='browser.start') {
       const employeeId=await person(actor,input.employeeId),profileId=input.profileId??null;
       const sessionId='bs-'+digest(actor,input.requestId).slice(0,32);
       const signature=digest(employeeId,profileId,input.url??null);
-      let row=await records.get(pk,sessionId);
+      let row=await reconcileExpiry(await records.get(pk,sessionId));
       if(row && row.signature!==signature)fail(409,'Browser request already used.');
       let origins,grantVersion;
       if(profileId) {
@@ -80,6 +99,7 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
         const lockNames=[seatKey(employeeId),...(profileId?[profileKey(profileId)]:[])];
         const held=await Promise.all(lockNames.map(k=>records.get(locks,k)));
         if(held.some(l=>l && l.expiresAt>at))fail(409,'An employee or profile session is already open.');
+        for(const lock of held) if(lock && lock.sessionId!==sessionId) await reconcileExpiry(await records.get(pk,lock.sessionId));
         const changes=lockNames.map((k,i)=>write(locks,k,held[i],{sessionId,expiresAt}));
         if(!await records.transact([write(pk,sessionId,null,s),write('browser-list#'+employeeId,String(1e14-at)+sessionId,null,{id:sessionId}),write('browser-catalog',String(1e14-at)+sessionId,null,{id:sessionId}),...changes]))
           fail(409,'Session start raced another request. Retry.');
@@ -87,14 +107,16 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
       }
       if(row.status==='starting'&&row.expiresAt>now()) {
         const providerId=await provider.start({...row,url:input.url,origins});
-        await records.transact([write(pk,row.id,row,{...clean(row),providerId,status:'active'})]);
+        await records.transact([write(pk,row.id,row,{...clean(row),providerId,status:'active'}),
+          ...audit('browser.started',actor,employeeId,{sessionId,profileId,status:'active'},sessionId)]);
         row=await records.get(pk,sessionId);
       }
       return {session:summary(row,now())};
     }
     if(!id(input.sessionId)) fail(400,'Invalid browser session.');
-    const row=await records.get(pk,input.sessionId);
-    if(!row||actor!=='owner'&&actor!==row.employeeId)fail(404,'Browser session not found.');
+    const stored=await records.get(pk,input.sessionId);
+    if(!stored||actor!=='owner'&&actor!==stored.employeeId)fail(404,'Browser session not found.');
+    const row=await reconcileExpiry(stored);
     if(op==='browser.view')return {session:summary(row,now()),path:summary(row,now()).takeoverPath};
     if(op==='browser.frame'&&actor!=='owner')fail(403,'Owner view required.');
     let origins;
@@ -174,6 +196,9 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
       if(op==='browser.release')next.controller='agent';
       if(stopped)next.status='stopped';
       const changes=[write(pk,row.id,locked,next)];
+      const kind=stopped?'browser.stopped':op==='browser.takeover'?'browser.taken_over':op==='browser.release'?'browser.handed_back':null;
+      if(success && kind)changes.push(...audit(kind,actor,row.employeeId,{sessionId:row.id,profileId:row.profileId,
+        status:stopped?'stopped':next.controller},digest(row.id,input.requestId)));
       // A failed input may already have reached the page. Keep the receipt
       // ambiguous instead of replaying a click or password submission.
       if(stopped||op!=='browser.stop'&&success)changes.push(write(receiptPk,input.requestId,action,{signature,done:true,...(saved&&{file:saved})}));

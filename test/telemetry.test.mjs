@@ -125,3 +125,19 @@ test('failures before a work span emit a bounded EMF failure without invoking tr
   assert.equal(exporter.getFinishedSpans().length,0);
   await t.shutdown();
 });
+test('broker command traces admit exact commands and generated item IDs and suppress browser and file contents',async()=>{
+  const exporter=new InMemorySpanExporter(),lines=[];
+  const telemetry=createTelemetry({mode:'test',exporter,write:line=>lines.push(JSON.parse(line))});
+  const sensitive='confidential-client-token';
+  const suffix='a'.repeat(32);
+  const ids={projectId:'p-'+suffix,browserSessionId:'bs-'+suffix,browserProfileId:'bp-'+suffix};
+  await telemetry.withSpan('company.command',{command:'browser.takeover',...ids,text:sensitive,profileId:sensitive,
+    url:'https://'+sensitive+'.example',frame:sensitive,cookie:sensitive},async()=>{});
+  await telemetry.withSpan('company.command',{command:'browser.'+sensitive,browserSessionId:sensitive,
+    projectId:'bs-'+suffix,resourceId:sensitive},async()=>{});
+  await telemetry.flushTelemetry();
+  assert.deepEqual(exporter.getFinishedSpans()[0].attributes,{command:'browser.takeover',...ids});
+  assert.deepEqual(exporter.getFinishedSpans()[1].attributes,{});
+  assert.ok(!JSON.stringify(lines).includes(sensitive));
+  await telemetry.shutdown();
+});

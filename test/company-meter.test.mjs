@@ -22,3 +22,16 @@ test('admission rejects unfunded and stale policy, issues once and bills actual 
   const {budget}=await governance.execute('ceo','governance.get');
   assert.equal(budget.reservedCents,0);assert.equal(budget.spentCents,42);assert.equal(budget.availableCents,58);
 });
+test('model reservation preserves host-assigned task attribution through replay and settlement',async t=>{
+  const records=makeSqliteRecords({filename:':memory:'});t.after(()=>records.close());
+  const calls=[];
+  const governance={async execute(actor,op,input){calls.push({actor,op,input});return {reservation:{id:'r-test'}};}};
+  const modelId='model',settingsVersion='config-1',taskId='t-'+'b'.repeat(32),requestId=randomUUID();
+  const settings={effective:async()=>({version:settingsVersion,settings:{modelId}})};
+  const meter=makeModelMeter({records,governance,settings,tariffs:{model:{maxInputTokens:100,maxOutputTokens:100,
+    inputCentsPerMillion:100,outputCentsPerMillion:300}}});
+  assert.equal((await meter.execute('ceo','budget.model.begin',{requestId,modelId,settingsVersion,taskId})).permitted,true);
+  await assert.rejects(meter.execute('ceo','budget.model.begin',{requestId,modelId,settingsVersion,taskId:'different'}),{status:409});
+  await meter.execute('ceo','budget.model.finish',{requestId,usage:{input_tokens:3,output_tokens:1}});
+  assert.deepEqual(calls.map(c=>[c.op,c.input.taskId]),[['budget.reserve',taskId],['budget.settle',taskId]]);
+});

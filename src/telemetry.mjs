@@ -17,6 +17,9 @@ const knownValues = new Set([
   'remember', 'recall', 'reply', 'wait', 'finish', 'work', 'blocked', 'create', 'send', 'assign', 'retry',
   'success', 'error', 'ok', 'accepted', 'denied', 'ready', 'working', 'done', 'failed', 'completed', 'open',
   'queued', 'pending', 'approved', 'changes_requested', 'submitted', 'cancelled', 'rejected', 'conflict',
+  'mail','pass','search','open','start','stop','read','write','list','get','save','forget','approve','revoke',
+  'allocate','propose','build','preview','release','rollback','commit','attach','snapshot','provision','status',
+  'navigate','download','screenshot','input','review','close','confirm','active','stopped','expired','granted','revoked',
   'decision_format', 'decision_provider', 'store', 'store_retry', 'store_access', 'aborted', 'other',
   'empty_response', 'invalid_json', 'invalid_action', 'invalid_value', 'invalid_target', 'invalid_delay',
 ]);
@@ -27,10 +30,23 @@ const commandNames = new Set([
   'task.block', 'task.wait', 'task.resume', 'journal.get', 'journal.stage', 'journal.confirm', 'journal.fail',
   'admin.conversations', 'admin.messages', 'admin.events', 'admin.goals', 'admin.tasks',
   'directory.list', 'directory.get', 'employee.hire', 'employee.pause', 'employee.resume', 'employee.fire',
+  'files.list','files.read','files.write','files.versions','files.part','files.commit','soul.get',
+  'settings.effective','settings.get','settings.history','settings.update','settings.restore',
+  'knowledge.list','knowledge.save','knowledge.forget','browser.list','browser.view','browser.start','browser.stop',
+  'browser.takeover','browser.release','browser.profile.grant','browser.profile.revoke','browser.navigate','browser.input',
+  'browser.read','browser.frame','browser.screenshot','browser.download','governance.get','policy.get','policy.set',
+  'promotion.list','promotion.propose','promotion.approve','grant.revoke','budget.get','budget.allocate','budget.reclaim',
+  'budget.model.begin','budget.model.finish','project.create','project.list','project.get','project.history',
+  'project.attach','project.commit','project.snapshot','delivery.build','delivery.preview','delivery.status',
+  'delivery.release','delivery.rollback','delivery.withdraw','delivery.expire','infra.list','infra.provision','infra.status','infra.remove',
+  'mail.list','mail.get','mail.claim','mail.finish','mail.release','mail.send','mail.reply','memory.save',
+  'deliveries.claim','deliveries.ack','deliveries.stage','deliveries.release','activity.list','admin.activity',
   'memory.list', 'memory.remember', 'memory.update', 'memory.forget', 'worker.heartbeat',
 ]);
 const idKeys = new Set(['work_id', 'agent_id', 'agentId', 'goalId', 'taskId', 'conversationId', 'messageId', 'commandId', 'workId']);
-const enumKeys = new Set(['work_kind', 'workKind', 'action', 'reason', 'outcome', 'status', 'command']);
+const domainIds = {projectId:/^p-[a-f0-9]{32}$/,jobId:/^j-[a-f0-9]{32}$/,buildId:/^b-[a-f0-9]{32}$/,
+  resourceId:/^i-[a-f0-9]{32}$/,browserSessionId:/^bs-[a-f0-9]{32}$/,browserProfileId:/^bp-[a-f0-9]{32}$/};
+const enumKeys = new Set(['work_kind', 'workKind', 'action', 'reason', 'outcome', 'status']);
 const counts = new Set(['attempt', 'generation', 'inputTokens', 'outputTokens', 'cachedInputTokens', 'reasoningOutputTokens']);
 const identifier = /^(?:ceo|owner|[0-9a-f]{24,64}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[acdegmtw]-[0-9a-f]{16,64})$/;
 const releasePattern = /^[0-9a-f]{40,64}$/;
@@ -42,6 +58,7 @@ function safeAttributes(attributes) {
   const safe = {};
   for (const [key, value] of Object.entries(attributes ?? {})) {
     if (idKeys.has(key) && typeof value === 'string' && identifier.test(value)) safe[key] = value;
+    else if (Object.hasOwn(domainIds,key) && typeof value==='string' && domainIds[key].test(value)) safe[key]=value;
     else if (key === 'command' && commandNames.has(value)) safe.command = value;
     else if (enumKeys.has(key) && knownValues.has(value)) safe[key] = value;
     else if (counts.has(key) && Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000) safe[key] = value;

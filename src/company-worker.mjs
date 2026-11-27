@@ -139,9 +139,11 @@ async function contextFor(actor, unit, execute) {
 
 function applyDecision({ unit, ctx, execute, browse, signal, requestId }, { op, input }) {
   const key = suffix => digest(requestId, suffix);
-  const call = (name, args) => execute(name, { ...args, requestId: key(name) });
+  const call = (name, args) => execute(name, { ...args,
+    ...(unit.task && /^(employee\.(hire|fire)|promotion\.|budget\.allocate|grant\.revoke)/.test(name) && {taskId:unit.task.id}),
+    requestId: key(name) });
   const receipt = (result, finished = false) => ({ ...result, ...(finished && { finished:true }) });
-  return withSpan('tool.execute', { action:op.split('.').at(-1) }, async () => {
+  return withSpan('tool.execute', { action:op.split('.').at(-1),command:op }, async () => {
     if (!ctx.allowed.includes(op)) return { error:'This action is outside the scope of this work.' };
     if (['reply','pass'].includes(op)) {
       if (unit.kind === 'message') await execute('deliveries.ack', { ...deliveryKey(unit), ...(op === 'reply' && { reply:input.text }) });
@@ -255,7 +257,7 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
             const key=digest(id,index,entry.failures);
             const {settings,version}=unit.runtime??{};
             if(!settings?.modelId)throw new Error('Missing model configuration.');
-            const permit=await execute('budget.model.begin',{requestId:key,modelId:settings.modelId,settingsVersion:version});
+            const permit=await execute('budget.model.begin',{requestId:key,modelId:settings.modelId,settingsVersion:version,...(unit.task && {taskId:unit.task.id})});
             let usage;
             try {
               if(!permit.permitted) throw new Error('This paid attempt has already been issued.');

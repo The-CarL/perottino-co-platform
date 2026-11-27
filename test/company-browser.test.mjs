@@ -10,13 +10,13 @@ import {createManagedBrowser} from '../src/company-browser.mjs';
 import {localInteractiveBrowser} from '../src/interactive-browser.mjs';
 import {makeSqliteRecords} from '../src/foundation-records.mjs';
 import {createCompanyFiles,localBlobs} from '../src/company-files.mjs';
-async function fixture(t,provider,profiles) {
+async function fixture(t,provider,profiles,options={}) {
   const root=await mkdtemp(join(tmpdir(),'company-browser-test-'));t.after(()=>rm(root,{recursive:true,force:true}));
   const records=makeSqliteRecords({filename:':memory:'});t.after(()=>records.close());
   const employee=async id=>['ceo','eng'].includes(id)?{id,name:id,handle:id,role:'Employee'}:null;
   const files=createCompanyFiles({records,blobs:localBlobs(join(root,'files')),employee});
-  const service=createManagedBrowser({records,employee,provider,profiles,files});
-  return {invoke:(actor,op,args={})=>service.execute(actor,'browser.'+op,{requestId:randomUUID(),...args}),files};
+  const service=createManagedBrowser({records,employee,provider,profiles,files,...options});
+  return {records,invoke:(actor,op,args={})=>service.execute(actor,'browser.'+op,{requestId:randomUUID(),...args}),files};
 }
 test('live Chromium takeover, passive public pages, active dedicated preview, file import and screenshot',async t=>{
   const root=await mkdtemp(join(tmpdir(),'browser-pw-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -72,4 +72,31 @@ test('configured origin grants, exclusive profile, transfer and revocation',asyn
   await invoke('owner','stop',s);
   const {session:fresh}=await invoke('ceo','start',{profileId:profile.id});
   await invoke('owner','stop',{sessionId:fresh.id,saveProfile:true});assert.equal(published,1);
+});
+test('browser audit commits one metadata-only event per outcome, including discovered TTL expiry',async t=>{
+  let time=Date.now();
+  const secret='private-account-canary';
+  const resource='https://'+secret+'.example';
+  const provider={validate:async()=>{},start:async()=>secret,action:async()=>({dataUrl:secret}),stop:async()=>{},save:async()=>{}};
+  const {invoke,records}=await fixture(t,provider,[{id:secret,label:secret,origins:[resource]}],{now:()=>time});
+  const grant={profileId:secret,employeeId:'eng',requestId:randomUUID()};
+  await invoke('owner','profile.grant',grant); await invoke('owner','profile.grant',grant);
+  const start={profileId:secret,url:resource+'/account',requestId:randomUUID()};
+  const {session}=await invoke('eng','start',start);await invoke('eng','start',start);
+  const s={sessionId:session.id};
+  const control={...s,requestId:randomUUID()};await invoke('owner','takeover',control);await invoke('owner','takeover',control);
+  await invoke('owner','input',{...s,kind:'type',text:secret});
+  await invoke('owner','frame',s);
+  await invoke('owner','release',s);await invoke('eng','stop',s);
+  await invoke('owner','profile.revoke',{employeeId:'eng',profileId:secret});
+  await invoke('eng','start',{});time+=16*60_000;
+  await invoke('eng','list');await invoke('eng','list');
+  const {items}=await records.list('company-events');
+  const events=items.map(r=>r.kind).sort();
+  assert.deepEqual(events,['browser.profile.granted','browser.started','browser.taken_over','browser.handed_back',
+    'browser.stopped','browser.profile.revoked','browser.started','browser.expired'].sort());
+  for(const row of items){assert.equal(row.employeeId,'eng');assert.ok(!JSON.stringify(row).includes(secret));}
+  const started=items.find(r=>r.kind==='browser.started'&&r.browserSessionId===session.id);
+  assert.match(started.browserProfileId,/^bp-[0-9a-f]{32}$/);
+  assert.equal(items.find(r=>r.kind==='browser.expired').actor,'system');
 });
