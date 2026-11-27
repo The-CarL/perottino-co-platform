@@ -109,7 +109,15 @@ export function createCompanyService({ records, store, control, heartbeat }) {
       return { employee:profile(affected) };
     }
     if (op.startsWith('memory.')) return memory(actor,op,input);
-    if (op.startsWith('journal.')) { requireAgent(actor); return journal.execute(actor,op,input); }
+    if (op.startsWith('journal.')) {
+      requireAgent(actor);
+      if (op === 'journal.fail' && ['plan','close','task','review'].includes(input.kind)) {
+        const type = ['plan','close'].includes(input.kind) ? 'goal' : 'task';
+        const resource = (await work.execute(actor,type+'.get',{[type+'Id']:input.workId}))[type];
+        return journal.execute(actor,op,{...input,workId:resource.id});
+      }
+      return journal.execute(actor,op,input);
+    }
     if (op === 'worker.poll') {
       requireAgent(actor);
       const cursors = input.after ?? {};

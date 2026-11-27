@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createTurnTools, runTurn, sdkDecision } from './agent.mjs';
 import { makeAgentCoreBrowser } from './agentcore-browser.mjs';
-import { flushTelemetry, traceCarrier } from './telemetry.mjs';
+import { flushTelemetry, traceCarrier, operationFailure } from './telemetry.mjs';
 
 const actions = ['goal', 'reply', 'work', 'finish', 'wait', 'blocked', 'remember', 'recall', 'browse', 'hire', 'fire', 'message'];
 const effects = ['hire', 'fire', 'message'];
@@ -416,7 +416,7 @@ async function main() {
       const { runCompanyResident } = await import('./company-worker.mjs');
       await runCompanyResident({ actor:{ id:binding.agentId },workerId:binding.taskArn,
         execute:companyCommand(binding,broker),browse:makeAgentCoreBrowser(),signal:stop.signal,
-        reportFailure:record => console.log(JSON.stringify(record)) });
+        reportFailure:record => operationFailure('work.failure',{agentId:binding.agentId,attempt:record.attempt,reason:record.reason ?? 'other',outcome:'error'}) });
       return;
     }
     const { createCloudStore } = await import('./cloud-store.mjs');

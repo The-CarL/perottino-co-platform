@@ -5,7 +5,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { createCompanyService } from './company-service.mjs';
 import { makeDynamoRecords } from './foundation-records.mjs';
-import { withSpan, flushTelemetry, operationEvent } from './telemetry.mjs';
+import { withSpan, flushTelemetry, operationFailure } from './telemetry.mjs';
 import { createCloudStore } from './cloud-store.mjs';
 import { createFactoryState } from './factory-state.mjs';
 import { isValidEmployeeLimit, maxCompanyEmployees } from './headcount.mjs';
@@ -400,7 +400,7 @@ export async function handler(event, context) {
   try {
     if (event?.source === 'aws.events') {
       try { return await factory().handler(event,context); }
-      catch (error) { operationEvent('work.failure',{reason:'store',outcome:'error'}); throw error; }
+      catch (error) { operationFailure('work.failure',{reason:'store',outcome:'error'}); throw error; }
     }
     return await withSpan('factory.reconcile',{},() => factory().handler(event,context));
   }
