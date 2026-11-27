@@ -13,6 +13,13 @@ const password = 'local-owner-test-password';
 const passwordHash = await hashPassword(password);
 const auth = 'Basic ' + Buffer.from(username + ':' + password).toString('base64');
 
+function useDefaultHeadcount(t) {
+  const configured = process.env.PEROTTINO_EMPLOYEE_LIMIT;
+  if (configured === undefined) return;
+  delete process.env.PEROTTINO_EMPLOYEE_LIMIT;
+  t.after(() => { process.env.PEROTTINO_EMPLOYEE_LIMIT = configured; });
+}
+
 async function directory(t) {
   const dataDir = await mkdtemp(join(tmpdir(), 'perottino-test-'));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
@@ -198,6 +205,7 @@ test('owner memory corrections and forget preserve provenance and replay safely 
 });
 
 test('local manager hires once, paused employees keep durable goals across restart, and firing preserves the archive', async t => {
+  useDefaultHeadcount(t);
   const dir = await directory(t);
   let app = await open(dir);
   t.after(() => app.close());
@@ -226,11 +234,11 @@ test('local manager hires once, paused employees keep durable goals across resta
   const assigned = (await (await call(id,'messages')).json()).messages.find(m => m.text === firstAssignment);
   assert.equal(assigned.author,'employee');
   assert.equal(assigned.senderAgentId,'ceo');
-  await app.post('overflow','hire Writer');
-  await until(async () => (await (await call('ceo','messages')).json()).messages.some(m => m.text.includes('employee limit')));
+  await app.post('second-hire','hire Writer');
+  await until(async () => (await (await app.get('/api/directory')).json()).agents.some(agent => agent.role === 'Writer'));
   await call(id,'messages',{requestId:'forbidden',text:'hire QA'});
   await until(async () => (await (await call(id,'messages')).json()).messages.some(m => m.text.includes('do not have hiring authority')));
-  assert.equal((await (await app.get('/api/directory')).json()).agents.length, 2);
+  assert.equal((await (await app.get('/api/directory')).json()).agents.length, 3);
   const paused = await (await act(id,'pause','pause-1')).json();
   assert.equal(paused.employee.desiredState, 'paused');
   assert.deepEqual(await (await act(id,'pause','pause-1')).json(), paused);
@@ -264,3 +272,38 @@ test('local manager hires once, paused employees keep durable goals across resta
   assert.equal((await profile(id)).goals.length, 3);
   assert.equal((await (await call(id,'memory')).json()).memories[0].id, memo.id);
 });
+
+for (const [description, cap, options] of [
+  ['the default of 100 employees', 100, undefined],
+  ['a configured limit of two employees', 2, {employeeLimit:2}]
+]) {
+  test('local hiring enforces ' + description + ', including the CEO and paused staff', async t => {
+    if (options === undefined) useDefaultHeadcount(t);
+    const store = createStore(await directory(t), options);
+    try {
+      const nextTurn = requestId => {
+        store.enqueue('ceo','hire Engineer',requestId);
+        return store.claim(10000);
+      };
+      let report;
+      for (let seat = 2; seat <= cap; seat++) {
+        const job = nextTurn('seat-' + seat);
+        report = store.hireForTurn(job,'Engineer');
+        if (seat === cap) assert.equal(store.hireForTurn(job,'Engineer').id, report.id);
+        assert.equal(store.complete(job,'Hired',[]), true);
+      }
+      assert.equal(store.directory().length, cap);
+      const control = operation => store.setEmployeeState({agentId:report.id, operation, requestId:operation});
+      assert.equal(control('pause').employee.desiredState,'paused');
+      const next = nextTurn('one-more');
+      assert.throws(() => store.hireForTurn(next,'Engineer'), {code:'EMPLOYEE_LIMIT'});
+      assert.equal(store.directory().length, cap);
+      assert.equal(control('fire').employee.desiredState,'fired');
+      const replacement = store.hireForTurn(next,'Engineer');
+      assert.notEqual(replacement.id,report.id);
+      assert.equal(store.complete(next,'Hired',[]), true);
+      const working = store.directory().filter(agent => store.employee(agent.id).desiredState === 'active');
+      assert.equal(working.length, cap);
+    } finally { store.close(); }
+  });
+}

@@ -9,23 +9,30 @@ const endpoint = process.env.PEROTTINO_DDB_TEST_ENDPOINT;
 if (endpoint && !/^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d+\/?$/.test(endpoint))
   throw Error('Employee-store tests require a local DynamoDB endpoint.');
 
-test('resident identity and goal lifecycle on DynamoDB Local', { skip: !endpoint }, async t => {
+async function withTable(check) {
   const tableName = 'perottino-resident-test-' + randomUUID();
   const raw = new DynamoDBClient({ endpoint, region:'us-east-1', credentials:{accessKeyId:'test',secretAccessKey:'test'} });
   const client = DynamoDBDocumentClient.from(raw);
-  let time = Date.now();
-  const store = createCloudStore({ tableName, client, now:()=>time, resident:true });
-  const legacy = createCloudStore({ tableName, client, now:()=>time, resident:false });
-  const actor = (agentId,generation,taskArn) => ({agentId,generation,taskArn});
-  const ceo = actor('ceo',1,'arn:test:tasks/ceo');
-  const makeHire = (name,requestId) => ({callerId:'ceo',binding:ceo,role:'Engineer',name,handle:name.toLowerCase(),requestId,assignment:'Investigate soil records'});
-  const run = binding => store.claimNextWork({...binding,leaseMs:1000});
-  let hire, worker, ownerMessage;
   await raw.send(new CreateTableCommand({TableName:tableName, BillingMode:'PAY_PER_REQUEST',
     AttributeDefinitions:['pk','sk'].map(AttributeName=>({AttributeName,AttributeType:'S'})),
     KeySchema:[{AttributeName:'pk',KeyType:'HASH'},{AttributeName:'sk',KeyType:'RANGE'}]}));
   try {
     await waitUntilTableExists({client:raw,maxWaitTime:20,minDelay:1,maxDelay:2},{TableName:tableName});
+    await check({ tableName, client });
+  } finally {
+    try { await raw.send(new DeleteTableCommand({TableName:tableName})); } finally { raw.destroy(); }
+  }
+}
+
+test('resident identity and goal lifecycle on DynamoDB Local', { skip: !endpoint }, t => withTable(async ({ tableName, client }) => {
+  let time = Date.now();
+  const store = createCloudStore({ tableName, client, now:()=>time, resident:true });
+  const legacy = createCloudStore({ tableName, client, now:()=>time, resident:false });
+  const actor = (agentId,generation,taskArn) => ({agentId,generation,taskArn});
+  const ceo = actor('ceo',1,'arn:test:tasks/ceo');
+  const makeHire = (name,requestId) => ({callerId:'ceo',binding:ceo,role:'Engineer',name,handle:name.toLowerCase(),requestId,assignment:'Investigate soil records',maxEmployees:2});
+  const run = binding => store.claimNextWork({...binding,leaseMs:1000});
+  let hire, worker, ownerMessage;
     await t.test('legacy CEO state upgrades in place and a fenced manager can hire only one report',async()=>{
       await legacy.directory();
       ownerMessage=(await legacy.enqueue('ceo','original conversation','old-message')).message;
@@ -153,5 +160,42 @@ test('resident identity and goal lifecycle on DynamoDB Local', { skip: !endpoint
       assert.equal((await store.getGoal('ceo',g.goal.id)).status,'blocked');
       assert.equal((await run(replacement)).state,'idle');
     });
-  } finally { try { await raw.send(new DeleteTableCommand({TableName:tableName})); } finally {raw.destroy();} }
-});
+}));
+
+test('the default headcount includes the CEO, admits employee 100 and rejects employee 101',
+  {skip:!endpoint}, t => withTable(async ({ tableName, client }) => {
+    const inheritedLimit = process.env.PEROTTINO_EMPLOYEE_LIMIT;
+    delete process.env.PEROTTINO_EMPLOYEE_LIMIT;
+    t.after(() => {
+      if (inheritedLimit === undefined) delete process.env.PEROTTINO_EMPLOYEE_LIMIT;
+      else process.env.PEROTTINO_EMPLOYEE_LIMIT = inheritedLimit;
+    });
+    const store = createCloudStore({tableName,client,resident:true});
+    const ceo = await store.ensureCEO();
+    const binding = {agentId:ceo.id,generation:ceo.generation,taskArn:'arn:test:tasks/headcount-ceo'};
+    assert.equal(await store.bindEmployeeTask(binding),true);
+
+    function hire(number) {
+      return store.hireEmployee({callerId:'ceo',binding,role:'Analyst',name:'Analyst ' + number,
+        handle:'analyst-' + number,requestId:'hire-' + number});
+    }
+    await hire(1);
+    process.env.PEROTTINO_EMPLOYEE_LIMIT = '2';
+    await assert.rejects(hire(2),{code:'EMPLOYEE_LIMIT'});
+    delete process.env.PEROTTINO_EMPLOYEE_LIMIT;
+
+    for (let number = 2; number <= 98; number++) await hire(number);
+    assert.equal((await store.listEmployees()).length,99);
+
+    const contenders = await Promise.allSettled([hire(99),hire(100)]);
+    assert.equal(contenders.filter(result=>result.status === 'fulfilled').length,1);
+    const rejected = contenders.filter(result=>result.status === 'rejected');
+    assert.equal(rejected.length,1);
+    assert.equal(rejected[0].reason.code,'EMPLOYEE_LIMIT');
+    await assert.rejects(hire(101),{code:'EMPLOYEE_LIMIT'});
+
+    const roster = await store.listEmployees();
+    assert.equal(roster.length,100);
+    assert.equal(roster.filter(employee=>employee.id === ceo.id).length,1);
+    assert.equal(roster.filter(employee=>employee.managerId === ceo.id).length,99);
+  }));

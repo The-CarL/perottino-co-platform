@@ -15,5 +15,5 @@
   "publicSubnetIds": [
     "subnet-abcdef01234567890"
   ],
-  "employeeLimit": 2
+  "employeeLimit": 100
 }

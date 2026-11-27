@@ -43,7 +43,12 @@ test('one explicitly bootstrapped CEO uses standalone employee tasks with durabl
   assert.deepEqual(bootstrap.Properties.TaskDefinitionArn, { Ref: 'WorkerTask' });
   assert.equal(bootstrap.Properties.WorkerImage, sample().workerImage);
   assert.equal(bootstrap.Properties.ReleaseImage, sample().lambdaImage);
-  assert.equal(bootstrap.Properties.EmployeeLimit, '2');
+  assert.equal(bootstrap.Properties.EmployeeLimit, '100');
+  const { employeeLimit, ...configWithDefault } = sample();
+  assert.equal(employeeLimit, 100);
+  const defaults = render(t, configWithDefault).template.Resources;
+  assert.equal(defaults.ResidentCompany.Properties.EmployeeLimit, '100');
+  assert.equal(defaults.FactoryFn.Properties.Environment.Variables.PEROTTINO_EMPLOYEE_LIMIT, '100');
   assert.ok(bootstrap.Properties.ServiceTimeout > props(r, 'FactoryFn').Timeout);
   assert.deepEqual(bootstrap.DependsOn.sort(), ['ManagerFn', 'OwnerFn', 'RepairInvoke', 'StoppedInvoke']);
   const change = render(t, { ...sample(), employeeLimit: 6 }).template.Resources;
@@ -85,7 +90,7 @@ test('invalid AWS bindings, PAT reuse, mutable image tags and a namespace too lo
     c => { c.publicSubnetIds = []; },
     c => { c.workerSize = 'huge'; },
     c => { c.employeeLimit = 0; },
-    c => { c.employeeLimit = 31; },
+    c => { c.employeeLimit = 101; },
     c => { c.employeeLimit = '2'; },
     c => { c.ownerSecretArn = c.ownerSecretArn.replace('example/owner', '/perottino-co/github/pat'); },
     c => { c.bedrockResourceArns.push('*'); },

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { isValidEmployeeLimit, maxCompanyEmployees } from './headcount.mjs';
 
 function ownerMessage(turn) {
   return { id: turn.id, author: turn.sender_agent_id ? 'employee' : 'owner', text: turn.text, createdAt: turn.created_at,
@@ -16,9 +17,9 @@ function turnMessages(turn) {
   return messages;
 }
 
-export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTINO_EMPLOYEE_LIMIT ?? 2)} = {}) {
-  if (!Number.isSafeInteger(employeeLimit) || employeeLimit < 1 || employeeLimit > 30)
-    throw new Error('Employee limit must be between 1 and 30.');
+export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTINO_EMPLOYEE_LIMIT ?? maxCompanyEmployees)} = {}) {
+  if (!isValidEmployeeLimit(employeeLimit))
+    throw new Error(`Employee limit must be between 1 and ${maxCompanyEmployees}.`);
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const filename = join(dataDir, 'company.sqlite');
   closeSync(openSync(filename, 'a', 0o600));

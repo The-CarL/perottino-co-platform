@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { isValidEmployeeLimit, maxCompanyEmployees } from './headcount.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const pkFor = id => 'AGENT#' + id;
@@ -89,10 +90,10 @@ export function createEmployeeStore({ ddb, tableName, get, query, write, insert,
     });
   }
 
-  async function hireEmployee({ callerId, name, handle, role, requestId, assignment, binding, companyGate, companyVersion, generatedIdentity = false, maxEmployees = Number(process.env.PEROTTINO_EMPLOYEE_LIMIT ?? 2) }) {
+  async function hireEmployee({ callerId, name, handle, role, requestId, assignment, binding, companyGate, companyVersion, generatedIdentity = false, maxEmployees = Number(process.env.PEROTTINO_EMPLOYEE_LIMIT ?? maxCompanyEmployees) }) {
     name = text(name, 100, 'name'); role = text(role, 160, 'role'); handle = text(handle, 48, 'handle').toLowerCase();
     if (!/^[a-z][a-z0-9-]{0,47}$/.test(handle) || ['owner','ceo','mara'].includes(handle)) throw problem(409, 'Handle is reserved or invalid.');
-    if (!Number.isSafeInteger(maxEmployees) || maxEmployees < 1 || maxEmployees > 30) throw problem(400, 'Invalid employee limit.');
+    if (!isValidEmployeeLimit(maxEmployees)) throw problem(400, 'Invalid employee limit.');
     const managerId = callerId === 'owner' ? 'ceo' : callerId;
     const receipt = receiptFor('hire', callerId, requestId);
     const signature = digest(JSON.stringify([generatedIdentity ? null : name, generatedIdentity ? null : handle, role, assignment ?? '']));

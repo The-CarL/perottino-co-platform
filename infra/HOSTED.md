@@ -19,7 +19,7 @@ flowchart LR
   Employee --> Browser[On-demand AgentCore Browser]
 ```
 
-The pilot starts with one CEO. Its default limit of **two employee seats** permits a first hire. The configured cap governs personnel, while actual monthly cost also depends on worker size, active hours, model calls and tools. Running a resident Fargate task incurs compute, memory and public IPv4 charges throughout its lifetime, including when its queue is empty. A 30-second idle pulse amounts to about 87,600 pulses per employee in a 730-hour month; a pulse may perform several DynamoDB operations. Empty pulses leave model inference and browser sessions idle. The factory's five-minute repair rule runs about 8,760 times over the same month. [Account setup and cost assumptions](PORTABILITY.md)
+The pilot starts with one CEO. Its default limit of **100 employees** leaves room for 99 hires. The configured cap governs personnel, while actual monthly cost also depends on worker size, active hours, model calls and tools. Running a resident Fargate task incurs compute, memory and public IPv4 charges throughout its lifetime, including when its queue is empty. A 30-second idle pulse amounts to about 87,600 pulses per employee in a 730-hour month; a pulse may perform several DynamoDB operations. Empty pulses leave model inference and browser sessions idle. The factory's five-minute repair rule runs about 8,760 times over the same month. [Account setup and cost assumptions](PORTABILITY.md)
 
 ## Account and region inputs
 
@@ -42,7 +42,7 @@ The default synth uses [synthetic target values](example-hosted.json) and [synth
 | `ownerSecretArn` | Full ARN of the target's Secrets Manager secret containing `username` and a salted Argon2id `passwordHash`. The bootstrap uses service-managed encryption. For customer-managed encryption, review decrypt access on the exact key before use. |
 | `permissionsBoundaryArn` | Approved IAM boundary in the target account. Hosted roles use the project path `/factory/<scope>/` and this boundary. |
 | `bedrockModel`, `bedrockResourceArns` | Exact supported inference profile ID, source-region profile ARN and permitted destination model ARNs. The pinned adapter accepts `us.openai.*` and `global.openai.*`. Validate model availability, destination regions and actual live authorization in the selected account. AgentCore Browser uses the regional system tool `aws.browser.v1`. |
-| Optional `employeeLimit` | Integer from 1 through 30, default 2. The factory bootstraps the CEO once. Increasing the limit makes additional hires possible. Review existing staff and outstanding launch reservations before lowering it. |
+| Optional `employeeLimit` | Integer from 1 through 100, default 100. The factory bootstraps the CEO once. Increasing the limit makes additional hires possible. Review existing staff and outstanding launch reservations before lowering it. |
 | Optional `workerSize` | `small` (default) is 0.25 vCPU and 1 GiB per active employee. `medium` is 0.5 vCPU and 1 GiB. `large` is 1 vCPU and 2 GiB. Profile task memory, pulse time and inference latency before increasing fleet-wide sizing. |
 | Optional `customDomain` | Supply a public `hostname` and an issued regional ACM `certificateArn` for that name. Supply `hostedZoneId` to create one Route 53 A alias. With external DNS, use the `RegionalDnsName` and `RegionalDnsZone` outputs. The default public address is API Gateway's managed HTTPS endpoint. Configuring a custom domain disables that default endpoint. |
 

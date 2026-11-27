@@ -12,7 +12,7 @@ ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=dependencies /build/node_modules ./node_modules
 COPY package.json ./
-COPY src/resident.mjs src/employee-store.mjs src/cloud-store.mjs src/agent.mjs src/agentcore-browser.mjs src/browser.mjs src/renderer.mjs src/private-socket.mjs ./src/
+COPY src/resident.mjs src/employee-store.mjs src/headcount.mjs src/cloud-store.mjs src/agent.mjs src/agentcore-browser.mjs src/browser.mjs src/renderer.mjs src/private-socket.mjs ./src/
 RUN chmod -R a+rX,go-w src package.json \
     && node node_modules/@openai/codex/bin/codex.js --version
 USER 1000:1000

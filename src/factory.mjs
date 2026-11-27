@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { ECSClient, RunTaskCommand, StopTaskCommand, DescribeTasksCommand, ListTasksCommand } from '@aws-sdk/client-ecs';
 import { createCloudStore } from './cloud-store.mjs';
 import { createFactoryState } from './factory-state.mjs';
+import { isValidEmployeeLimit, maxCompanyEmployees } from './headcount.mjs';
 
 const maxFailures = 5;
 const stableRuntime = 10 * 60_000;
@@ -346,8 +347,8 @@ function factory() {
   if (!instance) {
     const { PEROTTINO_STATE_TABLE: tableName, PEROTTINO_CLUSTER_ARN: clusterArn, PEROTTINO_TASK_DEFINITION_ARN: taskDefinitionArn,
       PEROTTINO_PUBLIC_SUBNET_IDS, PEROTTINO_SECURITY_GROUP_ID: securityGroupId, PEROTTINO_EMPLOYEE_LIMIT } = process.env;
-    const employeeLimit = Number(PEROTTINO_EMPLOYEE_LIMIT ?? 2);
-    if (!Number.isInteger(employeeLimit) || employeeLimit < 1 || employeeLimit > 30) throw new Error('Invalid employee limit');
+    const employeeLimit = Number(PEROTTINO_EMPLOYEE_LIMIT ?? maxCompanyEmployees);
+    if (!isValidEmployeeLimit(employeeLimit)) throw new Error('Invalid employee limit');
     instance = createEmployeeFactory({ store: createCloudStore({ tableName }), state: createFactoryState({ tableName }),
       ecs: new ECSClient({ maxAttempts: 2 }), config: { clusterArn, taskDefinitionArn, securityGroupId, employeeLimit,
         subnets: PEROTTINO_PUBLIC_SUBNET_IDS?.split(',') } });

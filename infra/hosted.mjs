@@ -1,5 +1,6 @@
 import { App, CfnOutput, CfnResource, LegacyStackSynthesizer, RemovalPolicy, Stack } from 'aws-cdk-lib';
 import { resourceTags } from './foundation.mjs';
+import { isValidEmployeeLimit, maxCompanyEmployees } from '../src/headcount.mjs';
 
 const taggedIds = ['Hosted', 'State', 'Logs', 'WorkerSecurityGroup', 'Cluster', 'WorkerTask', 'ExecutionRole',
   'WorkerRole', 'WebRole', 'FactoryRole', 'WebFn', 'FactoryFn', 'OwnerFn', 'ManagerFn',
@@ -13,8 +14,8 @@ function requireField(condition, key) {
 
 function validate(c) {
   const { account, region, ownerSecretArn, bedrockModel } = c;
-  const employeeLimit = c.employeeLimit ?? 2;
-  requireField(Number.isInteger(employeeLimit) && employeeLimit >= 1 && employeeLimit <= 30, 'employeeLimit (1 to 30)');
+  const employeeLimit = c.employeeLimit ?? maxCompanyEmployees;
+  requireField(isValidEmployeeLimit(employeeLimit), `employeeLimit (1 to ${maxCompanyEmployees})`);
   requireField(Object.hasOwn(workerSizes, c.workerSize ?? 'small'), 'workerSize (small, medium, large)');
   requireField(typeof account === 'string' && /^\d{12}$/.test(account), 'account');
   requireField(/^(us|eu|ap|sa|ca|me|af|il|mx)-[a-z]+-\d+$/.test(region), 'commercial AWS region');
@@ -146,7 +147,7 @@ export function synthHosted(config, provenance, outdir) {
     { ...allow('ecs:TagResource', taskArnPattern), Condition: { StringEquals: { 'ecs:CreateAction': 'RunTask' } } },
     { ...allow('iam:PassRole', [arn(workerRole), arn(executionRole)]), Condition: { StringEquals: { 'iam:PassedToService': ecs } } },
   ]);
-  const limit = String(config.employeeLimit ?? 2);
+  const limit = String(config.employeeLimit ?? maxCompanyEmployees);
   const groupId = sg.getAtt('GroupId').toString();
   const factoryConfig = { PEROTTINO_RESIDENT: '1', PEROTTINO_COMPANY_GATE: '1', PEROTTINO_STATE_TABLE: state.ref,
     PEROTTINO_CLUSTER_ARN: arn(cluster), PEROTTINO_TASK_DEFINITION_ARN: workerTask.ref,

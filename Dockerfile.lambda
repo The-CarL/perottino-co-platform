@@ -12,7 +12,7 @@ FROM public.ecr.aws/lambda/nodejs:24@sha256:d20c164c7208f5d3af9adf77c455e3678419
 WORKDIR ${LAMBDA_TASK_ROOT}
 COPY --from=dependencies /build/node_modules ./node_modules
 COPY package.json ./
-COPY src/auth.mjs src/console-http.mjs src/cloud-api.mjs src/cloud-store.mjs src/employee-store.mjs src/factory.mjs src/factory-state.mjs src/email-ingress.mjs ./src/
+COPY src/auth.mjs src/console-http.mjs src/cloud-api.mjs src/cloud-store.mjs src/employee-store.mjs src/headcount.mjs src/factory.mjs src/factory-state.mjs src/email-ingress.mjs ./src/
 COPY public/ ./public/
 # AWS Lambda chooses its own least-privileged UID. Source checkouts may use 0600.
 RUN chmod -R a+rX,go-w src public package.json

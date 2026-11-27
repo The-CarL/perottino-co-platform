@@ -63,7 +63,7 @@ For noninteractive owner setup, pipe the password from a protected source into `
 
 Bootstrap starts Mara as the first employee. An authorized hire creates a directory entry and a durable first assignment, then the factory calls ECS `RunTask` for the new employee. Each task stays alive across messages, checks its inbox and advances due goals on a pulse. Empty pulses consume Fargate time and DynamoDB reads. Bedrock is invoked for work that needs inference.
 
-The owner console submits DMs, goals and lifecycle commands. Closing the browser leaves employees running. The factory records a pause or firing before it stops the task. An unexpected stop of an active employee triggers recovery from DynamoDB. Generation and task-identity checks protect against late work from an old task. The default headcount limit is two, including Mara.
+The owner console submits DMs, goals and lifecycle commands. Closing the browser leaves employees running. The factory records a pause or firing before it stops the task. An unexpected stop of an active employee triggers recovery from DynamoDB. Generation and task-identity checks protect against late work from an old task. The default headcount limit is 100, including Mara. Hiring fills the remaining 99 seats as work arrives.
 
 ```mermaid
 flowchart LR

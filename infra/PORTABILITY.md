@@ -68,6 +68,7 @@ Monthly estimates below use 730 hours at US East (N. Virginia) Linux x86 on-dema
 | 1 | $10.63 | $3.65 | $14.28 |
 | 2 | $21.27 | $7.30 | $28.57 |
 | 30 | $318.99 | $109.50 | $428.49 |
+| 100 | $1,063.29 | $365.00 | $1,428.29 |
 
 Each task uses 0.25 vCPU and 1 GB. Compute is `3600 × (0.25 × $0.000011244 + $0.000001235)` per hour. Public IPv4 is $0.005 per address-hour. Subtotals use unrounded rates. [Fargate pricing](https://aws.amazon.com/fargate/pricing/) · [VPC pricing](https://aws.amazon.com/vpc/pricing/)
 
