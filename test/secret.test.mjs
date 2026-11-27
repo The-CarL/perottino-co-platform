@@ -39,7 +39,7 @@ test('founder mail enrollment generates a retained routing token in AWS and publ
     'address@localhost', 'a"b@example.invalid', 'A Name <founder@example.invalid>', 'x@example.invalid\nBcc: y@else.invalid'])
     assert.doesNotMatch(example, address);
 
-  assert.deepEqual(Object.keys(template.Resources), ['FounderMail']);
+  assert.deepEqual(Object.keys(template.Resources).sort(), ['FounderMail', 'FounderRecipient']);
   const secret = template.Resources.FounderMail;
   assert.equal(secret.Type, 'AWS::SecretsManager::Secret');
   assert.equal(secret.DeletionPolicy, 'Retain');
@@ -58,4 +58,13 @@ test('founder mail enrollment generates a retained routing token in AWS and publ
   assert.ok(generator.PasswordLength * Math.log2(alphabet.length) >= 256);
   assert.deepEqual(Object.keys(template.Outputs), ['OwnerMailSecretArn']);
   assert.deepEqual(template.Outputs.OwnerMailSecretArn.Value, {Ref:'FounderMail'});
+  assert.equal(template.Parameters.VerifySandboxRecipient.Default, 'false');
+  assert.deepEqual(template.Conditions.EnrollRecipient, {'Fn::Equals':[{Ref:'VerifySandboxRecipient'},'true']});
+  const recipient = template.Resources.FounderRecipient;
+  assert.equal(recipient.Type, 'AWS::SES::EmailIdentity');
+  assert.equal(recipient.Condition, 'EnrollRecipient');
+  assert.deepEqual(recipient.Properties, {EmailIdentity:{Ref:'FounderEmail'}});
+  assert.equal(recipient.DeletionPolicy, 'Retain');
+  assert.equal(recipient.UpdateReplacePolicy, 'Retain');
+  assert.ok(!JSON.stringify(secret.Properties).includes('VerifySandboxRecipient'));
 });
