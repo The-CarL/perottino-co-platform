@@ -5,9 +5,11 @@ const slots=8, hour=3_600_000;
 const absent=err=>['QueueDoesNotExist','AWS.SimpleQueueService.NonExistentQueue','NonExistentQueue'].includes(err?.name);
 const fault=status=>Object.assign(new Error('Sandbox resource request declined.'),{status});
 
-export function createQueueProvisioner({sqs,scope,account,region,provenance={},now=Date.now}) {
+export function createQueueProvisioner({sqs,scope,account,region,provenance={},assessmentScope,now=Date.now}) {
   if(!/^[a-f0-9-]{36}-[a-z0-9][a-z0-9-]{0,15}$/.test(scope)||!/^\d{12}$/.test(account)||
     !/^[a-z]{2}-[a-z]+-\d$/.test(region)) throw fault(500);
+  if (assessmentScope !== undefined && assessmentScope !== scope) throw fault(500);
+  const assessmentTags = assessmentScope ? {'perottino:assessment':scope} : {};
   const pattern='factory-'+scope+'-r-q-';
   const name=i=>pattern+i;
   const expectedAttributes={SqsManagedSseEnabled:'true',MessageRetentionPeriod:'3600',MaximumMessageSize:'65536',VisibilityTimeout:'30'};
@@ -50,7 +52,7 @@ export function createQueueProvisioner({sqs,scope,account,region,provenance={},n
       if(!matches(current,spec)) throw fault(409);
       return checked(current);
     }
-    await sqs.send(new CreateQueueCommand({QueueName:name(spec.slot),Attributes:expectedAttributes,tags:{...permittedTags,'factory:s':scope,'perottino:purpose':queueTemplate,'perottino:resource':spec.resourceId,
+    await sqs.send(new CreateQueueCommand({QueueName:name(spec.slot),Attributes:expectedAttributes,tags:{...permittedTags,...assessmentTags,'factory:s':scope,'perottino:purpose':queueTemplate,'perottino:resource':spec.resourceId,
       'perottino:project':spec.projectId,'perottino:expires':spec.expiresAt}}));
     const verified=await lookup(spec.slot);
     if(!matches(verified,spec)) throw fault(503);
@@ -71,7 +73,7 @@ export function createQueueProvisioner({sqs,scope,account,region,provenance={},n
 let instance;
 export async function handler(event) {
   instance??=createQueueProvisioner({sqs:new SQSClient({}),scope:process.env.PEROTTINO_SCOPE,account:process.env.SANDBOX_ACCOUNT,
-    region:process.env.AWS_REGION,provenance:JSON.parse(process.env.QUEUE_PROVENANCE || '{}')});
+    region:process.env.AWS_REGION,assessmentScope:process.env.PEROTTINO_ASSESSMENT_SCOPE,provenance:JSON.parse(process.env.QUEUE_PROVENANCE || '{}')});
   // Fixed scheduled invocation is outside the API Gateway event envelope.
   if(event?.trigger==='sandbox-expiry' && !event.requestContext) return instance.sweep();
   try {

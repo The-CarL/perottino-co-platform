@@ -4,6 +4,11 @@ Parameters:
   ProjectScope:
     Type: String
     AllowedPattern: '[0-9a-f-]{36}-[a-z0-9][a-z0-9-]{0,15}'
+  EnableAssessmentTag:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Apply the company scope as the cost allocation tag on new assessment queues.
   BrokerRoleArn:
     Type: String
     AllowedPattern: arn:aws:iam::[0-9]{12}:role/factory/[a-z0-9-]+/[A-Za-z0-9_+=,.@-]+
@@ -19,6 +24,9 @@ Parameters:
     Type: String
     MaxLength: 3000
     Description: Reviewed factory provenance tags as a JSON map. Applied to each queue at creation.
+Conditions:
+  AssessmentTagged:
+    Fn::Equals: [{Ref: EnableAssessmentTag}, 'true']
 Resources:
   SandboxLogs:
     Type: AWS::Logs::LogGroup
@@ -85,6 +93,8 @@ Resources:
                 aws:RequestTag/factory:s:
                   Ref: ProjectScope
                 aws:RequestTag/perottino:purpose: temporary-queue-v1
+                aws:RequestTag/perottino:assessment:
+                  Fn::If: [AssessmentTagged, {Ref: ProjectScope}, {Ref: 'AWS::NoValue'}]
           - Effect: Allow
             Action: sqs:DeleteQueue
             Resource:
@@ -129,6 +139,8 @@ Resources:
         Variables:
           PEROTTINO_SCOPE:
             Ref: ProjectScope
+          PEROTTINO_ASSESSMENT_SCOPE:
+            Fn::If: [AssessmentTagged, {Ref: ProjectScope}, {Ref: 'AWS::NoValue'}]
           SANDBOX_ACCOUNT:
             Ref: AWS::AccountId
           QUEUE_PROVENANCE:

@@ -98,6 +98,27 @@ test('sandbox SQS adapter verifies target identity before changes, fails closed 
   await assert.rejects(()=>provider.execute('provision',spec),{status:409});
 });
 
+test('assessment attribution on new queues uses the configured scope and cannot be overridden by request or provenance',async()=>{
+  const stamp=Date.UTC(2026,0,1), now=()=>stamp;
+  const spec={projectId,resourceId:'i-'+'a'.repeat(32),slot:0,template:queueTemplate,
+    createdAt:new Date(stamp).toISOString(),expiresAt:new Date(stamp+3600000).toISOString(),assessmentScope:'untrusted'};
+  const sqs=fakeSqs();
+  const config={sqs,scope,region,account,now,provenance:{'perottino:assessment':'untrusted'}};
+  const regular=createQueueProvisioner(config), tagged=createQueueProvisioner({...config,assessmentScope:scope});
+  await regular.execute('provision',spec);
+  await tagged.execute('provision',spec); // Reconciliation leaves an older live generation intact.
+  await tagged.execute('provision',{...spec,slot:1,resourceId:'i-'+'b'.repeat(32)});
+  const creates=sqs.calls.filter(([op])=>op==='CreateQueueCommand').map(([,input])=>input.tags);
+  assert.equal(creates.length,2);
+  assert.equal(creates[0]['perottino:assessment'],undefined);
+  assert.equal(creates[1]['perottino:assessment'],scope);
+  assert.equal(creates[1]['factory:s'],scope);
+  assert.equal(creates[1]['perottino:purpose'],queueTemplate);
+  assert.throws(()=>createQueueProvisioner({...config,assessmentScope:'another-company'}),{status:500});
+  const yaml=readFileSync(new URL('../infra/sandbox-queues.yaml',import.meta.url),'utf8');
+  assert.match(yaml,/aws:RequestTag\/perottino:assessment:\s+Fn::If: \[AssessmentTagged, \{Ref: ProjectScope/);
+});
+
 test('cross-account broker signs only the configured regional sandbox endpoint and refuses redirects',async()=>{
   const origin='https://abcdefghij.execute-api.us-east-1.amazonaws.com', resourceId='i-'+'a'.repeat(32);
   const provider=createRemoteInfrastructure({origin,region,credentials:{accessKeyId:'TEST',secretAccessKey:'test-secret'},transport:async(url,init)=>{
