@@ -69,6 +69,15 @@ If the private template exceeds CloudFormation's 51,200-byte inline limit, stage
 
 Verify the existing roster and owner login after the update. Use a fresh V2 DM and an explicit goal to validate conversation delivery, evidence submission and review. For an installation built on the older single-host SQLite design, preserve its data and suspended work, test a separate import and rehearse rollback before switching traffic.
 
+## Remove a deployment
+
+Capture the deployed stack IDs, physical resource IDs, project tags, protection settings, backup inventory and DNS bindings before deletion. Store this inventory privately. Confirm which company records and recovery points the owner wants to keep.
+
+1. Suspend the company through the owner factory and verify that the cluster drains. Keep the factory and its permissions available for the hosted stack's deletion callback.
+2. Delete the hosted stack and check its terminal events. Reconcile the retained employee table, log group and every revision of the worker task-definition family against the inventory. Check for running tasks and remaining task network interfaces before removing a dedicated network stack.
+3. After the functions and workers are gone, remove the release-bootstrap and Git-secret stacks. Their retention policies leave the image repository and credential slots for explicit cleanup. Verify each physical resource and its scope before deleting it. Record the chosen Secrets Manager recovery deadline.
+4. Apply the owner's data decision to the retained table and any backups. Check DynamoDB backup inventory again after deletion. Verify the former API, compute, images, IAM roles, monitoring and project-owned network resources individually. Record provider-managed history and any pending deletion separately.
+
 ## Cost at pilot scale
 
 Monthly estimates below use 730 hours at US East (N. Virginia) Linux x86 on-demand rates, before credits or taxes. Each active employee runs continuously, including while waiting for work. A paused employee stops incurring task compute and public IPv4 charges when Fargate releases those resources.
