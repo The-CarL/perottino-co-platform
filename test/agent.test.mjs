@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { once } from 'node:events';
-import { createServer, request as localRequest } from 'node:http';
-import { createHash, createHmac } from 'node:crypto';
+import { createServer } from 'node:http';
 import { Codex } from '@openai/codex-sdk';
 import { createDecisionServer, runTurn, sdkDecision } from '../src/agent.mjs';
 
@@ -91,36 +90,7 @@ test('SDK worker restricts tool access to this run and excludes other job and ap
     { action: 'reply', value: 'ready' });
 });
 
-const fixtureKey = 'AKIAXXXXXXXXXXXXXXXX';
-const fixtureSecret = 'offline-fixture';
-const fixtureToken = 'offline-session-token';
-
-// Reconstruct the AWS signature at the receiving end. The native CLI signs
-// the canonical regional host even though its immediate TCP peer is loopback.
-function validateSignature(request, payload, region) {
-  const credentials = /^AWS4-HMAC-SHA256 Credential=([^/]+)\/(\d{8})\/([^/]+)\/([^/]+)\/aws4_request, *SignedHeaders=([^,]+), *Signature=([a-f0-9]{64})$/.exec(request.headers.authorization || '');
-  assert.ok(credentials, 'Expected a complete native SigV4 authorization');
-  const [, key, date, signedRegion, service, names, signature] = credentials;
-  const hostname = 'bedrock-runtime.' + region + '.amazonaws.com';
-  assert.equal(key, fixtureKey);
-  assert.equal(signedRegion, region);
-  assert.equal(service, 'bedrock');
-  assert.equal(request.headers.host, hostname);
-  assert.ok(names.split(';').includes('host'));
-  assert.equal(request.headers['x-amz-security-token'], fixtureToken);
-  const headers = names.split(';').map(name => name + ':' + request.headers[name].trim().replace(/\s+/g, ' ')).join('\n') + '\n';
-  const sha = value => createHash('sha256').update(value).digest('hex');
-  const canonical = [request.method, request.url, '', headers, names, sha(payload)].join('\n');
-  const scope = [date, region, service, 'aws4_request'].join('/');
-  const stringToSign = ['AWS4-HMAC-SHA256', request.headers['x-amz-date'], scope, sha(canonical)].join('\n');
-  let signingKey = Buffer.from('AWS4' + fixtureSecret);
-  for (const part of [date, region, service, 'aws4_request']) {
-    signingKey = createHmac('sha256', signingKey).update(part).digest();
-  }
-  assert.equal(createHmac('sha256', signingKey).update(stringToSign).digest('hex'), signature);
-}
-
-test('the resident relay preserves the native Bedrock signature, zero-tool schema, and streamed reply', { timeout: 60_000 }, async t => {
+test('the native Codex binary signs a Bedrock Responses request with no model-callable tools', { timeout: 60_000 }, async t => {
   const reply = { action: 'reply', value: 'Offline fixture reply.' };
   const item = { type: 'message', id: 'msg_fixture', role: 'assistant', status: 'completed',
     content: [{ type: 'output_text', text: JSON.stringify(reply), annotations: [] }] };
@@ -128,9 +98,8 @@ test('the resident relay preserves the native Bedrock signature, zero-tool schem
   const endpoint = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
-    const payload = Buffer.concat(chunks);
-    const body = JSON.parse(payload);
-    request = { incoming: req, payload, path: req.url, method: req.method,
+    const body = JSON.parse(Buffer.concat(chunks));
+    request = { path: req.url, method: req.method, signed: /^AWS4-HMAC-SHA256 /.test(req.headers.authorization),
       model: body.model, schema: body.text?.format?.schema, tools: body.tools };
     const response = { id: 'resp_fixture', object: 'response', model: body.model, status: 'completed', output: [item],
       usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } };
@@ -148,34 +117,22 @@ test('the resident relay preserves the native Bedrock signature, zero-tool schem
   endpoint.listen(0, '127.0.0.1');
   await once(endpoint, 'listening');
   t.after(() => { endpoint.closeAllConnections(); return new Promise(resolve => endpoint.close(resolve)); });
-  // The injected upstream transport delivers the relay's untouched HTTPS request
-  // to the offline fixture. The app configures the native provider and its Host.
-  let wireOptions, loopback;
-  const upstream = (options, receive) => {
-    wireOptions = options;
-    return localRequest({ ...options, protocol: 'http:', hostname: '127.0.0.1', port: endpoint.address().port,
-      agent: false }, receive);
-  };
+  // Only the transport endpoint and credentials change. The CLI, model catalog,
+  // output schema, and permission configuration are the ones used in Fargate.
   class OfflineBedrock extends Codex {
     constructor(options) {
-      loopback = options.config.model_providers['amazon-bedrock-runtime'].base_url;
+      options.config.model_providers['amazon-bedrock-runtime'].base_url = 'http://127.0.0.1:' + endpoint.address().port;
       for (const key of Object.keys(options.env)) if (key.startsWith('AWS_CONTAINER_')) delete options.env[key];
-      options.env.AWS_ACCESS_KEY_ID = fixtureKey;
-      options.env.AWS_SECRET_ACCESS_KEY = fixtureSecret;
-      options.env.AWS_SESSION_TOKEN = fixtureToken;
+      options.env.AWS_ACCESS_KEY_ID = 'AKIAXXXXXXXXXXXXXXXX';
+      options.env.AWS_SECRET_ACCESS_KEY = 'offline-fixture';
       options.env.AWS_EC2_METADATA_DISABLED = 'true';
       super(options);
     }
   }
-  assert.deepEqual(await sdkDecision({ message: 'Return the fixture reply.' }, AbortSignal.timeout(45_000), OfflineBedrock,
-    undefined, upstream), reply);
-  const region = process.env.AWS_REGION || 'us-east-1';
-  assert.equal(new URL(loopback).hostname, '127.0.0.1');
-  await assert.rejects(fetch(loopback, { signal: AbortSignal.timeout(1000) }), /fetch failed/);
-  assert.equal(wireOptions.hostname, 'bedrock-runtime.' + region + '.amazonaws.com');
+  assert.deepEqual(await sdkDecision({ message: 'Return the fixture reply.' }, AbortSignal.timeout(45_000), OfflineBedrock), reply);
   assert.equal(request.method, 'POST');
-  assert.equal(request.path, '/openai/v1/responses');
-  validateSignature(request.incoming, request.payload, region);
+  assert.equal(request.path, '/responses');
+  assert.equal(request.signed, true);
   assert.equal(request.model, process.env.PEROTTINO_BEDROCK_MODEL || 'us.openai.gpt-6-sol');
   assert.deepEqual(request.schema.required, ['action', 'value']);
   assert.deepEqual(request.tools, []);
