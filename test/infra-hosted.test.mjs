@@ -188,5 +188,10 @@ test('the owner, employees and trusted control code have disjoint entry points a
   assert.deepEqual(pass.Resource, [att('WorkerRole', 'Arn'), att('ExecutionRole', 'Arn')]);
   assert.equal(pass.Condition.StringEquals['iam:PassedToService'], 'ecs-tasks.amazonaws.com');
   assert.ok(actions(r, 'WorkerRole').includes('bedrock-agentcore:ConnectBrowserAutomationStream'));
-  assert.deepEqual(grants(r, 'WorkerRole').find(g => g.Action.includes('bedrock:InvokeModel')).Resource, config.bedrockResourceArns);
+  const inferenceGrants = grants(r, 'WorkerRole').filter(s => [s.Action].flat().some(a => a.startsWith('bedrock:')));
+  assert.deepEqual(inferenceGrants, [
+    { Effect: 'Allow', Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], Resource: config.bedrockResourceArns },
+    { Effect: 'Allow', Action: 'bedrock:InvokeModel', Resource: 'arn:aws:bedrock:us-east-1:111111111111:project/default',
+      Condition: { ArnEquals: { 'bedrock:ModelArn': 'arn:aws:bedrock:us-east-1:111111111111:inference-profile/us.openai.gpt-6-sol' } } },
+  ]);
 });

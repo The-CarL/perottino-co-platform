@@ -49,11 +49,11 @@ function validate(c) {
     requireField(new RegExp('^arn:aws:acm:' + region + ':' + account + ':certificate/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$').test(certificateArn), 'same-region certificateArn');
     if (hostedZoneId !== undefined) requireField(/^Z[A-Z0-9]+$/.test(hostedZoneId), 'hostedZoneId');
   }
-  return 'arn:aws:ecr:' + region + ':' + account + ':repository/' + repos[0];
+  return { repo: 'arn:aws:ecr:' + region + ':' + account + ':repository/' + repos[0], profile };
 }
 
 export function synthHosted(config, provenance, outdir) {
-  const repo = validate(config);
+  const { repo, profile } = validate(config);
   const tags = resourceTags(provenance, taggedIds);
   const scope = tags.Hosted['factory:s'];
   const prefix = 'factory-' + scope + '-r-';
@@ -112,6 +112,8 @@ export function synthHosted(config, provenance, outdir) {
   const workerRole = role('WorkerRole', ecs, [...employeeState, scopedItems(['dynamodb:ConditionCheckItem'], ['COMPANY#GATE']),
     allow('lambda:InvokeFunction', functionArn('m')),
     allow(['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], config.bedrockResourceArns),
+    { ...allow('bedrock:InvokeModel', 'arn:aws:bedrock:' + region + ':' + account + ':project/default'),
+      Condition: { ArnEquals: { 'bedrock:ModelArn': profile } } },
     allow(['bedrock-agentcore:StartBrowserSession', 'bedrock-agentcore:StopBrowserSession',
       'bedrock-agentcore:ConnectBrowserAutomationStream'], browser)], ecsArn + '*');
   const [cpu, memory] = workerSizes[config.workerSize ?? 'small'];
