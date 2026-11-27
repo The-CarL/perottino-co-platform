@@ -82,9 +82,13 @@ test('optional receiving and sending roles isolate SES, event origins and founda
   assert.deepEqual(r.InvokePermission.Properties.SourceArn,{Ref:'Topic'});assert.deepEqual(r.EventPermission.Properties.SourceArn,{Ref:'EventsTopic'});
   assert.equal([r.ClockPermission.Properties.SourceArn['Fn::GetAtt']].flat().join('.'),'OutboxClock.Arn');
   const inbound=JSON.stringify(r.MailRole.Properties.Policies);
-  assert.match(inbound,/V2#mail-/);assert.doesNotMatch(inbound,/ses:Send|ecs:RunTask|FACTORY#CONTROL|mail-outbox/);
+  assert.match(inbound,/V2#mail-/);assert.doesNotMatch(inbound,/ses:Send|ses:GetEmailIdentity|ecs:RunTask|FACTORY#CONTROL|mail-outbox/);
   const sender=JSON.stringify(r.SenderRole.Properties.Policies);
   assert.match(sender,/ses:SendEmail/);assert.match(sender,/ses:FromAddress/);assert.doesNotMatch(sender,/SendRawEmail|FACTORY#CONTROL/);
+  const identityGrants=r.SenderRole.Properties.Policies[0].PolicyDocument.Statement
+    .filter(s=>[s.Action].flat().includes('ses:GetEmailIdentity'));
+  assert.deepEqual(identityGrants,[{Effect:'Allow',Action:'ses:GetEmailIdentity',
+    Resource:{'Fn::Sub':'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}'}}]);
   for(const role of [r.MailRole,r.SenderRole]) {
     const statements=role.Properties.Policies[0].PolicyDocument.Statement;
     const writes=statements.find(s=>s.Action.includes('dynamodb:UpdateItem'));

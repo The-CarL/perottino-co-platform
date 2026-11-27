@@ -2,9 +2,22 @@ import { makeDynamoRecords } from './foundation-records.mjs';
 import { createCloudStore } from './cloud-store.mjs';
 import { dispatchCompanyMail, recordMailReceipt } from './company-mail-outbox.mjs';
 
-export function createSesMailTransport({client,SendEmailCommand,configurationSet,readOwnerIdentity,domain}) {
+export function createSesMailTransport({client,GetEmailIdentityCommand,SendEmailCommand,configurationSet,readOwnerIdentity,domain,now=Date.now}) {
   if(!configurationSet) throw new Error('Mail configuration set required.');
-  return {async send(m) {
+  let verified=false,checkAfter=0;
+  async function isReady() {
+    if(now()<checkAfter) return verified;
+    try {
+      const identity=await client.send(new GetEmailIdentityCommand({EmailIdentity:domain}),
+        {abortSignal:AbortSignal.timeout(5000)});
+      verified=identity.VerifiedForSendingStatus===true;
+    } catch {
+      verified=false;
+    }
+    checkAfter=now()+30_000;
+    return verified;
+  }
+  return {isReady,async send(m) {
     const headers=[];
     if(m.inReplyTo) headers.push({Name:'In-Reply-To',Value:m.inReplyTo});
     const references=[...m.references];
@@ -49,7 +62,7 @@ export function createMailSender({records,store,transport,domain,topicArn,config
 let run;
 export async function handler(event) {
   if(!run) {
-    const {SESv2Client,SendEmailCommand}=await import('@aws-sdk/client-sesv2');
+    const {SESv2Client,GetEmailIdentityCommand,SendEmailCommand}=await import('@aws-sdk/client-sesv2');
     const tableName=process.env.PEROTTINO_STATE_TABLE,domain=process.env.PEROTTINO_MAIL_DOMAIN,configurationSet=process.env.PEROTTINO_MAIL_CONFIGURATION_SET;
     const records=makeDynamoRecords({tableName}),store=createCloudStore({tableName,resident:true});
     const secret=process.env.PEROTTINO_MAIL_OWNER_SECRET_ARN;
@@ -59,7 +72,7 @@ export async function handler(event) {
       const client=new SecretsManagerClient({});
       readOwnerIdentity=async()=>JSON.parse((await client.send(new GetSecretValueCommand({SecretId:secret,VersionStage:'AWSCURRENT'}))).SecretString);
     }
-    const transport=createSesMailTransport({domain,readOwnerIdentity,client:new SESv2Client({maxAttempts:1}),SendEmailCommand,configurationSet});
+    const transport=createSesMailTransport({domain,readOwnerIdentity,client:new SESv2Client({maxAttempts:1}),GetEmailIdentityCommand,SendEmailCommand,configurationSet});
     const scoped=new Map();
     function claimRecordsFor(person) {
       // Guard at the transition immediately preceding the external call.

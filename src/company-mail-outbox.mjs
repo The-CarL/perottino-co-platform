@@ -69,6 +69,7 @@ export async function dispatchCompanyMail({records,store,domain,transport,now=Da
     const at=now()+60000;
     await records.transact([drop(q),writeMail('mail-outbox',key(at,m.id),{...mailValue(q),at})]);return true;
   }
+  if(transport.isReady && !await transport.isReady()) return false;
   // A reassigned office alias must never send on behalf of its previous holder.
   const directory=await store.listEmployees();
   const from=mailRoute(m.from,domain,directory)?.id===person.id ? m.from : person.handle+'@'+domain;

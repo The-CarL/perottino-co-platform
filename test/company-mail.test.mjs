@@ -124,6 +124,55 @@ test('SES adapter binds sender/recipient/tags, sets RFC reply headers, and adds 
   assert.ok(sent[0].Content.Simple.Headers.some(h=>h.Name==='References'&&h.Value==='<first@example.net> <in@example.net>'));
 });
 
+test('the scheduled SES drain retains due mail until its domain is verified and sends each intent once',async t=>{
+  const {mail,records,store,now,advance}=fixture(t);
+  const {GetEmailIdentityCommand,SendEmailCommand}=await import('@aws-sdk/client-sesv2');
+  let lookups=0;
+  const sent=[];
+  const client={async send(command){
+    if(command instanceof GetEmailIdentityCommand) {
+      assert.deepEqual(command.input,{EmailIdentity:domain});
+      lookups++;
+      if(lookups===2) throw new Error('identity lookup unavailable');
+      return {VerifiedForSendingStatus:lookups>2};
+    }
+    assert.ok(command instanceof SendEmailCommand);
+    sent.push(command.input.EmailTags[0].Value);
+    return {MessageId:'provider-'+sent.length};
+  }};
+  const transport=createSesMailTransport({client,GetEmailIdentityCommand,SendEmailCommand,domain,configurationSet:'configured',now});
+  const handler=createMailSender({records,store,transport,domain});
+  const drain=()=>handler({operation:'dispatch'});
+  await drain();
+  assert.equal(lookups,0);
+  const ids=[];
+  for(const requestId of ['first','second']) {
+    const result=await mail.execute('ceo','mail.send',{requestId,to:'customer@example.net',subject:'Hello',text:'Hi'});
+    ids.push(result.messageId);
+  }
+  const queued=await records.list('mail-outbox');
+  for(const expectedLookups of [1,2]) {
+    await drain();
+    await drain();
+    assert.equal(lookups,expectedLookups);
+    assert.deepEqual(sent,[]);
+    assert.deepEqual(await records.list('mail-outbox'),queued);
+    assert.deepEqual((await records.list('mail-attempts')).items,[]);
+    for(const id of ids) assert.equal((await records.get('mail-messages',id)).status,'queued');
+    advance(60_000);
+  }
+  await drain();
+  advance(60_000);
+  await drain();
+  assert.equal(lookups,3);
+  assert.deepEqual(sent.sort(),ids.sort());
+  for(const id of ids) {
+    const message=await records.get('mail-messages',id);
+    assert.equal(message.status,'sent');
+    assert.equal(message.attempts,1);
+  }
+});
+
 test('owner MIME brief and follow-up run through the same persistent SQLite records and local transport after a restart',async t=>{
   const [{mkdtemp,rm},{tmpdir},{join},{createEmailIngress}]=await Promise.all([
     import('node:fs/promises'),import('node:os'),import('node:path'),import('../src/email-ingress.mjs')]);

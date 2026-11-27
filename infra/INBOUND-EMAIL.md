@@ -50,6 +50,8 @@ Mail sent to public aliases is ordinary correspondence. The worker can answer th
 
 ## Delivery and recovery
 
+When external mail is due, the hosted sender checks whether SES has verified the configured company domain for sending. A pending domain or a failed lookup leaves the message queued with its send attempt count unchanged. The sender caches the result for 30 seconds. The one-minute drain resumes delivery automatically after verification. Idle drains make no SES requests.
+
 Each send commits the message, thread, employee indexes and durable intent before SES runs. SES is called with one SDK attempt and a tagged message ID. A successful response marks the message sent, and SES event publication records delivery, bounce, complaint or rejection. Internal company mail is committed directly. Local mode uses the same authorization, threading, claiming and receipt transitions and captures external envelopes in SQLite without opening a network connection. [SES event publishing](https://docs.aws.amazon.com/ses/latest/dg/monitor-sending-activity-using-notifications-event-publishing.html)
 
 Company activity records each received message, queued outbound message, dispatch attempt and status transition in the same transaction as the mail change. A dispatch event marks the start of an attempt. A sent or delivered status records the corresponding provider confirmation. Each activity entry carries internal thread, message, actor and employee identifiers. Owner reads of company folders and employee threads also produce audit entries. Correspondents, subjects, bodies and routing secrets stay in the restricted mail records.

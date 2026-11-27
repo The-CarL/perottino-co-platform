@@ -190,6 +190,7 @@ test('the owner, employees and trusted control code have disjoint entry points a
   }
   const gate = id => grants(r, id).find(s => s.Condition?.['ForAllValues:StringLike']?.['dynamodb:LeadingKeys']?.includes('COMPANY#GATE'));
   assert.equal(gate('WorkerRole'), undefined);
+  assert.ok(!actions(r,'WorkerRole').some(action=>action.startsWith('ses:')));
   assert.equal(gate('WebRole'), undefined);
   assert.ok(gate('FactoryRole').Action.includes('dynamodb:PutItem'));
   const factory = grants(r, 'FactoryRole');
