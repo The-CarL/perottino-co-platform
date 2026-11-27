@@ -15,7 +15,7 @@ export function createFactoryState({ tableName = process.env.PEROTTINO_STATE_TAB
     running: company.enabled && !company.suspended, epoch: company.epoch, version: company.version } } });
   return {
     company: () => get('COMPANY'),
-    async configure({ stackId, requestId, enabled, deployment, employeeLimit, create }) {
+    async configure({ stackId, requestId, enabled, deployment, employeeLimit, residentLimit, create }) {
       for (let i = 0; i < 4; i++) {
         if (await get('CF#' + requestId)) return get('COMPANY');
         const old = await get('COMPANY');
@@ -29,6 +29,10 @@ export function createFactoryState({ tableName = process.env.PEROTTINO_STATE_TAB
           epoch: (old?.epoch ?? 1) + Number(Boolean(old && old.enabled !== enabled)) };
         if (deployment ?? old?.deployment) company.deployment = deployment ?? old.deployment;
         if (employeeLimit ?? old?.employeeLimit) company.employeeLimit = employeeLimit ?? old.employeeLimit;
+        const previousLimit = old?.residentLimit ?? old?.employeeLimit;
+        const nextLimit = residentLimit ?? employeeLimit ?? previousLimit;
+        if (nextLimit !== undefined) company.residentLimit = nextLimit;
+        const reducingSeats = enabled && nextLimit < previousLimit;
         if (old?.cursor) company.cursor = old.cursor;
         try {
           await db.send(new TransactWriteCommand({ TransactItems: [
@@ -37,10 +41,15 @@ export function createFactoryState({ tableName = process.env.PEROTTINO_STATE_TAB
             { Put: { TableName: tableName, Item: { ...key('CF#' + requestId), stackId },
               ConditionExpression: 'attribute_not_exists(pk)' } },
             gate(company),
+            ...(reducingSeats ? [{ ConditionCheck:{ TableName:tableName,Key:key('SEATS'),
+              ConditionExpression:'attribute_not_exists(#n) OR #n<=:cap',ExpressionAttributeNames:{'#n':'occupied'},
+              ExpressionAttributeValues:{':cap':nextLimit} } }] : []),
           ] }));
           return company;
         } catch (error) {
           if (error.name !== 'TransactionCanceledException') throw error;
+          if (reducingSeats && error.CancellationReasons?.[3]?.Code === 'ConditionalCheckFailed')
+            throw new Error('Release occupied Fargate slots before lowering the resident limit.');
         }
       }
       throw new Error('Concurrent company configuration change');
@@ -83,6 +92,17 @@ export function createFactoryState({ tableName = process.env.PEROTTINO_STATE_TAB
         ...(cursor && { ExclusiveStartKey:key(cursor) }) }));
       return { ids: (rows.Items ?? []).map(row => row.sk.slice(4)), cursor: rows.LastEvaluatedKey?.sk };
     },
+    async waiters(limit) {
+      const response = await db.send(new QueryCommand({TableName:tableName, ConsistentRead:true, Limit:limit,
+        KeyConditionExpression:'pk=:pk AND begins_with(sk,:prefix)', ExpressionAttributeValues:{':pk':'FACTORY#CONTROL',':prefix':'WAIT#'}}));
+      return (response.Items ?? []).map(row => ({id:row.sk.slice(5), generation:row.generation}));
+    },
+    async removeWaiter(id, generation) {
+      try {
+        await db.send(new DeleteCommand({TableName:tableName, Key:key('WAIT#'+id), ConditionExpression:'#g=:g',
+          ExpressionAttributeNames:{'#g':'generation'}, ExpressionAttributeValues:{':g':generation}}));
+      } catch (error) { if (!contended(error)) throw error; }
+    },
     async lock(id, time) {
       const lease = randomUUID();
       try {
@@ -109,7 +129,7 @@ export function createFactoryState({ tableName = process.env.PEROTTINO_STATE_TAB
         UpdateExpression: 'SET #r=:r', ExpressionAttributeNames: { '#r': 'run' },
         ExpressionAttributeValues: { ':owner': lease, ':r': run } }));
     },
-    async reserve(id, lease, run, company, seat) {
+    async reserve(id, lease, run, company, seat, enqueue = true) {
       const seatCondition = seat ? 'seat=:yes' : 'attribute_not_exists(seat)';
       try {
         await db.send(new TransactWriteCommand({ TransactItems: [
@@ -120,10 +140,21 @@ export function createFactoryState({ tableName = process.env.PEROTTINO_STATE_TAB
             ExpressionAttributeNames:{ '#r':'run' }, ExpressionAttributeValues:{ ':owner':lease, ':r':run, ':yes':true } } },
           ...(seat ? [] : [{ Update:{ TableName:tableName, Key:key('SEATS'), ConditionExpression:'attribute_not_exists(#n) OR #n<:limit',
             UpdateExpression:'ADD #n :one', ExpressionAttributeNames:{ '#n':'occupied' },
-            ExpressionAttributeValues:{ ':limit':company.employeeLimit, ':one':1 } } }]),
+            ExpressionAttributeValues:{ ':limit':company.residentLimit ?? company.employeeLimit, ':one':1 } } }]),
+          { Delete:{TableName:tableName,Key:key('WAIT#'+id)} },
         ] }));
         return true;
       } catch (error) {
+        if (enqueue && !seat && error.name === 'TransactionCanceledException' && error.CancellationReasons?.[2]?.Code === 'ConditionalCheckFailed') {
+          try {
+            await db.send(new UpdateCommand({TableName:tableName,Key:key('WAIT#'+id),
+              UpdateExpression:'SET #g=:g',ConditionExpression:'attribute_not_exists(#g) OR #g<:g',
+              ExpressionAttributeNames:{'#g':'generation'},ExpressionAttributeValues:{':g':run.generation}}));
+          } catch (waitError) { if (contended(waitError)) return false; throw waitError; }
+          // Close the interval between the first failed reservation and becoming
+          // visible to the refill handler. Only a newly queued generation retries.
+          return this.reserve(id,lease,run,company,seat,false);
+        }
         if (error.name === 'TransactionCanceledException' && error.CancellationReasons?.some(r => r.Code === 'ConditionalCheckFailed')) return false;
         throw error;
       }

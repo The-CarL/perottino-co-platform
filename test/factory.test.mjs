@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { CreateTableCommand, DeleteTableCommand, DynamoDBClient, waitUntilTableExists } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { createCloudStore } from '../src/cloud-store.mjs';
 import { makeDynamoRecords } from '../src/foundation-records.mjs';
 import { createFactoryState } from '../src/factory-state.mjs';
@@ -14,7 +14,7 @@ const config = { clusterArn:'fixture-cluster', taskDefinitionArn:'fixture-family
   securityGroupId:'fixture-group', employeeLimit:2 };
 const scheduled = { source:'aws.events', 'detail-type':'Scheduled Event' };
 
-async function fixture(t, foundations = false) {
+async function fixture(t, foundations = false, overrides = {}) {
   const url = new URL(endpoint);
   assert.ok(url.protocol === 'http:' && ['127.0.0.1','localhost','[::1]'].includes(url.hostname) && !url.username && !url.password);
   const tableName = 'factory-test-' + randomUUID();
@@ -55,7 +55,7 @@ async function fixture(t, foundations = false) {
     }
   } };
   const recordsFor = (binding,version) => makeDynamoRecords({client,tableName,conditions:binding ? store.foundationGuards(binding,version) : []});
-  const factory = createEmployeeFactory({ state, store, ecs, config, now, ...(foundations && {recordsFor}), respond:async(_,result)=>responses.push(result),
+  const factory = createEmployeeFactory({ state, store, ecs, config:{...config,...overrides}, now, ...(foundations && {recordsFor}), respond:async(_,result)=>responses.push(result),
     sleep:async ms=>{ clock.time+=ms; flags.afterSleep?.(); } });
   const custom = async (RequestType, RequestId = randomUUID()) => {
     await factory.handler({ RequestType,RequestId,StackId:stackId,LogicalResourceId:'Residents',
@@ -66,7 +66,7 @@ async function fixture(t, foundations = false) {
     task.lastStatus='STOPPED'; task.desiredStatus='STOPPED';
     return factory.handler({ source:'aws.ecs',detail:{ clusterArn:config.clusterArn,group:task.group,taskArn:task.taskArn,lastStatus:'STOPPED' } });
   };
-  return { clock, flags, state, store, tasks, launches, factory, custom, stopped };
+  return { clock, flags, state, store, tasks, launches, factory, custom, stopped, client, tableName };
 }
 
 test('ambiguous ECS placement reuses identical input; repeated definite failures stop consuming launches',
@@ -100,6 +100,9 @@ test('a fired employee retains its compute seat until its exact ECS task stops',
   {skip:!endpoint},async t=>{
     const f=await fixture(t);
     assert.equal((await f.custom('Create')).Status,'SUCCESS');
+    assert.equal((await f.state.company()).residentLimit,config.employeeLimit);
+    // Upgrades can read company records created before residentLimit existed.
+    await f.client.send(new UpdateCommand({TableName:f.tableName,Key:{pk:'FACTORY#CONTROL',sk:'COMPANY'},UpdateExpression:'REMOVE residentLimit'}));
     const ceo=await f.store.employee('ceo');
     const capability=f.tasks.get(ceo.taskArn).overrides.containerOverrides[0].environment
       .find(variable=>variable.name==='PEROTTINO_EMPLOYEE_CAPABILITY').value;
@@ -183,3 +186,63 @@ test('bound IC can consume and submit work through the broker and has no adminis
   assert.equal((await owner('employee.pause',{agentId:employee.id,requestId:'pause-employee'})).ok,true);
   assert.equal((await invoke('directory.self')).code,'MANAGER_DENIED');
 });
+
+test('a 100-person roster defers excess Fargate residents and preserves their work until a confirmed stop',
+  {skip:!endpoint}, async t=>{
+    const f=await fixture(t,true,{employeeLimit:100,residentLimit:3});
+    assert.equal((await f.custom('Create')).Status,'SUCCESS');
+    const owner=async (op,input={})=>{
+      const response=await f.factory.owner({operation:'company',requestId:randomUUID(),command:{op,input}});
+      assert.equal(response.ok,true,op+' '+JSON.stringify(response));
+      return response.result;
+    };
+    const hire=async key=>(await owner('employee.hire',{role:'Engineer',requestId:key})).employee;
+    await hire('initial-engineer');
+    const competitors=await Promise.all([hire('competing-a'),hire('competing-b')]);
+    const roster=(await owner('directory')).agents;
+    assert.equal(roster.length,4);
+    assert.equal(f.launches.length,3);
+    const waiter=roster.find(person=>person.runtimeStatus==='Waiting for a Fargate task');
+    assert.ok(competitors.some(person=>person.id===waiter.id));
+    assert.equal((await f.store.employee(waiter.id)).taskArn,null);
+    assert.equal(await f.state.run(waiter.id),undefined);
+    assert.deepEqual(await f.state.waiters(12),[{id:waiter.id,generation:1}]);
+    assert.equal((await f.state.company()).residentLimit,3);
+
+    await assert.rejects(f.state.configure({stackId,requestId:randomUUID(),enabled:true,employeeLimit:100,residentLimit:2}),
+      /Release occupied Fargate slots/);
+    assert.equal((await f.state.company()).residentLimit,3);
+    const {conversation}=await owner('conversations.dm',{peerId:waiter.id});
+    const {message}=await owner('messages.post',{conversationId:conversation.id,text:'Check this when a seat opens.',requestId:'held-dm'});
+    for(let i=0;i<2;i++)await f.factory.handler(scheduled);
+    assert.equal(f.launches.length,3);
+    const denied=await f.factory.manager({operation:'company',callerId:waiter.id,generation:1,taskArn:'unbound',
+      capability:'unbound',requestId:randomUUID(),command:{op:'budget.model.begin',input:{}}});
+    assert.equal(denied.code,'MANAGER_DENIED');
+    assert.equal((await owner('governance.get',{employeeId:waiter.id})).budget.spentCents,0);
+
+    const incumbent=roster.find(person=>person.id!=='ceo'&&person.id!==waiter.id);
+    const oldTask=f.tasks.get((await f.store.employee(incumbent.id)).taskArn);
+    await owner('employee.pause',{agentId:incumbent.id,requestId:'free-one-slot'});
+    await f.factory.handler(scheduled);
+    assert.equal(f.launches.length,3,'A stop request alone cannot release a seat.');
+    await f.stopped(oldTask);
+    assert.equal(f.launches.length,4,'The released seat admits a waiter directly from the STOPPED event.');
+    const run=await f.state.run(waiter.id), newEmployee=await f.store.employee(waiter.id);
+    assert.ok(run.arn);
+    assert.equal(newEmployee.taskArn,run.arn);
+    await f.factory.handler(scheduled);
+    assert.equal(f.launches.length,4);
+    assert.deepEqual(await f.state.waiters(12),[]);
+    assert.equal(f.launches.filter(p=>p.group==='employee-'+waiter.id).length,1);
+    const work=await f.factory.manager({operation:'company',callerId:waiter.id,generation:newEmployee.generation,
+      taskArn:run.arn,capability:run.capability,requestId:randomUUID(),command:{op:'worker.poll',input:{workerId:run.arn}}});
+    assert.equal(work.result.inbox.message.id,message.id);
+    const next=await hire('fifth-person');
+    assert.equal((await f.store.employee(next.id)).taskArn,null);
+    assert.equal((await owner('directory')).agents.length,5);
+    assert.equal((await f.store.employee(incumbent.id)).desiredState,'paused');
+    await owner('employee.pause',{agentId:next.id,requestId:'pause-waiter'});
+    assert.deepEqual(await f.state.waiters(12),[]);
+    assert.equal(f.launches.length,4);
+  });

@@ -19,6 +19,8 @@ function validate(c) {
   requireField(c.browserMinutesPerMonth===undefined || (Number.isSafeInteger(c.browserMinutesPerMonth) &&
     c.browserMinutesPerMonth>=0 && c.browserMinutesPerMonth<=1_000_000),'browserMinutesPerMonth (0 to 1000000)');
   requireField(isValidEmployeeLimit(employeeLimit), `employeeLimit (1 to ${maxCompanyEmployees})`);
+  requireField(c.residentLimit === undefined || (isValidEmployeeLimit(c.residentLimit) && c.residentLimit <= employeeLimit),
+    'residentLimit (1 to employeeLimit)');
   requireField(Object.hasOwn(workerSizes, c.workerSize ?? 'small'), 'workerSize (small, medium, large)');
   requireField(typeof account === 'string' && /^\d{12}$/.test(account), 'account');
   requireField(/^(us|eu|ap|sa|ca|me|af|il|mx)-[a-z]+-\d+$/.test(region), 'commercial AWS region');
@@ -192,7 +194,8 @@ export function synthHosted(config, provenance, outdir) {
     { ...allow('ecs:TagResource', taskArnPattern), Condition: { StringEquals: { 'ecs:CreateAction': 'RunTask' } } },
     { ...allow('iam:PassRole', [arn(workerRole), arn(executionRole)]), Condition: { StringEquals: { 'iam:PassedToService': ecs } } },
   ]);
-  const limit = String(config.employeeLimit ?? maxCompanyEmployees);
+  const employeeLimit = String(config.employeeLimit ?? maxCompanyEmployees);
+  const residentLimit = String(config.residentLimit ?? employeeLimit);
   const groupId = sg.getAtt('GroupId').toString();
   const factoryConfig = { PEROTTINO_RESIDENT: '1', PEROTTINO_COMPANY_GATE: '1', PEROTTINO_STATE_TABLE: state.ref,
     ...(sandbox&&{PEROTTINO_SANDBOX_API_ORIGIN:'https://'+sandbox.apiId+'.execute-api.'+sandbox.region+'.amazonaws.com',PEROTTINO_SANDBOX_API_REGION:sandbox.region}),
@@ -207,7 +210,7 @@ export function synthHosted(config, provenance, outdir) {
     ...(config.browserMinutesPerMonth!==undefined && {PEROTTINO_BROWSER_MONTHLY_MINUTES:String(config.browserMinutesPerMonth)}),
     PEROTTINO_CLUSTER_ARN: arn(cluster), PEROTTINO_TASK_DEFINITION_ARN: workerTask.ref,
     PEROTTINO_PUBLIC_SUBNET_IDS: config.publicSubnetIds.join(','), PEROTTINO_SECURITY_GROUP_ID: groupId,
-    PEROTTINO_EMPLOYEE_LIMIT: limit };
+    PEROTTINO_EMPLOYEE_LIMIT: employeeLimit, PEROTTINO_RESIDENT_LIMIT: residentLimit };
   const factory = fn('FactoryFn', 'f', 'src/factory.handler', factoryRole, factoryConfig, 240);
   const owner = fn('OwnerFn', 'o', 'src/factory.owner', factoryRole, factoryConfig, 60);
   const manager = fn('ManagerFn', 'm', 'src/factory.manager', factoryRole, factoryConfig, 60);
@@ -231,7 +234,8 @@ export function synthHosted(config, provenance, outdir) {
   // During deletion, the callback quiesces the full company while IAM, both rules
   // and the task definition still exist. Late events must check the durable stop.
   const bootstrap = resource('ResidentCompany', 'Custom::ResidentCompany', {
-    ServiceToken: arn(factory), ServiceTimeout: 300, EmployeeLimit: limit, TaskDefinitionArn: workerTask.ref,
+    ServiceToken: arn(factory), ServiceTimeout: 300, EmployeeLimit: employeeLimit, ResidentLimit: residentLimit,
+    TaskDefinitionArn: workerTask.ref,
     SecurityGroupId: groupId, PublicSubnetIds: config.publicSubnetIds, WorkerImage: config.workerImage, ReleaseImage: config.lambdaImage,
   });
   for (const dependency of [invokePermission('StoppedInvoke', stopped), invokePermission('RepairInvoke', repair), manager, owner]) {

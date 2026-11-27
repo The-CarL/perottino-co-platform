@@ -30,8 +30,9 @@ function value({ pk, sk, version, ...rest }) { return rest; }
 function profile(row) {
   if (!row) throw problem(404, 'Employee not found.');
   const { id, name, handle, role, managerId, desiredState = 'active', canHire } = row;
+  const activeStatus = row.taskArn ? 'Task registered' : row.taskArn === null ? 'Waiting for a Fargate task' : 'Active';
   return { id, name, handle, role, managerId: managerId ?? null, canHire: Boolean(canHire), desiredState,
-    runtimeStatus: row.runtimeStatus ?? (desiredState === 'active' ? (row.taskArn ? 'Task registered' : 'Active') : desiredState) };
+    runtimeStatus: row.runtimeStatus ?? (desiredState === 'active' ? activeStatus : desiredState) };
 }
 
 export function createCompanyService({ records, store, control, heartbeat, adapters = {} }) {

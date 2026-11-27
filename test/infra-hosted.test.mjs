@@ -45,16 +45,29 @@ test('one explicitly bootstrapped CEO uses standalone employee tasks with durabl
   assert.equal(bootstrap.Properties.WorkerImage, sample().workerImage);
   assert.equal(bootstrap.Properties.ReleaseImage, sample().lambdaImage);
   assert.equal(bootstrap.Properties.EmployeeLimit, '100');
+  assert.equal(bootstrap.Properties.ResidentLimit, '100');
   const { employeeLimit, ...configWithDefault } = sample();
   assert.equal(employeeLimit, 100);
   const defaults = render(t, configWithDefault).template.Resources;
   assert.equal(defaults.ResidentCompany.Properties.EmployeeLimit, '100');
+  assert.equal(defaults.ResidentCompany.Properties.ResidentLimit, '100');
   assert.equal(defaults.FactoryFn.Properties.Environment.Variables.PEROTTINO_EMPLOYEE_LIMIT, '100');
   assert.ok(bootstrap.Properties.ServiceTimeout > props(r, 'FactoryFn').Timeout);
   assert.deepEqual(bootstrap.DependsOn.sort(), ['ManagerFn', 'OwnerFn', 'RepairInvoke', 'StoppedInvoke']);
   const change = render(t, { ...sample(), employeeLimit: 6 }).template.Resources;
   assert.equal(change.ResidentCompany.Properties.EmployeeLimit, '6');
-  assert.equal(change.FactoryFn.Properties.Environment.Variables.PEROTTINO_EMPLOYEE_LIMIT, '6');
+  assert.equal(change.ResidentCompany.Properties.ResidentLimit, '6');
+  const assessment = render(t, { ...sample(), residentLimit: 3 }).template.Resources;
+  assert.equal(assessment.ResidentCompany.Properties.EmployeeLimit, '100');
+  assert.equal(assessment.ResidentCompany.Properties.ResidentLimit, '3');
+  for (const handler of ['FactoryFn', 'ManagerFn', 'OwnerFn']) {
+    assert.equal(change[handler].Properties.Environment.Variables.PEROTTINO_EMPLOYEE_LIMIT, '6');
+    assert.equal(change[handler].Properties.Environment.Variables.PEROTTINO_RESIDENT_LIMIT, '6');
+    assert.equal(assessment[handler].Properties.Environment.Variables.PEROTTINO_EMPLOYEE_LIMIT, '100');
+    assert.equal(assessment[handler].Properties.Environment.Variables.PEROTTINO_RESIDENT_LIMIT, '3');
+  }
+  assert.deepEqual(assessment.WorkerTask, r.WorkerTask);
+  assert.deepEqual(change.WorkerTask, r.WorkerTask);
   assert.deepEqual(change.State, r.State);
 });
 
@@ -93,6 +106,10 @@ test('invalid AWS bindings, PAT reuse, mutable image tags and a namespace too lo
     c => { c.employeeLimit = 0; },
     c => { c.employeeLimit = 101; },
     c => { c.employeeLimit = '2'; },
+    c => { c.residentLimit = 0; },
+    c => { c.residentLimit = '3'; },
+    c => { c.residentLimit = 1.5; },
+    c => { c.employeeLimit = 2; c.residentLimit = 3; },
     c => { c.ownerSecretArn = c.ownerSecretArn.replace('example/owner', '/perottino-co/github/pat'); },
     c => { c.bedrockResourceArns.push('*'); },
     c => { c.customDomain = { hostname: 'test.example.com', certificateArn: '*' }; },

@@ -75,14 +75,14 @@ export function createEmployeeFactory({ store, state, ecs, config, recordsFor, a
     }
   }
 
-  async function reconcile(id, { stoppedArn, replace = true, allowLaunch = true, onLaunch } = {}) {
+  async function reconcile(id, { stoppedArn, replace = true, allowLaunch = true, refill = true, onLaunch } = {}) {
     const lock = await state.lock(id, now());
     if (!lock) return 'busy';
-    let empty = !lock.run, seat = lock.seat;
+    let empty = !lock.run, seat = lock.seat, released = false;
     async function save(value) {
       const releaseSeat = seat && (!value || !value.arn && !value.capability);
       await state.save(id, lock.lease, value, releaseSeat);
-      if (releaseSeat) seat = false;
+      if (releaseSeat) { seat = false; released = true; }
       empty = !value;
     }
     try {
@@ -188,7 +188,21 @@ export function createEmployeeFactory({ store, state, ecs, config, recordsFor, a
         return 'stopping';
       }
       return 'starting';
-    } finally { await state.unlock(id, lock.lease, empty); }
+    } finally {
+      await state.unlock(id, lock.lease, empty);
+      if (released && !seat && refill && allowLaunch && allowed(await state.company())) {
+        await fillVacancy();
+      }
+    }
+  }
+
+  async function fillVacancy() {
+    for (const waiter of await state.waiters(maxPage)) {
+      let attempted = false;
+      const status = await reconcile(waiter.id, {refill:false, onLaunch:() => { attempted = true; }});
+      if (attempted || status === 'deferred') return;
+      if (['absent','inactive','running','starting','blocked'].includes(status)) await state.removeWaiter(waiter.id,waiter.generation);
+    }
   }
 
   async function repair() {
@@ -274,7 +288,7 @@ export function createEmployeeFactory({ store, state, ecs, config, recordsFor, a
       if (enabled && event.ResourceProperties?.TaskDefinitionArn !== config.taskDefinitionArn) throw new Error('Task definition mismatch');
       const company = await state.configure({ stackId: event.StackId, requestId: event.RequestId, enabled,
         create: event.RequestType === 'Create', deployment: enabled ? deployment(config) : undefined,
-        employeeLimit: enabled ? config.employeeLimit : undefined });
+        employeeLimit: enabled ? config.employeeLimit : undefined, residentLimit: enabled ? config.residentLimit : undefined });
       if (!enabled && company && !company.enabled) {
         const available = context?.getRemainingTimeInMillis?.() ?? 200_000;
         await drain({ confirm: true, deadline: Date.now() + Math.min(180_000, available - 25_000) });
@@ -314,8 +328,18 @@ export function createEmployeeFactory({ store, state, ecs, config, recordsFor, a
       if (!desiredState || !idFormat.test(input.agentId ?? '')) reject(400,'INVALID_EMPLOYEE');
       employee = await store.setEmployeeState({ ...common, requestId:input.requestId, agentId:input.agentId, desiredState });
     }
-    await reconcile(employee.id);
-    return { employee: publicEmployee(employee) };
+    const placement = await reconcile(employee.id);
+    if (op === 'pause' || op === 'fire') {
+      // The transition increments generation; a later resume can enqueue a new one.
+      const previous = employee.generation - 1;
+      if (previous > 0) await state.removeWaiter(employee.id,previous);
+    }
+    const result = publicEmployee(employee);
+    if (employee.desiredState === 'active') {
+      if (placement === 'deferred') result.runtimeStatus = 'Waiting for a Fargate slot';
+      else if (placement === 'starting' || placement === 'running') result.runtimeStatus = 'Task registered';
+    }
+    return { employee:result };
   }
   async function companyOperation(actor,event,common,company) {
     const { op, input = {} } = event.command ?? {};
@@ -394,15 +418,17 @@ let instance;
 function factory() {
   if (!instance) {
     const { PEROTTINO_STATE_TABLE: tableName, PEROTTINO_CLUSTER_ARN: clusterArn, PEROTTINO_TASK_DEFINITION_ARN: taskDefinitionArn,
-      PEROTTINO_PUBLIC_SUBNET_IDS, PEROTTINO_SECURITY_GROUP_ID: securityGroupId, PEROTTINO_EMPLOYEE_LIMIT } = process.env;
+      PEROTTINO_PUBLIC_SUBNET_IDS, PEROTTINO_SECURITY_GROUP_ID: securityGroupId, PEROTTINO_EMPLOYEE_LIMIT, PEROTTINO_RESIDENT_LIMIT } = process.env;
     const employeeLimit = Number(PEROTTINO_EMPLOYEE_LIMIT ?? maxCompanyEmployees);
     if (!isValidEmployeeLimit(employeeLimit)) throw new Error('Invalid employee limit');
+    const residentLimit = Number(PEROTTINO_RESIDENT_LIMIT ?? employeeLimit);
+    if (!isValidEmployeeLimit(residentLimit) || residentLimit > employeeLimit) throw new Error('Invalid resident limit');
     const client = DynamoDBDocumentClient.from(new DynamoDBClient({maxAttempts:3}));
     const store = createCloudStore({tableName,client});
     instance = createEmployeeFactory({ store, adapters:hostedAdapters(), state:createFactoryState({tableName}),
       ...(process.env.PEROTTINO_FOUNDATIONS === '1' && {recordsFor:(binding,version) =>
         makeDynamoRecords({tableName,client,conditions:binding ? store.foundationGuards(binding,version) : []})}),
-      ecs: new ECSClient({ maxAttempts: 2 }), config: { clusterArn, taskDefinitionArn, securityGroupId, employeeLimit,
+      ecs: new ECSClient({ maxAttempts: 2 }), config: { clusterArn, taskDefinitionArn, securityGroupId, employeeLimit, residentLimit,
         subnets: PEROTTINO_PUBLIC_SUBNET_IDS?.split(',') } });
   }
   return instance;

@@ -76,7 +76,7 @@ The trusted Git worker reads the projects-only PAT from the retained Secrets Man
 
 ## AWS pilot retirement
 
-On November 27, 2026, the owner retired the AWS pilot after verifying private messaging and delegated work. All four CloudFormation stacks reported `DELETE_COMPLETE`. The API, ECS cluster, dedicated network, ECR repository and seven image digests, log group and monitoring resources were removed. The final check found zero running or pending employee tasks.
+On November 26, 2026 (Eastern time), the owner retired the previous AWS pilot after verifying private messaging and delegated work. All four CloudFormation stacks reported `DELETE_COMPLETE`. The API, ECS cluster, dedicated network, ECR repository and seven image digests, log group and monitoring resources were removed. The final check found zero running or pending employee tasks.
 
 At the owner’s direction, the DynamoDB company table was deleted without a data backup. The final inventory found no DynamoDB backups or AWS Backup recovery points. Both pilot secrets became inaccessible and entered their seven-day recovery window. Six ECS task-definition revisions remained registered because the scoped role lacked permission to deregister them. These definitions incur no Fargate compute charges. The source repositories and shared DNS hosted zone were preserved. [Retirement procedure](infra/PORTABILITY.md#remove-a-deployment)
 
