@@ -1,4 +1,4 @@
-import { mailRoute, mailRetry, mailValue, writeMail } from './company-mail.mjs';
+import { mailActivity, mailRoute, mailRetry, mailValue, writeMail } from './company-mail.mjs';
 
 const key=(at,id)=>String(at).padStart(13,'0')+'#'+id;
 const confirmed={sent:1,delivered:2,failed:3,bounced:4,complained:5};
@@ -26,6 +26,7 @@ export async function recordMailReceipt({records,id,provider,status,from,to,at=D
     const mapping=await records.get('mail-provider',provider);
     if(mapping && mapping.messageId!==id) return false;
     const changes=[rowFor(m,{status,providerId:provider,providerAt:new Date(at).toISOString()})];
+    if(m.status!==status) changes.push(...mailActivity('mail.status',m,'mail-sender',m.sender,status));
     if(!mapping) changes.push(writeMail('mail-provider',provider,{threadId:m.threadId,messageId:id}));
     if(m.attemptKey) {
       const attempt=await records.get('mail-attempts',m.attemptKey);
@@ -43,7 +44,7 @@ async function finishAttempt(records,id,kind,now) {
     if(!attempt) return false;
     const retry=kind==='throttled' && m.attempts<4;
     const status=retry?'queued':kind==='uncertain'?'uncertain':'failed';
-    const changes=[drop(attempt),rowFor(m,{status})];
+    const changes=[drop(attempt),rowFor(m,{status}),...mailActivity('mail.status',m,'mail-sender',m.sender,status)];
     if(retry) {
       const due=now()+60_000*(2**(m.attempts-1));
       changes.push(writeMail('mail-outbox',key(due,id),{id,attempts:m.attempts,at:due}));
@@ -60,7 +61,10 @@ export async function dispatchCompanyMail({records,store,domain,transport,now=Da
   const m=await records.get('mail-messages',q.id);
   if(!m||m.status!=='queued') {await records.transact([drop(q)]);return true;}
   const person=await store.employee(m.sender);
-  if(!person||person.desiredState==='fired') {await records.transact([drop(q),rowFor(m,{status:'failed'})]);return true;}
+  if(!person||person.desiredState==='fired') {
+    await records.transact([drop(q),rowFor(m,{status:'failed'}),...mailActivity('mail.status',m,'mail-sender',m.sender,'failed')]);
+    return true;
+  }
   if(person.desiredState!=='active') {
     const at=now()+60000;
     await records.transact([drop(q),writeMail('mail-outbox',key(at,m.id),{...mailValue(q),at})]);return true;
@@ -73,7 +77,8 @@ export async function dispatchCompanyMail({records,store,domain,transport,now=Da
   const guarded=claimRecordsFor?claimRecordsFor(person):records;
   let acquired;
   try { acquired=await guarded.transact([drop(q),writeMail(m.pk,m.sk,claimed,m.version),
-    writeMail('mail-attempts',attemptKey,{id:m.id,deadline})]); }
+    writeMail('mail-attempts',attemptKey,{id:m.id,deadline}),
+    ...mailActivity('mail.dispatched',claimed,'mail-sender',m.sender,'sending')]); }
   catch(error){if(error.code==='FOUNDATION_GUARD_DENIED') return false;throw error;}
   if(!acquired) return true;
   let result;

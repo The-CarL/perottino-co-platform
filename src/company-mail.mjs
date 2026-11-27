@@ -1,9 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { eventRows } from './company-events.mjs';
 
 export const mailHash = (...values) => createHash('sha256').update(JSON.stringify(values)).digest('hex');
 export const failMail = (status, message) => Object.assign(new Error(message), { status });
 export const mailValue = row => { const { pk, sk, version, ...data } = row; return data; };
 export const writeMail = (pk, sk, value, expect = null) => ({ pk, sk, value, expect });
+export function mailActivity(kind,message,actor,employeeId,status) {
+  return eventRows(kind,{actor,employeeId,threadId:message.threadId,messageId:message.id,status},
+    [message.id,message.attempts??0,status].join('/'));
+}
 const keyPattern = /^[a-f0-9]{64}$/;
 const domainPattern = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const padded = n => String(n).padStart(13,'0');
@@ -103,7 +108,8 @@ export function createCompanyMail({records,store,domain='company.invalid',extern
         inReplyTo:args.inReplyTo??null,references:args.references??[],rfcMessageId:args.rfcMessageId??null,
         trustedOwner:Boolean(args.trustedOwner),ownerReplyRoute:Boolean(args.ownerReplyRoute),canReply:args.canReply!==false};
       const changes=[writeMail('mail-messages',id,msg),writeMail('mail-threads',threadId,thread,current?.version??null),
-        writeMail('mail-thread#'+threadId,sk,{id})];
+        writeMail('mail-thread#'+threadId,sk,{id}),
+        ...mailActivity(direction==='outbound'?'mail.queued':'mail.received',msg,args.actor,recipient??sender,status)];
       for(const member of [...members,'owner']) {
         if(current) {
           const prior=await records.get(folder(member),current.index);
@@ -140,7 +146,7 @@ export function createCompanyMail({records,store,domain='company.invalid',extern
     const linked=await matchedThread(from,employee.id,refs);
     const id=mailHash('received',employee.id,input.providerId);
     const text=requireText(input.text,16000),subject=requireText(input.subject||'(no subject)',250,true);
-    return append({id,requestHash:mailHash(input.providerId,employee.id,from,subject,text),...linked,from,to,subject,text,members:[employee.id],
+    return append({id,actor:input.trustedOwner===true?'owner':'external',requestHash:mailHash(input.providerId,employee.id,from,subject,text),...linked,from,to,subject,text,members:[employee.id],
       recipient:employee.id,direction:'inbound',contact:from,rfcMessageId:rfcId(input.rfcMessageId),inReplyTo:refs.at(-1),references:refs,
       trustedOwner:input.trustedOwner===true,allowThreading:input.allowThreading!==false,canReply:input.canReply!==false,notify:input.notify!==false});
   }
@@ -172,7 +178,7 @@ export function createCompanyMail({records,store,domain='company.invalid',extern
     const peer=internal?mailRoute(target,domain,await people()):null;
     if(internal&&(!peer||peer.id===employeeId||thread && !thread.members.includes(peer.id))) throw failMail(404,'Company recipient is unavailable.');
     if(!internal && outbound==='disabled') throw failMail(503,'External mail is disabled.');
-    const result=await append({id,requestHash:mailHash(op,input.to??null,input.threadId??null,input.messageId??null,subject,text),
+    const result=await append({id,actor,requestHash:mailHash(op,input.to??null,input.threadId??null,input.messageId??null,subject,text),
       threadId:thread?.id,from,to:target,subject,text,members:peer?[employeeId,peer.id].sort():[employeeId],
       sender:employeeId,recipient:peer?.id,direction:peer?'internal':'outbound',contact:peer?null:target,references:refs,inReplyTo:refs.at(-1),
       notify:!completion,ownerReplyRoute:!peer && employeeId==='ceo' && (anchor?.trustedOwner || anchor?.ownerReplyRoute),rfcMessageId:peer?'<'+id+'@'+domain+'>':null},completion);
@@ -239,11 +245,20 @@ export function createCompanyMail({records,store,domain='company.invalid',extern
       if(await records.transact([writeMail('mail-routing',id,{routes})])) return routes;
     });
   }
+  async function ownerRead(kind,ids) {
+    if(!await records.transact(eventRows(kind,{actor:'owner',...ids},randomUUID())))
+      throw failMail(503,'Could not record administrative mail access.');
+  }
   return {receive,routesForReceipt,canUseSource,async execute(actor,op,input={}) {
     if(op==='mail.list') {
       const employeeId=actor==='owner'?(input.employeeId??'owner'):actor;
       if(actor!=='owner'&&input.employeeId!==undefined&&input.employeeId!==actor) throw failMail(403,'Private employee mailbox.');
-      const page=await records.list(folder(employeeId),options(input));
+      const opts=options(input);
+      if(actor==='owner') {
+        if(employeeId!=='owner' && !await store.employee(employeeId)) throw failMail(404,'Employee mailbox not found.');
+        await ownerRead('admin.mail.folders.read',employeeId==='owner'?{}:{employeeId});
+      }
+      const page=await records.list(folder(employeeId),opts);
       const threads=await Promise.all(page.items.map(i=>threadFor(actor,i.threadId)));
       return {domain,outbound,threads:threads.map(publicThread),...(page.next&&{next:page.next})};
     }
@@ -257,6 +272,7 @@ export function createCompanyMail({records,store,domain='company.invalid',extern
         if(anchor.seq>opts.limit) opts.after=padded(anchor.seq-opts.limit)+'#'+'f'.repeat(64);
         opts.limit=Math.min(opts.limit,anchor.seq);
       }
+      if(actor==='owner') await ownerRead('admin.mail.thread.read',{threadId:thread.id});
       const page=await records.list('mail-thread#'+thread.id,opts);
       const messages=await Promise.all(page.items.map(i=>records.get('mail-messages',i.id)));
       return {domain,outbound,thread:publicThread(thread),messages:messages.map(publicMessage),...(page.next&&!input.throughMessageId&&{next:page.next})};

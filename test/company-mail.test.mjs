@@ -44,7 +44,7 @@ test('same external thread survives ingress replay and provider-ID routing; byst
   await assert.rejects(mail.execute('ceo','mail.reply',{threadId:a.threadId,messageId:a.messageId,to:'else@example.net',text:'x',requestId:'forge'}),{status:400});
 });
 test('handles and role aliases work for internal mail, public sender cannot be forged and staff auto-replies stop at the originating inbox',async t=>{
-  const {mail}=fixture(t);
+  const {mail,records}=fixture(t);
   const msg={to:'engineer@'+domain,subject:'Work',text:'Please review.',requestId:'start'};
   const a=await mail.execute('ceo','mail.send',msg);
   assert.deepEqual(await mail.execute('ceo','mail.send',msg),a);
@@ -59,6 +59,9 @@ test('handles and role aliases work for internal mail, public sender cannot be f
   const next=await mail.execute('owner','mail.get',{threadId:a.threadId,after:page.next});
   assert.equal(next.messages[0].text,'Reviewed.');
   assert.equal((await mail.execute('eng','mail.list',{})).threads.length,1);
+  const logged=(await records.list('company-events')).items.filter(e=>e.kind==='mail.received');
+  assert.equal(logged.length,2);
+  assert.ok(logged.some(e=>e.threadId===a.threadId&&e.messageId===a.messageId&&e.actor==='ceo'&&e.employeeId==='eng'&&e.status==='delivered'));
 });
 test('uncertain send is not transmitted again; tagged provider events reconcile it without downgrading delivery',async t=>{
   const {mail,dispatch,records,advance,now}=fixture(t);
@@ -72,6 +75,8 @@ test('uncertain send is not transmitted again; tagged provider events reconcile 
     messageId:'provider-id',source:'mara@'+domain,destination:['customer@example.net'],tags:{'ses:configuration-set':['configured'],'company-mail-id':[m.messageId]}}})}}]});
   await handler(event('Delivery'));await handler(event('Send'));await handler(event('Delivery'));
   assert.equal((await records.get('mail-messages',m.messageId)).status,'delivered');
+  const events=(await records.list('company-events')).items.filter(e=>e.kind==='mail.status');
+  assert.deepEqual(events.map(e=>e.status).sort(),['delivered','uncertain']);
   assert.equal(await recordMailReceipt({records,id:m.messageId,provider:'forged',status:'bounced',from:'mara@'+domain,to:'wrong@example.org',at:now()}),false);
 });
 test('explicit throttling permits safe bounded retry; fired employees cannot dispatch queued mail',async t=>{
@@ -158,4 +163,58 @@ test('owner MIME brief and follow-up run through the same persistent SQLite reco
     const view=await instance.mail.execute('owner','mail.get',{threadId:next.threadId});
     assert.deepEqual(view.messages.map(m=>m.text),['Please prepare a preview.','The preview is ready.','Please update it.']);
   } finally {instance.records.close();}
+});
+
+test('mail activity links receipt, queue, each dispatch, and provider outcomes without exposing correspondence',async t=>{
+  const {mail,inbound,records,dispatch,advance}=fixture(t);
+  const first=await inbound();
+  await inbound();
+  const input={employeeId:'ceo',threadId:first.threadId,messageId:first.messageId,requestId:'owner-reply',text:'Private reply'};
+  const outgoing=await mail.execute('owner','mail.reply',input);
+  await mail.execute('owner','mail.reply',input);
+  await dispatch({async send(){throw Object.assign(Error(),{name:'ThrottlingException'});}});
+  advance(61000);
+  await dispatch({async send(){return {providerId:'sensitive-provider-id'};}});
+  const proof={records,id:outgoing.messageId,provider:'sensitive-provider-id',status:'delivered',from:'ceo@'+domain,to:'customer@example.net'};
+  await recordMailReceipt(proof);
+  await recordMailReceipt(proof);
+  await mail.execute('ceo','mail.get',{threadId:first.threadId});
+  await mail.execute('owner','mail.list',{employeeId:'ceo'});
+  await mail.execute('owner','mail.get',{threadId:first.threadId});
+  const {items}=await records.list('company-events');
+  const transitions=items.filter(e=>e.kind.startsWith('mail.'));
+  assert.deepEqual(transitions.map(e=>[e.kind,e.status].join('/')).sort(),[
+    'mail.received/received','mail.queued/queued','mail.dispatched/sending','mail.status/queued',
+    'mail.dispatched/sending','mail.status/sent','mail.status/delivered'].sort());
+  for(const event of transitions) {
+    assert.equal(event.threadId,first.threadId);
+    assert.equal(event.employeeId,'ceo');
+    const received=event.kind==='mail.received';
+    assert.equal(event.messageId,received?first.messageId:outgoing.messageId);
+    assert.equal(event.actor,received?'external':event.kind==='mail.queued'?'owner':'mail-sender');
+  }
+  const reads=items.filter(e=>e.kind.startsWith('admin.mail.'));
+  assert.equal(reads.length,2);
+  assert.ok(reads.some(e=>e.kind==='admin.mail.thread.read'&&e.threadId===first.threadId&&e.actor==='owner'));
+  assert.ok(reads.some(e=>e.kind==='admin.mail.folders.read'&&e.employeeId==='ceo'&&e.actor==='owner'));
+  assert.doesNotMatch(JSON.stringify(items),/@|sensitive-provider-id|First question|Private reply|Preview|owner-reply/i);
+});
+
+test('an unavailable audit write blocks storing a message, issuing a send, and administrative disclosure',async t=>{
+  const {records,mail,store,inbound}=fixture(t);
+  const blocked={...records,transact:changes=>changes.some(c=>c.pk==='company-events')?false:records.transact(changes)};
+  const audited=createCompanyMail({records:blocked,store,domain,externalEnabled:true});
+  await assert.rejects(audited.execute('ceo','mail.send',{to:'other@example.net',subject:'Review',text:'Private request',requestId:'blocked'}),{status:503});
+  assert.equal((await records.list('mail-outbox')).items.length,0);
+  assert.equal((await records.list('mail-messages')).items.length,0);
+  const first=await inbound();
+  const reply=await mail.execute('ceo','mail.reply',{threadId:first.threadId,messageId:first.messageId,text:'Private reply',requestId:'ok'});
+  let sends=0;
+  await dispatchCompanyMail({records,store,domain,claimRecordsFor:()=>blocked,transport:{send:async()=>{sends++;}}});
+  assert.equal(sends,0);
+  assert.equal((await records.get('mail-messages',reply.messageId)).status,'queued');
+  await assert.rejects(audited.execute('owner','mail.get',{threadId:first.threadId}),{status:503});
+  await assert.rejects(audited.execute('owner','mail.list',{employeeId:'ceo'}),{status:503});
+  await assert.rejects(audited.execute('eng','mail.get',{threadId:first.threadId}),{status:404});
+  assert.equal((await audited.execute('ceo','mail.get',{threadId:first.threadId})).messages.length,2);
 });

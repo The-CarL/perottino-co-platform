@@ -85,6 +85,15 @@ test('optional receiving and sending roles isolate SES, event origins and founda
   assert.match(inbound,/V2#mail-/);assert.doesNotMatch(inbound,/ses:Send|ecs:RunTask|FACTORY#CONTROL|mail-outbox/);
   const sender=JSON.stringify(r.SenderRole.Properties.Policies);
   assert.match(sender,/ses:SendEmail/);assert.match(sender,/ses:FromAddress/);assert.doesNotMatch(sender,/SendRawEmail|FACTORY#CONTROL/);
+  for(const role of [r.MailRole,r.SenderRole]) {
+    const statements=role.Properties.Policies[0].PolicyDocument.Statement;
+    const writes=statements.find(s=>s.Action.includes('dynamodb:UpdateItem'));
+    const keys=writes.Condition['ForAllValues:StringLike']['dynamodb:LeadingKeys'];
+    assert.ok(keys.includes('V2#event-id') && keys.includes('V2#company-events'));
+    assert.ok(!keys.includes('V2#*'));
+    const reads=statements.find(s=>s.Action.includes('dynamodb:GetItem'));
+    assert.ok(!reads.Condition['ForAllValues:StringLike']['dynamodb:LeadingKeys'].includes('V2#company-events'));
+  }
   assert.equal(r.Sender.Properties.ImageConfig.Command[0],'src/company-mail-ses.handler');
   assert.equal([r.Subscription.Properties.RedrivePolicy.deadLetterTargetArn['Fn::GetAtt']].flat().join('.'),'Failures.Arn');
   assert.doesNotMatch(JSON.stringify(r),/AWS::Route53::RecordSet|AWS::SES::ReceiptRuleSet/);

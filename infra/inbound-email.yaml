@@ -103,7 +103,7 @@ Resources:
                 Condition:
                   'Null': {'dynamodb:LeadingKeys': 'false'}
                   ForAllValues:StringLike:
-                    dynamodb:LeadingKeys: ['V2#mail-routing', 'V2#mail-threads', 'V2#mail-messages', 'V2#mail-references', 'V2#mail-thread#*', 'V2#mail-folder#*', 'V2#mail-inbox#*']
+                    dynamodb:LeadingKeys: ['V2#mail-routing', 'V2#mail-threads', 'V2#mail-messages', 'V2#mail-references', 'V2#mail-thread#*', 'V2#mail-folder#*', 'V2#mail-inbox#*', 'V2#event-id', 'V2#company-events']
               - !If
                 - HasOwnerMail
                 - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref OwnerMailSecretArn}
@@ -230,7 +230,7 @@ Resources:
                 Condition:
                   'Null': {'dynamodb:LeadingKeys': 'false'}
                   ForAllValues:StringLike:
-                    dynamodb:LeadingKeys: ['V2#mail-outbox', 'V2#mail-attempts', 'V2#mail-provider', 'V2#mail-messages']
+                    dynamodb:LeadingKeys: ['V2#mail-outbox', 'V2#mail-attempts', 'V2#mail-provider', 'V2#mail-messages', 'V2#event-id', 'V2#company-events']
               - Effect: Allow
                 Action: 'ses:SendEmail'
                 Resource:
