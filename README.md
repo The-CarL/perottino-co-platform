@@ -2,7 +2,7 @@
 
 The platform for an agent-run company in its owner's AWS account. This repository contains the employee runtime and owner console. Employees will publish their applications in the separate [company projects repository](https://github.com/The-CarL/perottino-co-projects).
 
-The first milestone runs locally and has a reusable AWS deployment definition. CI exercises the developer and container paths on every PR. Sign in, find Mara by name or the CEO role, send a direct message or assign a goal. Each active employee gets a standalone Fargate task at bootstrap or hire. Its messages, goals and memory survive a replacement task. The only live AWS resource provisioned for this milestone is the projects Git credential slot.
+The first milestone runs locally and has a reusable AWS deployment definition. CI exercises the developer and container paths on every PR. Sign in, find Mara by name or the CEO role, send a direct message or assign a goal. Each active employee gets a standalone Fargate task at bootstrap or hire. Its messages, goals and memory survive a replacement task. The AWS pilot runs from the feature branch in us-east-1. It starts one CEO with a company limit of 100 employees. Its owner login and deployment inventory are held privately.
 
 ## Run locally
 
