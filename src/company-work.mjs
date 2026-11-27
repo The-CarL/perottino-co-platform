@@ -41,7 +41,7 @@ function fields(row) {
   return rest;
 }
 function publicWork(resource, handoff = false) {
-  const {claimDigest,availableAt,traceContext,source,...rest} = resource;
+  const {claimDigest,availableAt,traceContext,source,sourceMail,...rest} = resource;
   return handoff && traceContext ? {...rest,traceContext} : rest;
 }
 function listOf(value,check,max) {
@@ -68,7 +68,7 @@ function taskIndexes(t) {
   return result;
 }
 
-export function createWork({records,employee,event = eventRows,currentTrace = traceCarrier,canReadSource,now = Date.now,leaseMs = 150000}) {
+export function createWork({records,employee,event = eventRows,currentTrace = traceCarrier,canReadSource,canUseMailSource,now = Date.now,leaseMs = 150000}) {
   requireThat(Number.isSafeInteger(leaseMs) && leaseMs > 0 && leaseMs <= 900000,500,'Invalid task lease.');
   function handoff(prior) {
     const traceparent = currentTrace()?.traceparent ?? prior?.traceparent;
@@ -82,6 +82,15 @@ export function createWork({records,employee,event = eventRows,currentTrace = tr
     requireThat(canReadSource && await canReadSource(actor,source) &&
       (actor === accountableId || await canReadSource(accountableId,source)),404,'Source message not found.');
     return {source};
+  }
+  async function mailSource(actor,accountable,input) {
+    if(input.sourceMail==null) return {};
+    const v=input.sourceMail;
+    requireThat(!input.source && typeof v==='object' && !Array.isArray(v) && Object.keys(v).length===2,400,'Invalid source email.');
+    const sourceMail={threadId:identifier(v.threadId),messageId:identifier(v.messageId)};
+    requireThat(canUseMailSource && await canUseMailSource(actor,sourceMail) &&
+      (actor===accountable || await canUseMailSource(accountable,sourceMail)),404,'Authorized source email not found.');
+    return {sourceMail};
   }
   async function person(id) {
     const row = await employee(identifier(id));
@@ -198,7 +207,7 @@ export function createWork({records,employee,event = eventRows,currentTrace = tr
     if (op === 'goal.create') {
       const accountable = await person(input.accountableId);
       requireThat(await manages(actor,accountable.id) || (actor === 'ceo' && accountable.id === actor),403,'Only a leader can assign this goal.');
-      const goal = {id:requestKey,...handoff(),...await sourceForCreation(actor,accountable.id,input.source),accountableId:accountable.id,outcome:string(input.outcome,'outcome'),
+      const goal = {id:requestKey,...handoff(),...await sourceForCreation(actor,accountable.id,input.source),...await mailSource(actor,accountable.id,input),accountableId:accountable.id,outcome:string(input.outcome,'outcome'),
         successCriteria:string(input.successCriteria,'success criteria'),createdBy:actor,createdAt:at,updatedAt:at,
         status:'active',taskCount:0,openTaskCount:0};
       await save(changes,goals,null,goal,goalIndexes);
@@ -210,7 +219,7 @@ export function createWork({records,employee,event = eventRows,currentTrace = tr
       requireThat(old.status === 'active' && old.taskCount > 0 && old.openTaskCount === 0,409,'All tasks must pass review before closing the goal.');
       const goal = {...fields(old),status:'done',updatedAt:at,closedBy:actor};
       await save(changes,goals,old,goal,goalIndexes);
-      const notification = notificationRow(goal);
+      const notification = notificationRow(goal,goal.sourceMail && input.requesterReply ? string(input.requesterReply,'requester reply',8000) : undefined);
       if (notification) changes.push(notification);
       return {kind:'goal.closed',result:{goal:publicWork(goal)}};
     }
