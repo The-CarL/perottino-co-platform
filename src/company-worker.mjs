@@ -127,7 +127,10 @@ function applyDecision({ unit, ctx, execute, browse, signal, requestId }, { op, 
       return { url:page.url, title:String(page.title ?? '').slice(0,300), text:String(page.text ?? '').slice(0,4000) };
     }
     if (op === 'goal.create') {
-      const created = await call(op, { ...input, accountableId:input.accountableId || ctx.agent.id });
+      const accountableId = input.accountableId || ctx.agent.id;
+      const source = unit.delivery && unit.conversation.members.includes(accountableId)
+        ? { conversationId:unit.conversation.id, messageId:unit.message.id } : undefined;
+      const created = await call(op, { ...input, accountableId, ...(source && {source}) });
       return { goal:goal(created.goal) };
     }
     if (op === 'task.create' || op === 'employee.hire') {
@@ -247,10 +250,13 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
 export async function runCompanyResident({ actor, execute, workerId, browse, signal, now = Date.now,
   wait = (ms,s) => sleep(ms,undefined,{signal:s}), reportFailure = () => {} }) {
   let heartbeat = 0, failures = 0;
+  const startupDeadline = now() + 30_000;
+  let bound = false;
   while (!signal.aborted) {
     let delay = 30_000;
     try {
       const state = await runCompanyPulse({ actor,execute,workerId,browse,signal,now });
+      bound = true;
       delay = state === 'worked' ? 1000 : 30_000;
       if (now() >= heartbeat) {
         const { active } = await execute('worker.heartbeat',{ summary:state,nextPulseAt:now()+delay },signal);
@@ -259,7 +265,11 @@ export async function runCompanyResident({ actor, execute, workerId, browse, sig
       }
       failures = 0;
     } catch (error) {
-      if (signal.aborted || error.code === 'MANAGER_DENIED') return;
+      if (signal.aborted) return;
+      // A newly launched task can reach the broker before ECS RunTask and the
+      // directory transaction have both published its ARN. All access is gated
+      // during this short grace period; later revocation terminates immediately.
+      if (error.code === 'MANAGER_DENIED' && (bound || now() >= startupDeadline)) return;
       failures++;
       reportFailure({category:'company_worker',attempt:failures});
       if (failures >= 8) throw new Error('Company worker could not reach a healthy pulse.');

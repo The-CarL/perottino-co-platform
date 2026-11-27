@@ -395,7 +395,7 @@ export function companyCommand(binding, { client, InvokeCommand, functionName, c
     if (response.FunctionError || !response.Payload?.length) throw new Error('Company broker invocation failed.');
     const body = JSON.parse(Buffer.from(response.Payload).toString('utf8'));
     if (!body.ok) throw Object.assign(new Error('Company broker declined the operation.'),
-      { status:body.status, code:body.error });
+      { status:body.status, code:body.code });
     return body.result;
   };
 }

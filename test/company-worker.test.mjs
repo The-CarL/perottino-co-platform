@@ -4,7 +4,7 @@ import test from 'node:test';
 import { createCompanyService } from '../src/company-service.mjs';
 import { makeSqliteRecords } from '../src/foundation-records.mjs';
 import { companyCommand } from '../src/resident.mjs';
-import { runCompanyPulse } from '../src/company-worker.mjs';
+import { runCompanyPulse,runCompanyResident } from '../src/company-worker.mjs';
 import { createDecisionServer, requestCompanyDecision } from '../src/agent.mjs';
 import { once } from 'node:events';
 
@@ -51,6 +51,10 @@ test('conversation decisions survive a lost hire response and persist one delega
   };
   let lost = false;
   await assert.rejects(pulse('ceo',plan,{execute:async (op,input) => {
+    if (op === 'goal.create') {
+      assert.equal(input.source.conversationId,dm.id);
+      assert.ok(input.source.messageId.startsWith('m-'));
+    }
     const value = await exec('ceo',op,input);
     if (op === 'employee.hire' && !lost) { lost = true; throw new Error('Response lost after committed hire.'); }
     return value;
@@ -99,13 +103,23 @@ test('local commands use the shared runtime; private chat is absent from indepen
   assert.equal((await exec('owner','messages.list',{conversationId:conversation.id})).messages.at(-1).text,'I would measure the current error rate first.');
   const overview = await exec('owner','company.overview',{});
   assert.equal(overview.tasks.length,0); assert.equal(overview.goals.length,0);
+  await send('Ask Kai to check the sample in this private brief.');
+  let assignee;
+  await pulse('ceo',ctx => ctx.steps.length ? choice('reply',{text:'Kai has the sample-checking goal.'})
+    : choice('goal.create',{accountableId:kai.id,outcome:'Check the sample',successCriteria:'Referenced summary'}),{
+    execute:(op,input) => {
+      if (op === 'goal.create') { assignee=input.accountableId; assert.equal(input.source,undefined); }
+      return exec('ceo',op,input);
+    },
+  });
+  assert.equal(assignee,kai.id);
 });
 
 test('hosted command wraps business input with the bound identity and propagates broker revocation', async () => {
   const binding = {agentId:'ceo',generation:2,taskArn:'fixture-task'};
   const received = [];
   const execute = companyCommand(binding,{ client:{async send(command) {
-    received.push(JSON.parse(command.input.Payload)); return {Payload:Buffer.from('{"ok":false,"status":403,"error":"MANAGER_DENIED"}')};
+    received.push(JSON.parse(command.input.Payload)); return {Payload:Buffer.from('{"ok":false,"status":403,"code":"MANAGER_DENIED"}')};
   }},InvokeCommand:class { constructor(input) { this.input=input; } },functionName:'broker',capability:'fixture' });
   await assert.rejects(execute('directory.self',{}),{code:'MANAGER_DENIED',status:403});
   const [{requestId,...event}] = received;
@@ -131,6 +145,19 @@ test('isolated company sidecar authenticates and validates the company decision 
   assert.deepEqual(await requestCompanyDecision(context),choice('reply',{text:'I received the brief'}));
   process.env.PEROTTINO_BEDROCK_WORKER_TOKEN = randomUUID();
   await assert.rejects(requestCompanyDecision(context),/worker could not complete/);
+});
+
+test('hosted resident tolerates an unpublished binding only at startup and exits on subsequent revocation', async () => {
+  let time = 10_000, polls = 0;
+  const waits = [];
+  await runCompanyResident({ actor:{id:'ceo'},workerId:'fixture',signal:new AbortController().signal,
+    now:() => time,wait:async ms => { waits.push(ms); time += ms; },execute:async op => {
+      if (op === 'worker.heartbeat') return {active:true};
+      assert.equal(op,'worker.poll');
+      if (++polls === 2) return {readyTasks:[],unplanned:[],reviews:[],closable:[]};
+      throw Object.assign(new Error('Revoked'),{status:403,code:'MANAGER_DENIED'});
+    } });
+  assert.equal(polls,3); assert.deepEqual(waits,[2000,30000]);
 });
 
 test('a held planning page and a task claimed by another worker do not hide the next available item', async t => {
