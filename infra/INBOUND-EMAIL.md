@@ -34,19 +34,13 @@ In the hosted company configuration set `mailDomain` to the same verified domain
 
 ## Founder instructions with a normal mail client
 
-Provision a private Secrets Manager JSON value containing `address` and `token`. Set `address` to the founder's exact email address. To generate `token`, encode 32 cryptographically random bytes as unpadded lowercase RFC 4648 base32. This produces 52 characters from letters a–z and digits 2–7. The following command writes a new private file in an operator-owned directory. It displays no credential and refuses an existing filename.
+Deploy [the founder credential template](founder-mail-secret.yaml) as a separate stack in the mail stack's account and region. Supply the exact founder mailbox in its masked `FounderEmail` parameter using a private deployment context. The parameter accepts a single email address. Keep enrollment inputs and the change set accessible only to authorized operators.
 
-```sh
-python3 - <<'PY'
-import base64, json, os, secrets
-address = os.environ["OWNER_MAIL_ADDRESS"]
-token = base64.b32encode(secrets.token_bytes(32)).decode("ascii").rstrip("=").lower()
-with os.fdopen(os.open("owner-mail.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
-    json.dump({"address": address, "token": token}, f)
-PY
-```
+Secrets Manager generates a 52-character routing token from lowercase letters and digits 2–7 and stores it with the enrolled address. The alphabet provides 260 bits of random choice. The stack exposes only `OwnerMailSecretArn`. Pass that output to the mail stack's parameter of the same name. Preserve the credential stack across runtime releases. Unrelated updates preserve the current token. Changing the founder address or generator settings creates a new secret version and requires a new contact handoff.
 
-Set `OWNER_MAIL_ADDRESS` privately before running the command and enroll the file's contents in the specified secret using your approved secret-provisioning procedure. Share the derived contact address `owner-<token>@<mail-domain>` only with the founder. The owner sends an ordinary email from the enrolled mailbox to that private contact. The ingress requires the capability, exactly one matching MIME From, and passing SES DKIM and DMARC verdicts. It stores the CEO’s public handle as the recipient and supplies the worker a verified owner flag. The optional founder secret is read only by the dedicated ingress and SES sender. Treat email forwarded from the founder's mailbox, raw SNS failure events and reply headers as sensitive because these can include the private address. To rotate it, replace the secret’s token and update the founder’s private contact.
+For enrollment, an authorized owner or credential operator opens the secret in Secrets Manager and saves `owner-<token>@<mail-domain>` as the CEO contact in the founder's private address book or password manager. Use a protected, one-to-one handoff if another operator performs enrollment. Keep the token and private address out of deployment output, company chat, shared files, and logs. For ordinary correspondence, continue using the public employee address.
+
+The founder emails the private contact from the enrolled mailbox. The ingress requires the capability, exactly one matching MIME From, and passing SES DKIM and DMARC verdicts. It stores the CEO’s public handle as the recipient and supplies the worker a verified owner flag. Only the dedicated ingress and SES sender receive workload access to this secret. Restrict access to raw SNS failure events, forwarded founder messages and reply headers because they can contain the private routing address. For deliberate rotation, update the secret with an independently generated token in the same format and replace the founder's saved contact.
 
 A reply to a verified instruction uses the original public office or employee From while that employee retains the alias. The SES adapter places the private founder address in Reply-To only on the CEO's verified thread with the enrolled mailbox. Normal email clients can therefore reply on the same thread weeks later. Rotating the token invalidates the previous private Reply-To, and the founder can manually select the new private contact when replying.
 
