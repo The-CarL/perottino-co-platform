@@ -25,7 +25,7 @@ test('runtime bootstrap allocates an account-local registry, owner slot and scop
     assert.deepEqual(pull.Principal, { Service: 'lambda.amazonaws.com' });
     assert.deepEqual(pull.Action, ['ecr:BatchGetImage','ecr:GetDownloadUrlForLayer']);
     const sources = pull.Condition.ArnEquals['aws:SourceArn'];
-    assert.deepEqual(sources.map(a => a['Fn::Sub'].split('-r-').at(-1)).sort(), ['a','b','e','f','g','m','o','s','u']);
+    assert.deepEqual(sources.map(a => a['Fn::Sub'].split('-r-').at(-1)).sort(), ['a','b','e','f','g','m','o','s','u','z']);
     assert.ok(sources.every(a => a['Fn::Sub'].includes('${AWS::AccountId}:function:factory-${ProjectScope}')));
     assert.deepEqual(Outputs.ImageRepositoryUri.Value, { 'Fn::GetAtt': ['Images', 'RepositoryUri'] });
     assert.deepEqual(Outputs.OwnerSecretArn.Value, { Ref: 'ConsoleOwner' });
