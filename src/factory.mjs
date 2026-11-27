@@ -1,6 +1,11 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ECSClient, RunTaskCommand, StopTaskCommand, DescribeTasksCommand, ListTasksCommand } from '@aws-sdk/client-ecs';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { createCompanyService } from './company-service.mjs';
+import { makeDynamoRecords } from './foundation-records.mjs';
+import { withSpan, flushTelemetry, operationEvent } from './telemetry.mjs';
 import { createCloudStore } from './cloud-store.mjs';
 import { createFactoryState } from './factory-state.mjs';
 import { isValidEmployeeLimit, maxCompanyEmployees } from './headcount.mjs';
@@ -46,8 +51,13 @@ async function respondToCloudFormation(event, result) {
   if (!response.ok) throw new Error('CloudFormation response delivery failed');
 }
 
-export function createEmployeeFactory({ store, state, ecs, config, now = Date.now, sleep = delay, respond = respondToCloudFormation }) {
-  const call = command => ecs.send(command, { abortSignal: AbortSignal.timeout(7_000) });
+export function createEmployeeFactory({ store, state, ecs, config, recordsFor, now = Date.now, sleep = delay, respond = respondToCloudFormation }) {
+  const call = command => {
+    const send = () => ecs.send(command,{abortSignal:AbortSignal.timeout(7_000)});
+    if (command instanceof RunTaskCommand || command instanceof StopTaskCommand) return withSpan('factory.reconcile',
+      {action:command instanceof RunTaskCommand ? 'create' : 'pause'},send);
+    return send();
+  };
   const describe = async arns => {
     const result = await call(new DescribeTasksCommand({ cluster: config.clusterArn, tasks: arns }));
     if (result.failures?.some(failure => failure.reason !== 'MISSING')) throw new Error('ECS task status could not be verified');
@@ -274,56 +284,83 @@ export function createEmployeeFactory({ store, state, ecs, config, now = Date.no
     await respond(event, result);
   }
 
+  async function lifecycle(actor, op, input, common, company) {
+    if (!requestFormat.test(input.requestId ?? '')) reject(400, 'INVALID_REQUEST');
+    let employee;
+    if (op === 'hire') {
+      if (typeof input.role !== 'string' || !input.role.trim() || input.role.length > 120 ||
+          (input.assignment !== undefined && (typeof input.assignment !== 'string' || input.assignment.length > 4000)))
+        reject(400, 'INVALID_HIRE');
+      for (let i = 0; i < 3; i++) {
+        try {
+          employee = await store.hireEmployee({ ...common, requestId: input.requestId, ...generatedIdentity(actor,input.requestId,i),
+            generatedIdentity:true, role:input.role.trim(), ...(input.assignment && { assignment:input.assignment }), maxEmployees:company.employeeLimit });
+          break;
+        } catch (error) { if (error.code !== 'EMPLOYEE_IDENTITY_TAKEN' || i === 2) throw error; }
+      }
+    } else {
+      const desiredState = { pause:'paused', resume:'active', fire:'fired' }[op];
+      if (!desiredState || !idFormat.test(input.agentId ?? '')) reject(400,'INVALID_EMPLOYEE');
+      employee = await store.setEmployeeState({ ...common, requestId:input.requestId, agentId:input.agentId, desiredState });
+    }
+    await reconcile(employee.id);
+    return { employee: publicEmployee(employee) };
+  }
+  async function companyOperation(actor,event,common,company) {
+    const { op, input = {} } = event.command ?? {};
+    if (!recordsFor || typeof op !== 'string' || !/^[a-z][a-z.]{0,63}$/.test(op)) reject(400,'INVALID_REQUEST');
+    const records = recordsFor(common.binding, company?.version);
+    const service = createCompanyService({ records, store,
+      heartbeat: data => store.recordPulse(common.binding,data,company.version),
+      control: async (_actor, command, args) => {
+        if (!allowed(company) && command === 'employee.hire') reject(409,'COMPANY_SUSPENDED');
+        // New assignments are explicit work records. Never pass through a legacy hire assignment.
+        const {role,agentId,requestId} = args;
+        return lifecycle(actor,command.slice(9),{role,agentId,requestId},common,company);
+      } });
+    const run = () => service.execute(actor,op,input);
+    const quiet = ['worker.poll','worker.heartbeat','directory','directory.self','company.overview','journal.get'].includes(op) ||
+      (!op.startsWith('admin.') && /\.(?:list|get|status|history)$/.test(op));
+    const result = quiet ? await run() : await withSpan(op.startsWith('admin.') ? 'company.admin_read' : 'company.command',
+      {command:op,agentId:actor},run,{parent:event.trace});
+    return {ok:true,result};
+  }
   async function handleOwner(event) {
     if (!requestFormat.test(event?.requestId ?? '')) reject(400, 'INVALID_REQUEST');
+    if (event.operation === 'company') return companyOperation('owner',event,{callerId:'owner'},await state.company());
     if (['pause-company', 'resume-company'].includes(event.operation)) {
       const company = await state.suspend(event.requestId, event.operation === 'pause-company');
       if (company.suspended) await drain(); else await repair();
       return { ok: true, suspended: company.suspended };
     }
-    const desiredState = { pause: 'paused', resume: 'active', fire: 'fired' }[event.operation];
-    if (!desiredState || !idFormat.test(event.agentId ?? '')) reject(400, 'INVALID_REQUEST');
-    const employee = await store.setEmployeeState({ callerId: 'owner', agentId: event.agentId, desiredState, requestId: event.requestId });
-    await reconcile(employee.id);
-    return { ok: true, employee: publicEmployee(employee) };
+    if (!['pause','resume','fire'].includes(event.operation)) reject(400,'INVALID_REQUEST');
+    return {ok:true,...await lifecycle('owner',event.operation,event,{callerId:'owner'})};
   }
-
   async function handleManager(event) {
     if (!requestFormat.test(event?.requestId ?? '') || !idFormat.test(event.callerId ?? '') ||
-        !['hire', 'fire'].includes(event.operation)) reject(400, 'INVALID_REQUEST');
+        !['hire','fire','company'].includes(event.operation)) reject(400,'INVALID_REQUEST');
     const [company, caller, run] = await Promise.all([state.company(), store.employee(event.callerId), state.run(event.callerId)]);
-    if (!allowed(company) || !run?.capability || run.epoch !== company.epoch || run.stage === 'stopping'
-        || caller?.desiredState !== 'active' || !caller.canHire
-        || caller.generation !== event.generation || caller.taskArn !== event.taskArn || run.arn !== event.taskArn
-        || run.generation !== event.generation || typeof event.capability !== 'string' || event.capability.length !== run.capability.length
-        || !timingSafeEqual(hash(event.capability), hash(run.capability))) reject(403, 'MANAGER_DENIED');
-    const binding = { agentId: caller.id, generation: caller.generation, taskArn: caller.taskArn };
-    const common = { callerId: caller.id, requestId: event.requestId, binding, companyGate: true, companyVersion: company.version };
-    let employee;
-    if (event.operation === 'fire') {
-      if (!idFormat.test(event.agentId ?? '')) reject(400, 'INVALID_EMPLOYEE');
-      employee = await store.setEmployeeState({ ...common, agentId: event.agentId, desiredState: 'fired' });
-    } else {
-      if (typeof event.role !== 'string' || !event.role.trim() || event.role.length > 120 ||
-          (event.assignment !== undefined && (typeof event.assignment !== 'string' || event.assignment.length > 4000))) {
-        reject(400, 'INVALID_HIRE');
-      }
-      for (let i = 0; i < 3; i++) {
-        try {
-          employee = await store.hireEmployee({ ...common, ...generatedIdentity(caller.id, event.requestId, i), generatedIdentity: true, role: event.role.trim(),
-            ...(event.assignment && { assignment: event.assignment }), maxEmployees: company.employeeLimit });
-          break;
-        } catch (error) { if (error.code !== 'EMPLOYEE_IDENTITY_TAKEN' || i === 2) throw error; }
-      }
-    }
-    await reconcile(employee.id);
-    return { ok: true, employee: publicEmployee(employee) };
+    if (!allowed(company) || !run?.capability || run.epoch !== company.epoch ||
+        run.revision !== company.deployment?.revision || !['launching','started'].includes(run.stage) ||
+        caller?.desiredState !== 'active' || (event.operation !== 'company' && !caller.canHire) ||
+        caller.generation !== event.generation || run.generation !== event.generation ||
+        typeof event.taskArn !== 'string' || !event.taskArn || typeof event.capability !== 'string' ||
+        event.capability.length !== run.capability.length || !timingSafeEqual(hash(event.capability),hash(run.capability)))
+      reject(403,'MANAGER_DENIED');
+    if (run.arn && run.arn !== event.taskArn || caller.taskArn && caller.taskArn !== event.taskArn) reject(403,'MANAGER_DENIED');
+    if (!run.arn || !caller.taskArn) reject(503,'BINDING_PENDING');
+    if (caller.taskGeneration !== event.generation) reject(403,'MANAGER_DENIED');
+    const binding = {agentId:caller.id,generation:caller.generation,taskArn:caller.taskArn};
+    const common = {callerId:caller.id,binding,companyGate:true,companyVersion:company.version};
+    if (event.operation === 'company') return companyOperation(caller.id,event,common,company);
+    if (recordsFor) reject(400,'USE_COMPANY_COMMAND');
+    return {ok:true,...await lifecycle(caller.id,event.operation,event,common,company)};
   }
   async function safeAction(operation, event) {
     try { return await operation(event); }
     catch (error) {
       const status = [400, 403, 404, 409, 429].includes(error.status) ? error.status : 503;
-      return { ok: false, status, code: status !== 503 && /^[A-Z_]{2,60}$/.test(error.code ?? '') ? error.code : 'FACTORY_ACTION_FAILED' };
+      return { ok: false, status, ...(event?.operation === 'company' && status !== 503 && {message:error.message}), code: (status !== 503 || error.code === 'BINDING_PENDING') && /^[A-Z_]{2,60}$/.test(error.code ?? '') ? error.code : 'FACTORY_ACTION_FAILED' };
     }
   }
   return {
@@ -349,12 +386,29 @@ function factory() {
       PEROTTINO_PUBLIC_SUBNET_IDS, PEROTTINO_SECURITY_GROUP_ID: securityGroupId, PEROTTINO_EMPLOYEE_LIMIT } = process.env;
     const employeeLimit = Number(PEROTTINO_EMPLOYEE_LIMIT ?? maxCompanyEmployees);
     if (!isValidEmployeeLimit(employeeLimit)) throw new Error('Invalid employee limit');
-    instance = createEmployeeFactory({ store: createCloudStore({ tableName }), state: createFactoryState({ tableName }),
+    const client = DynamoDBDocumentClient.from(new DynamoDBClient({maxAttempts:3}));
+    const store = createCloudStore({tableName,client});
+    instance = createEmployeeFactory({ store, state:createFactoryState({tableName}),
+      ...(process.env.PEROTTINO_FOUNDATIONS === '1' && {recordsFor:(binding,version) =>
+        makeDynamoRecords({tableName,client,conditions:binding ? store.foundationGuards(binding,version) : []})}),
       ecs: new ECSClient({ maxAttempts: 2 }), config: { clusterArn, taskDefinitionArn, securityGroupId, employeeLimit,
         subnets: PEROTTINO_PUBLIC_SUBNET_IDS?.split(',') } });
   }
   return instance;
 }
-export const handler = (event, context) => factory().handler(event, context);
-export const owner = event => factory().owner(event);
-export const manager = event => factory().manager(event);
+export async function handler(event, context) {
+  try {
+    if (event?.source === 'aws.events') {
+      try { return await factory().handler(event,context); }
+      catch (error) { operationEvent('work.failure',{reason:'store',outcome:'error'}); throw error; }
+    }
+    return await withSpan('factory.reconcile',{},() => factory().handler(event,context));
+  }
+  finally { await flushTelemetry(); }
+}
+async function command(handler,event) {
+  try { return await factory()[handler](event); }
+  finally { await flushTelemetry(); }
+}
+export const owner = event => command('owner',event);
+export const manager = event => command('manager',event);

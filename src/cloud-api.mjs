@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { withSpan, traceCarrier, flushTelemetry } from './telemetry.mjs';
 import { isIP } from 'node:net';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
@@ -92,14 +94,14 @@ function reject(statusCode, message) {
   body: JSON.stringify({ error: message }) };
 }
 
-export function createCloudHandler({ store, readOwner, ownerControl, publicOrigin, publicDir = publicFiles, now = Date.now }) {
+export function createCloudHandler({ store, readOwner, ownerControl, company, publicOrigin, publicDir = publicFiles, now = Date.now }) {
   let expected;
   if (publicOrigin) {
     const url = new URL(publicOrigin);
     if (url.protocol !== 'https:' || url.href !== url.origin + '/') throw new Error('PUBLIC_ORIGIN must be an HTTPS origin.');
     expected = url.origin;
   }
-  const handle = createConsoleHandler({ store, mode: 'bedrock', publicDir, ownerControl, auth: ownerMiddleware(readOwner, expected, now) });
+  const handle = createConsoleHandler({ store, mode: 'bedrock', publicDir, ownerControl, company, auth: ownerMiddleware(readOwner, expected, now) });
   return async event => {
     const req = gatewayRequest(event, expected);
     if (!req) return reject(403, 'Request source denied.');
@@ -118,7 +120,7 @@ export function createCloudHandler({ store, readOwner, ownerControl, publicOrigi
 async function production() {
   const tableName = process.env.PEROTTINO_STATE_TABLE;
   const secretArn = process.env.PEROTTINO_OWNER_SECRET_ARN;
-  if (!tableName || !secretArn) throw new Error('Missing owner API configuration.');
+  if ((!tableName && process.env.PEROTTINO_FOUNDATIONS !== '1') || !secretArn) throw new Error('Missing owner API configuration.');
   const [{ createCloudStore }, { SecretsManagerClient, GetSecretValueCommand }] = await Promise.all([
     import('./cloud-store.mjs'), import('@aws-sdk/client-secrets-manager'),
   ]);
@@ -137,8 +139,23 @@ async function production() {
       } catch { return { ok: false, status: 503 }; }
     };
   }
+  const company = process.env.PEROTTINO_FOUNDATIONS === '1' ? { execute: async (_actor, op, input) => {
+    const call = async () => {
+      const response = await ownerControl({ operation:'company', requestId:randomUUID(), command:{op,input}, trace:traceCarrier() });
+      if (!response.ok) {
+        const status = [400,403,404,409,429].includes(response.status) ? response.status : 503;
+        const messages = {400:'Invalid company request.',403:'Access denied.',404:'Resource not found.',409:'The record changed or this request conflicts.',429:'Rate limit reached.',503:'The company service is temporarily unavailable.'};
+        throw new HttpError(status,response.message ?? messages[status]);
+      }
+      return response.result;
+    };
+    // Dashboard polling and transcript reads are counted by API Gateway access logs.
+    if (!op.startsWith('admin.') && /(?:\.list|\.get|\.overview|\.status|\.history|^directory)$/.test(op)) return call();
+    try { return await withSpan(op.startsWith('admin.') ? 'company.admin_read' : 'company.command', {agentId:'owner',command:op},call); }
+    finally { await flushTelemetry(); }
+  }} : undefined;
   return createCloudHandler({
-    store: await createCloudStore({ tableName }), publicOrigin: process.env.PUBLIC_ORIGIN, ownerControl,
+    company, store: company ? undefined : await createCloudStore({ tableName }), publicOrigin: process.env.PUBLIC_ORIGIN, ownerControl,
     readOwner: async () => {
       const value = await secrets.send(new GetSecretValueCommand({ SecretId: secretArn, VersionStage: 'AWSCURRENT' }),
         { abortSignal: AbortSignal.timeout(4000) });

@@ -4,6 +4,7 @@ import test from 'node:test';
 import { CreateTableCommand, DeleteTableCommand, DynamoDBClient, waitUntilTableExists } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { createCloudStore } from '../src/cloud-store.mjs';
+import { makeDynamoRecords } from '../src/foundation-records.mjs';
 import { createFactoryState } from '../src/factory-state.mjs';
 import { createEmployeeFactory } from '../src/factory.mjs';
 
@@ -13,7 +14,7 @@ const config = { clusterArn:'fixture-cluster', taskDefinitionArn:'fixture-family
   securityGroupId:'fixture-group', employeeLimit:2 };
 const scheduled = { source:'aws.events', 'detail-type':'Scheduled Event' };
 
-async function fixture(t) {
+async function fixture(t, foundations = false) {
   const url = new URL(endpoint);
   assert.ok(url.protocol === 'http:' && ['127.0.0.1','localhost','[::1]'].includes(url.hostname) && !url.username && !url.password);
   const tableName = 'factory-test-' + randomUUID();
@@ -53,7 +54,8 @@ async function fixture(t) {
       default: assert.fail(command.constructor.name);
     }
   } };
-  const factory = createEmployeeFactory({ state, store, ecs, config, now, respond:async(_,result)=>responses.push(result),
+  const recordsFor = (binding,version) => makeDynamoRecords({client,tableName,conditions:binding ? store.foundationGuards(binding,version) : []});
+  const factory = createEmployeeFactory({ state, store, ecs, config, now, ...(foundations && {recordsFor}), respond:async(_,result)=>responses.push(result),
     sleep:async ms=>{ clock.time+=ms; flags.afterSleep?.(); } });
   const custom = async (RequestType, RequestId = randomUUID()) => {
     await factory.handler({ RequestType,RequestId,StackId:stackId,LogicalResourceId:'Residents',
@@ -154,3 +156,30 @@ test('a manager from before a company pause cannot hire after a rapid resume, ev
     assert.equal(response.status,403);
     assert.equal((await f.store.listEmployees()).length,1);
   });
+
+test('bound IC can consume and submit work through the broker and has no administrative authority',{skip:!endpoint},async t=>{
+  const f=await fixture(t,true);
+  assert.equal((await f.custom('Create')).Status,'SUCCESS');
+  const owner = (op,input={}) => f.factory.owner({operation:'company',command:{op,input},requestId:randomUUID()});
+  const created = await owner('employee.hire',{role:'Engineer',requestId:'engineer'});
+  assert.equal(created.ok,true);
+  const employee = await f.store.employee(created.result.employee.id);
+  const run=await f.state.run(employee.id);
+  const invoke = (op,input={}) => f.factory.manager({operation:'company',callerId:employee.id,taskArn:employee.taskArn,
+    generation:employee.generation,capability:run.capability,requestId:randomUUID(),command:{op,input}});
+  assert.equal((await invoke('directory.self')).result.employee.id,employee.id);
+  assert.equal((await invoke('admin.conversations')).status,403);
+  assert.equal((await invoke('employee.hire',{role:'QA',requestId:'no-authority'})).status,403);
+  assert.equal((await invoke('directory',{callerId:'ceo'})).status,400);
+  const goal = await owner('goal.create',{accountableId:'ceo',outcome:'Compute the sample',successCriteria:'Show sum',requestId:'sample'});
+  const task = await owner('task.create',{goalId:goal.result.goal.id,assigneeId:employee.id,title:'Add 2 and 3',acceptance:'Show operands and sum',requestId:'sum'});
+  const taskId = task.result.task.id;
+  assert.equal((await invoke('worker.poll',{workerId:'resident-fixture'})).result.readyTasks[0].id,taskId);
+  const {claimToken} = (await invoke('task.claim',{taskId,requestId:'claim'})).result;
+  assert.ok(claimToken);
+  assert.equal((await invoke('task.submit',{taskId,claimToken,evidence:['2+3=5'],requestId:'submit'})).result.task.status,'submitted');
+  assert.equal((await invoke('worker.heartbeat',{nextPulseAt:Date.now()+10000,summary:'worked'})).result.active,true);
+  assert.match((await owner('company.overview')).result.agents.find(a=>a.id===employee.id).lastPulseAt,/Z$/);
+  assert.equal((await owner('employee.pause',{agentId:employee.id,requestId:'pause-employee'})).ok,true);
+  assert.equal((await invoke('directory.self')).code,'MANAGER_DENIED');
+});

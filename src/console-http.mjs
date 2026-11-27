@@ -14,7 +14,7 @@ export class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
-async function readAction(req, requireText) {
+async function readJson(req) {
   if (req.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json')
     throw new HttpError(415, 'Send an application/json request.');
   let length = 0;
@@ -30,6 +30,12 @@ async function readAction(req, requireText) {
   let body;
   try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
   catch { throw new HttpError(400, 'Message must be valid JSON.'); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'Expected a JSON object.');
+  return body;
+}
+
+async function readAction(req, requireText) {
+  const body = await readJson(req);
   if (typeof body?.requestId !== 'string' || !/^[a-zA-Z0-9._:-]{1,160}$/.test(body.requestId))
     throw new HttpError(400, 'Supply a unique requestId.');
   if (!requireText) return { requestId: body.requestId };
@@ -90,7 +96,7 @@ function goalSummary(row) {
   return { id, text, status, checkpoint, stepCount, nextRunAt, createdAt, updatedAt };
 }
 
-export function createConsoleHandler({ store, auth, publicDir, mode, onEnqueued, ownerControl }) {
+export function createConsoleHandler({ store, auth, publicDir, mode, onEnqueued, ownerControl, company }) {
   return async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -102,6 +108,17 @@ export function createConsoleHandler({ store, auth, publicDir, mode, onEnqueued,
       try { url = new URL(req.url, 'http://localhost'); pathname = decodeURIComponent(url.pathname); }
       catch { throw new HttpError(400, 'Invalid URL.'); }
       if (!pathname.startsWith('/api/') && pathname !== '/api') return await servePage(req, res, pathname, publicDir);
+      if (company) {
+        if (req.method === 'GET' && pathname === '/api/directory')
+          return json(res, 200, { ...await company.execute('owner','directory',{}), mode });
+        const route = /^\/api\/company\/([a-z][a-z.]{0,63})$/.exec(pathname);
+        if (!route) throw new HttpError(404, 'Resource not found.');
+        if (req.method !== 'POST') throw new HttpError(405, 'Method not allowed.');
+        const input = await readJson(req);
+        const result = await company.execute('owner',route[1],input);
+        if (onEnqueued && /^(?:messages.post|employee\.(?:hire|resume)|task\.(?:create|resume|review)|goal.create)$/.test(route[1])) setImmediate(onEnqueued);
+        return json(res,200,result);
+      }
       if (pathname === '/api/directory') {
         if (req.method !== 'GET') throw new HttpError(405, 'Method not allowed.');
         return json(res, 200, { agents: await store.directory(), mode });
@@ -163,7 +180,7 @@ export function createConsoleHandler({ store, auth, publicDir, mode, onEnqueued,
       if (onEnqueued) setImmediate(onEnqueued);
     } catch (error) {
       if (error.code === 'EMPLOYEE_FIRED' && !res.headersSent) return json(res, 409, { error: 'This employee has left the company.' });
-      const known = error instanceof HttpError;
+      const known = error instanceof HttpError || (company && [400,403,404,409,429,503].includes(error.status));
       if (!res.headersSent && !res.destroyed) json(res, known ? error.status : 500, { error: known ? error.message : 'The request could not be completed.' });
       if (!known) console.error('Request failed:', error.code || error.name);
     }

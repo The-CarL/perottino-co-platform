@@ -248,9 +248,9 @@ export function createEmployeeStore({ ddb, tableName, get, query, write, insert,
         ExpressionAttributeValues:{':pk':'DIRECTORY',':pre':'AGENT#'}, Limit:limit, ...(cursor && {ExclusiveStartKey:{pk:'DIRECTORY',sk:cursor}}) }));
       return { employees:(p.Items ?? []).map(employeeView), ...(p.LastEvaluatedKey && {cursor:p.LastEvaluatedKey.sk}) };
     },
-    async recordPulse(binding, { nextPulseAt, summary='' }) {
+    async recordPulse(binding, { nextPulseAt, summary='' }, companyVersion) {
       if (!validTime(nextPulseAt) || typeof summary !== 'string' || summary.length > 2000) throw problem(400, 'Invalid pulse.');
-      return write([...gateChecks(), bindingCheck(binding), put({ pk:pkFor(binding.agentId), sk:'PULSE', generation:binding.generation, at:now(), nextPulseAt, summary })]);
+      return write([...gateChecks(companyVersion === undefined ? undefined : true,companyVersion), bindingCheck(binding), put({ pk:pkFor(binding.agentId), sk:'PULSE', generation:binding.generation, at:now(), nextPulseAt, summary })]);
     },
     async getPulse(id) { const row = await get({ pk:pkFor(id), sk:'PULSE' }); if (!row) return null; const {pk,sk,...pulse}=row; return pulse; }
   };

@@ -361,7 +361,7 @@ export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE
     }
   };
   const { accepting, bindingCheck, gateChecks, lockWork, unlockWork, goalItems, claimGoal, ...employeeApi } = people;
-  return { ...api, ...employeeApi, async claimNextWork({ agentId, generation, taskArn, leaseMs }) {
+  return { ...api, ...employeeApi, foundationGuards: (binding, version) => [...gateChecks(true,version), bindingCheck(binding)], async claimNextWork({ agentId, generation, taskArn, leaseMs }) {
     if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || !Number.isSafeInteger(generation) || !taskArn) throw new RangeError('Invalid resident claim.');
     const binding = { agentId, generation, taskArn };
     const person = await people.employee(agentId);
