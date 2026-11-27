@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { checkCompanyDecision, companySdkDecision, localCompanyDecision } from './company-decisions.mjs';
+import { capabilitiesFor, useCapability, capabilityFields } from './company-capabilities.mjs';
 import { withSpan } from './telemetry.mjs';
 
 const digest = (...parts) => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
@@ -21,12 +22,17 @@ const workActions = {
 
 function permitted(ctx) {
   let ops;
-  if (ctx.kind === 'message') {
+  if(ctx.kind==='mail') {
+    ops=ctx.trustedOwner?['reply','pass','goal.create','task.create','employee.hire','employee.fire',...shared]:['reply','pass'];
+    if(!ctx.message.canReply) ops=ops.filter(op=>op!=='reply');
+  } else if (ctx.kind === 'message') {
     const trusted = ctx.message.senderId === 'owner' ||
       (Boolean(ctx.agent.managerId) && ctx.message.senderId === ctx.agent.managerId);
     ops = trusted ? ['reply','pass','goal.create','task.create','employee.hire','employee.fire','memory.list','memory.save', ...shared]
       : ['reply','pass'];
   } else ops = workActions[ctx.kind];
+  ops=[...ops,...capabilitiesFor(ctx)];
+  if(ctx.runtime?.settings?.networkAccess===false) ops=ops.filter(op=>!['browse','search'].includes(op)&&!op.startsWith('browser.'));
   if (!ctx.agent.canHire) ops = ops.filter(op => !['employee.hire','employee.fire'].includes(op));
   if (ctx.kind === 'task' && ctx.task.workStep >= 12) ops = ['task.block','task.submit'];
   return ops;
@@ -35,15 +41,17 @@ function permitted(ctx) {
 // A journal key describes an input or a logical work step, independently of
 // process generation or lease token. Retried effects retain their request IDs.
 function unitId(actorId, unit) {
-  return digest('company-pulse-v1', actorId, unit.kind, unit.message?.id ?? unit.task?.id ?? unit.goal.id,
+  return digest('company-pulse-v1', actorId, unit.kind, unit.message?.id ?? unit.mail?.messageId ?? unit.task?.id ?? unit.goal.id,
     unit.task?.workStep ?? unit.goal?.taskCount ?? 0);
 }
-async function choose(actor, execute, workerId, now) {
+async function choose(actor, execute, workerId, now,onSettings) {
   let queues = await execute('worker.poll', { workerId, leaseMs });
-  if (queues.inbox?.delivery) return { kind:'message', ...queues.inbox };
+  onSettings(queues.runtimeSettings);
+  if (queues.inbox?.delivery) return { kind:'message', ...queues.inbox, runtime:queues.runtimeSettings };
+  if (queues.mail?.delivery) return {kind:'mail',mail:queues.mail.delivery,runtime:queues.runtimeSettings};
   while (queues) {
     const candidate = await chooseFromPage(actor, execute, queues, now);
-    if (candidate) return candidate;
+    if (candidate) return {...candidate,runtime:queues.runtimeSettings};
     queues = queues.next && Object.values(queues.next).some(Boolean)
       ? await execute('worker.poll',{workerId,leaseMs,continuation:true,after:queues.next}) : null;
   }
@@ -73,10 +81,20 @@ async function chooseFromPage(actor, execute, queues, now) {
 }
 
 async function contextFor(actor, unit, execute) {
+  if(unit.kind==='mail' && !unit.mail.trustedOwner) {
+    const ctx={kind:'mail',agent:employee(actor),trustedOwner:false,message:pick(unit.mail,['subject','text','canReply'])};
+    ctx.allowed=permitted(ctx);return ctx;
+  }
   const { agents } = await execute('directory.list', {});
   const people = agents.filter(person => person.desiredState !== 'fired').map(employee);
   const ctx = { kind:unit.kind, agent:people.find(person => person.id === actor.id) ?? employee(actor), directory:people };
-  if (unit.kind === 'message') {
+  if(unit.kind==='mail') {
+    ctx.trustedOwner=true;
+    ctx.message=pick(unit.mail,['threadId','messageId','subject','text','canReply']);
+    const thread=await execute('mail.get',{threadId:unit.mail.threadId,throughMessageId:unit.mail.messageId,limit:24});
+    ctx.history=(thread.messages??[]).filter(m=>m.id!==unit.mail.messageId && (m.trustedOwner||m.direction==='outbound')).slice(-12)
+      .map(m=>({id:m.id,text:m.text.slice(0,1800),sender:m.trustedOwner?'owner':'employee'}));
+  } else if (unit.kind === 'message') {
     ctx.conversation = pick(unit.conversation, ['id','title','type','members']);
     ctx.message = message(unit.message);
     ctx.history = (unit.history ?? []).slice(-16).map(row => ({ ...message(row), text:row.text.slice(0,2000) }));
@@ -108,6 +126,13 @@ async function contextFor(actor, unit, execute) {
         evidence:row.evidence?.slice(0,3).map(value => value.slice(0,500)) }));
     }
   }
+  if(unit.runtime) {
+    ctx.runtime=unit.runtime;
+    if(unit.kind!=='message'||ctx.message.senderId==='owner'||ctx.message.senderId===ctx.agent.managerId) {
+      try {const {file}=await execute('soul.get',{}); ctx.soul={version:file.version,text:file.text?.slice(0,4000)};}
+      catch(e) {if(![404,503].includes(e.status))throw e;}
+    }
+  }
   ctx.allowed = permitted(ctx);
   return ctx;
 }
@@ -120,8 +145,14 @@ function applyDecision({ unit, ctx, execute, browse, signal, requestId }, { op, 
     if (!ctx.allowed.includes(op)) return { error:'This action is outside the scope of this work.' };
     if (['reply','pass'].includes(op)) {
       if (unit.kind === 'message') await execute('deliveries.ack', { ...deliveryKey(unit), ...(op === 'reply' && { reply:input.text }) });
+      if(unit.kind==='mail') await execute('mail.finish',{deliveryId:unit.mail.id,token:unit.mail.token,...(op==='reply'&&{replyText:input.text})});
       return receipt({}, true);
     }
+    if((op==='browse'||op==='search') && unit.runtime) {
+      const runtime=await execute('settings.effective',{});
+      if(runtime.settings.networkAccess===false)return {error:'Public network access is disabled for this employee.'};
+    }
+    if(Object.hasOwn(capabilityFields,op)) return useCapability(op,input,{ctx,unit,execute,call,browse,signal});
     if (op === 'browse') {
       const page = await browse(input.url, { signal });
       return { url:page.url, title:String(page.title ?? '').slice(0,300), text:String(page.text ?? '').slice(0,4000) };
@@ -130,7 +161,7 @@ function applyDecision({ unit, ctx, execute, browse, signal, requestId }, { op, 
       const accountableId = input.accountableId || ctx.agent.id;
       const source = unit.delivery && unit.conversation.members.includes(accountableId)
         ? { conversationId:unit.conversation.id, messageId:unit.message.id } : undefined;
-      const created = await call(op, { ...input, accountableId, ...(source && {source}) });
+      const created = await call(op, { ...input, accountableId, ...(source && {source}),...(unit.mail?.trustedOwner && accountableId===ctx.agent.id && {sourceMail:{threadId:unit.mail.threadId,messageId:unit.mail.messageId}}) });
       return { goal:goal(created.goal) };
     }
     if (op === 'task.create' || op === 'employee.hire') {
@@ -140,7 +171,7 @@ function applyDecision({ unit, ctx, execute, browse, signal, requestId }, { op, 
         if (unit.kind === 'plan' && !input.goalId) return { error:'Specify the linked first task while planning a goal.' };
         if (input.title?.length > 320 || input.acceptance?.length > 4000) return { error:'The proposed first task exceeds its size limit.' };
         if (input.goalId) await execute('goal.get',{goalId:input.goalId});
-        person = employee((await call(op, { role:input.role })).employee);
+        person = employee((await call(op, pick(input,['role','projectId','allocationCents']))).employee);
         if (!input.goalId) return { employee:person };
       }
       const args = { goalId:input.goalId, assigneeId:person?.id ?? input.assigneeId,
@@ -183,7 +214,7 @@ function applyDecision({ unit, ctx, execute, browse, signal, requestId }, { op, 
     }
     if (op === 'goal.close') {
       if (!ctx.goal.taskCount || ctx.goal.taskCount !== ctx.verifiedTaskCount) return { error:'A submitted result and independent acceptance are required for each task.' };
-      return receipt({ goal:goal((await call(op,{goalId:unit.goal.id})).goal) },true);
+      return receipt({ goal:goal((await call(op,{goalId:unit.goal.id,...(input.requesterReply && {requesterReply:input.requesterReply})})).goal) },true);
     }
     const result = await call(op,{ ...input, taskId:unit.task.id, claimToken:unit.claimToken, ...(op === 'task.progress' && { release:true }) });
     return receipt({ taskId:result.task.id, status:result.task.status },true);
@@ -195,13 +226,13 @@ function deliveryKey(unit) {
 }
 
 export async function runCompanyPulse({ actor, execute:command, decide, browse, signal:parentSignal,
-  mode = 'bedrock', workerId = actor.id, now = Date.now }) {
+  mode = 'bedrock', workerId = actor.id, now = Date.now, onSettings=()=>{} }) {
   const deadline = AbortSignal.timeout(120_000);
   const signal = parentSignal ? AbortSignal.any([parentSignal,deadline]) : deadline;
   const execute = (op,input) => { signal.throwIfAborted(); return command(op,input,signal); };
   if (!['local','bedrock'].includes(mode)) throw new Error('Invalid company worker mode.');
   decide ??= mode === 'local' ? localCompanyDecision : companySdkDecision;
-  const unit = await choose(actor,execute,workerId,now);
+  const unit = await choose(actor,execute,workerId,now,onSettings);
   if (!unit) return 'idle';
   const id = unitId(actor.id,unit);
   const kind = ['plan','close'].includes(unit.kind) ? 'goal' : unit.kind;
@@ -212,12 +243,29 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
       if (unit.delivery) await execute('deliveries.stage', { ...deliveryKey(unit), plan:{ journalId:id } });
       const ctx = await contextFor(actor,unit,execute);
       let entry = unit.entry ?? (await execute('journal.get', { id })).entry;
-      for (let index = 0; index < maxSteps; index++) {
+      const limit=unit.runtime?.settings?.maxSteps??maxSteps;
+      for (let index = 0; index < limit; index++) {
         const prior = entry.steps[index];
         if (prior?.result) { if (prior.result.finished) return 'worked'; continue; }
         if (!prior) {
           const steps = entry.steps.map(step => ({ op:step.decision.op, input:step.decision.input, result:step.result }));
-          const choice = checkCompanyDecision(await decide({ ...ctx, steps, remainingDecisions:maxSteps-index },signal));
+          const modelContext={...ctx,steps,remainingDecisions:limit-index};
+          let choice;
+          if(mode==='bedrock') {
+            const key=digest(id,index,entry.failures);
+            const {settings,version}=unit.runtime??{};
+            if(!settings?.modelId)throw new Error('Missing model configuration.');
+            const permit=await execute('budget.model.begin',{requestId:key,modelId:settings.modelId,settingsVersion:version});
+            let usage;
+            try {
+              if(!permit.permitted) throw new Error('This paid attempt has already been issued.');
+              // Only the trusted transport reads these settings on untrusted inbound mail.
+              const options={settings:{modelId:settings.modelId,reasoningEffort:settings.reasoningEffort}};
+              choice=checkCompanyDecision(await decide(modelContext,signal,value=>{usage=value;},options));
+            } finally {
+              if(!permit.settled) await command('budget.model.finish',{requestId:key,...(usage && {usage})});
+            }
+          } else choice=checkCompanyDecision(await decide(modelContext,signal));
           entry = (await execute('journal.stage',{ id,index,decision:choice })).entry;
         }
         let result;
@@ -232,12 +280,27 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
         entry = (await execute('journal.confirm',{id,index,result})).entry;
         if (entry.steps[index].result.finished) return 'worked';
       }
+      if(unit.kind==='task' && ctx.task.workStep<12) {
+        // A task can exceed a per-pulse decision budget. Persist only bounded
+        // receipts; never copy file contents, email text or browser bodies.
+        const receipts=entry.steps.filter(s=>s.result&&!s.result.error).map(s=>{
+          const r=s.result;
+          return {op:s.decision.op,...(r.project?.id&&{project:r.project.id}),
+            ...(r.handoff?.sha&&{sha:r.handoff.sha,branch:r.handoff.branch,pr:r.handoff.pr?.url??r.handoff.pr?.number}),
+            ...pick(r,['projectId','commitSha','taskId','buildId','url','testsPassed','status']),
+            ...(r.session?.id&&{session:r.session.id}),...(r.file?.path&&{file:r.file.path,version:r.file.version})};
+        });
+        await execute('task.progress',{taskId:unit.task.id,claimToken:unit.claimToken,release:true,
+          note:('Completed actions: '+JSON.stringify(receipts)).slice(0,3000),requestId:digest(id,'checkpoint')});
+        return 'worked';
+      }
       throw new Error('Company decision step limit reached.');
     } catch (error) {
       if (!parentSignal?.aborted) {
         const { entry } = await command('journal.fail',{id,attemptId,kind:unit.kind,
-          workId:unit.message?.id ?? unit.task?.id ?? unit.goal.id});
-        if (unit.delivery) await command('deliveries.release',{ ...deliveryKey(unit), terminal:entry.failures >= 3 });
+          workId:unit.message?.id ?? unit.mail?.messageId ?? unit.task?.id ?? unit.goal.id});
+        if(unit.mail) await command('mail.release',{deliveryId:unit.mail.id,token:unit.mail.token});
+        else if (unit.delivery) await command('deliveries.release',{ ...deliveryKey(unit), terminal:entry.failures >= 3 });
         else if (unit.kind === 'task' && entry.failures >= 3) await command('task.block',{ taskId:unit.task.id,
           claimToken:unit.claimToken,note:'Execution could not complete after repeated attempts.',requestId:digest(id,'retry-limit') });
       }
@@ -249,15 +312,15 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
 
 export async function runCompanyResident({ actor, execute, workerId, browse, signal, now = Date.now,
   wait = (ms,s) => sleep(ms,undefined,{signal:s}), reportFailure = () => {} }) {
-  let heartbeat = 0, failures = 0;
+  let heartbeat = 0, failures = 0, idleMs=30_000;
   const startupDeadline = now() + 30_000;
   let bound = false;
   while (!signal.aborted) {
     let delay = 30_000;
     try {
-      const state = await runCompanyPulse({ actor,execute,workerId,browse,signal,now });
+      const state = await runCompanyPulse({ actor,execute,workerId,browse,signal,now,onSettings:runtime=>{if(runtime?.settings?.pulseSeconds)idleMs=runtime.settings.pulseSeconds*1000;} });
       bound = true;
-      delay = state === 'worked' ? 1000 : 30_000;
+      delay = state === 'worked' ? 1000 : idleMs;
       if (now() >= heartbeat) {
         const { active } = await execute('worker.heartbeat',{ summary:state,nextPulseAt:now()+delay },signal);
         if (!active) return;

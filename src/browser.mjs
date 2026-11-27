@@ -209,3 +209,55 @@ export async function browse(input, { signal: externalSignal, fixtureOrigin, ren
 export function makeBrowser({ fixtureOrigin, render } = {}) {
   return (url, { signal } = {}) => browse(url, { signal, fixtureOrigin, render });
 }
+
+// Interactive sessions mediate HTTP through the same public-address checks as
+// the document reader. Chromium never gets the broker's AWS or proxy headers.
+export async function validatePublicPage(raw,{origins,fixtureOrigin,signal=AbortSignal.timeout(5000)}={}) {
+  const url=validatedUrl(raw);
+  if(origins && !origins.includes(url.origin))throw Object.assign(new Error('Outside the browser profile origins.'),{status:403});
+  const address=await resolveAddress(url,signal,fixtureOrigin);
+  return {url,address};
+}
+
+export async function interactiveResource({raw,origins,method,headers={},body,fixtureOrigin,signal,site=false}) {
+  const {url,address}=await validatePublicPage(raw,{origins,fixtureOrigin,signal});
+  if(!['GET','HEAD','POST'].includes(method)||method==='POST'&&(!origins||url.protocol!=='https:')||body?.length>65536)
+    throw new Error('Unsupported browser request.');
+  const secure=url.protocol==='https:',host=url.hostname.replace(/^\[|\]$/g,'');
+  const proxy=url.origin!==fixtureOrigin && (process.env.PEROTTINO_BROWSER_PROXY_URL || (secure?process.env.HTTPS_PROXY:process.env.HTTP_PROXY));
+  const agent=proxy ? await proxyConnection(proxy,url,address,signal):false;
+  const out={Host:url.host,'Accept-Encoding':'identity','User-Agent':'Perottino-Interactive/1.0',Accept:headers.accept||'*/*'};
+  // The origin check is per request, including subresources/forms. Clean public
+  // sessions cannot forward cookies, tokens, or credentials from owner profiles.
+  for(const key of ['cookie','content-type','origin'])if(origins&&headers[key])out[key]=headers[key];
+  return new Promise((resolve,reject)=>{
+    const req=(secure?https:http).request({hostname:address,port:url.port||undefined,path:url.pathname+url.search,method,
+      headers:out,agent,signal,...(secure&&!isIP(host)&&{servername:host})},res=>{
+      const chunks=[];let length=0;
+      res.on('data',c=>{length+=c.length;if(length>1024*1024){res.destroy(new Error('Browser resource exceeds limit.'));return;}chunks.push(c);});
+      res.on('error',reject);
+      res.on('end',()=>{
+        const type=String(res.headers['content-type']||'application/octet-stream');
+        const filtered={'content-type':type,'referrer-policy':'no-referrer','x-content-type-options':'nosniff',
+          // Passive HTML/forms keep background scripts, WebRTC, service workers
+          // and unattended network activity out of a disconnected browser.
+          'content-security-policy':"default-src 'none'; img-src data: http: https:; style-src 'unsafe-inline' http: https:; script-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; frame-ancestors 'none'; sandbox allow-forms allow-same-origin"};
+        if(site) {
+          filtered['content-security-policy']="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; sandbox allow-scripts";
+          filtered['access-control-allow-origin']='*';
+        }
+        const location=res.headers.location;
+        if([301,302,303,307,308].includes(res.statusCode)&&location){
+          const target=validatedUrl(new URL(location,url).href).href;
+          // Chromium can bypass Playwright routing after an HTTP redirect. Keep
+          // the redirect explicit; clicking must go through the pinned fetcher.
+          const escaped=target.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;');
+          resolve({status:200,headers:{...filtered,'content-type':'text/html'},body:Buffer.from('<a href="'+escaped+'">Continue to redirected page</a>')});return;
+        }
+        if(origins&&secure&&res.headers['set-cookie'])filtered['set-cookie']=res.headers['set-cookie'].join('\n');
+        resolve({status:res.statusCode,headers:filtered,body:Buffer.concat(chunks)});
+      });
+    });
+    req.on('error',reject);req.end(body);
+  });
+}

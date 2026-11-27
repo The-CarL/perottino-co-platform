@@ -7,7 +7,7 @@ import { readBrowserDocument } from './renderer.mjs';
 const sessionSeconds = 90;
 
 export async function browserControl(region, browserIdentifier, { client: providedClient, connectCDP } = {}) {
-  const [{ BedrockAgentCoreClient, StartBrowserSessionCommand, StopBrowserSessionCommand },
+  const [{ BedrockAgentCoreClient, StartBrowserSessionCommand, StopBrowserSessionCommand, SaveBrowserSessionProfileCommand },
     { SignatureV4 }, { HttpRequest }, { Sha256 }, { chromium }] = await Promise.all([
     import('@aws-sdk/client-bedrock-agentcore'), import('@smithy/signature-v4'),
     import('@smithy/protocol-http'), import('@aws-crypto/sha256-js'), import('playwright-core'),
@@ -15,11 +15,13 @@ export async function browserControl(region, browserIdentifier, { client: provid
   const client = providedClient ?? new BedrockAgentCoreClient({ region, maxAttempts: 2 });
   const openCDP = connectCDP ?? ((endpoint, options) => chromium.connectOverCDP(endpoint, options));
   return {
-    async start(signal) {
-      const clientToken = randomUUID();
+    async start(signal,options={}) {
+      const clientToken = options.clientToken??randomUUID();
       const result = await client.send(new StartBrowserSessionCommand({
         browserIdentifier, name: 'perottino-' + clientToken, clientToken,
-        sessionTimeoutSeconds: sessionSeconds, viewPort: { width: 1280, height: 800 },
+        sessionTimeoutSeconds: options.timeoutSeconds??sessionSeconds,
+        ...(options.profileId&&{profileConfiguration:{profileIdentifier:options.profileId}}),
+        ...(options.guardNetwork&&{proxyConfiguration:{proxies:[{externalProxy:{server:'browser-requests.invalid',port:443}}]}}), viewPort: { width: 1280, height: 800 },
       }), { abortSignal: signal });
       return result.sessionId;
     },
@@ -34,6 +36,10 @@ export async function browserControl(region, browserIdentifier, { client: provid
       const signed = await signer.sign(new HttpRequest({ method: 'GET', protocol: 'wss:',
         hostname: host, path: route, headers: { host } }));
       return openCDP('wss://' + host + route, { headers: signed.headers, timeout: 8000 });
+    },
+    async save(sessionId,profileIdentifier,clientToken) {
+      await client.send(new SaveBrowserSessionProfileCommand({browserIdentifier,sessionId,profileIdentifier,clientToken}),
+        {abortSignal:AbortSignal.timeout(8000)});
     },
     async stop(sessionId) {
       await client.send(new StopBrowserSessionCommand({ browserIdentifier, sessionId }),

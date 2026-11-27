@@ -1,4 +1,5 @@
 import http from 'node:http';
+import {startBedrockRelay} from './bedrock-relay.mjs';
 import { spanAttributes, withSpan } from './telemetry.mjs';
 import { listenPrivateSocket, listenServer } from './private-socket.mjs';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -141,9 +142,12 @@ async function requestWorkerDecision(context, signal, endpoint, validate) {
 }
 
 const requestDecision = (context, signal) => requestWorkerDecision(context,signal,'/decision',checkDecision);
-export async function requestCompanyDecision(context, signal) {
+export async function requestCompanyDecision(context, signal,onUsage,options={}) {
   const { checkCompanyDecision } = await import('./company-decisions.mjs');
-  return requestWorkerDecision(context,signal,'/company-decision',checkCompanyDecision);
+  return requestWorkerDecision({...context,...(options.settings&&{transportSettings:options.settings})},signal,'/company-decision',body=>{
+    if(body.decision){if(body.usage)onUsage?.(body.usage);return checkCompanyDecision(body.decision);}
+    return checkCompanyDecision(body);
+  });
 }
 
 export function createTurnTools(job, browser, signal) {
@@ -212,7 +216,12 @@ export async function runTurn(job, { mode = process.env.PEROTTINO_AGENT_MODE || 
 export async function sdkDecision(context, signal, CodexImplementation, protocol = {
   instructions, schema: decisionSchema, validate: checkDecision,
 }) {
-  const model = process.env.PEROTTINO_BEDROCK_MODEL || 'us.openai.gpt-6-sol';
+  const configured=process.env.PEROTTINO_BEDROCK_MODEL||'us.openai.gpt-6-sol';
+  const model=protocol.settings?.modelId??configured;
+  const supported=new Set([configured,...(process.env.PEROTTINO_BEDROCK_MODELS||'').split(',').filter(Boolean)]);
+  if(!supported.has(model))throw new Error('Model is outside the allowed deployment configuration.');
+  const effort=protocol.settings?.reasoningEffort;
+  if(effort&&!['low','medium','high'].includes(effort))throw new Error('Invalid model effort.');
   return withSpan('model.decision', { model }, () => nativeDecision(context, signal, CodexImplementation, protocol, model));
 }
 
@@ -221,6 +230,7 @@ async function nativeDecision(context, signal, CodexImplementation, protocol, mo
   if (!/^(?:us|global)\.openai\.[a-z0-9.-]+$/.test(model)) throw new Error('Invalid Bedrock inference profile.');
   const Codex = CodexImplementation ?? (await import('@openai/codex-sdk')).Codex;
   const base = await mkdtemp(path.join(tmpdir(), 'perottino-codex-'));
+  let relay;
   try {
     const workspace = path.join(base, 'work');
     const codexHome = path.join(base, 'codex');
@@ -231,7 +241,7 @@ async function nativeDecision(context, signal, CodexImplementation, protocol, mo
     await writeFile(catalog, JSON.stringify({ models: [{
       slug: model, display_name: model, supported_in_api: true, visibility: 'list', priority: 1,
       base_instructions: 'Return the employee decision requested by the application.',
-      supported_reasoning_levels: [], support_verbosity: false, shell_type: 'disabled',
+      supported_reasoning_levels: protocol.settings ? ['low','medium','high'].map(effort=>({effort,description:effort})) : [], support_verbosity: false, shell_type: 'disabled',
       apply_patch_tool_type: null, experimental_supported_tools: [],
       truncation_policy: { mode: 'tokens', limit: 10_000 },
     }] }));
@@ -241,6 +251,7 @@ async function nativeDecision(context, signal, CodexImplementation, protocol, mo
       'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE', 'AWS_CONTAINER_AUTHORIZATION_TOKEN']) {
       if (process.env[key]) env[key] = process.env[key];
     }
+    if(protocol.metered) relay=await startBedrockRelay(region,signal,protocol.requestUpstream);
     const client = new Codex({
       env, config: {
         model_provider: 'amazon-bedrock-runtime', model, model_catalog_json: catalog,
@@ -248,7 +259,7 @@ async function nativeDecision(context, signal, CodexImplementation, protocol, mo
         // otherwise launches a filesystem helper that requires user namespaces.
         project_doc_max_bytes: 0,
         tools: { experimental_request_user_input: { enabled: false } },
-        model_providers: { 'amazon-bedrock-runtime': { aws: { region } } },
+        model_providers: { 'amazon-bedrock-runtime': { aws: { region }, ...(relay&&{base_url:relay.baseUrl,http_headers:{host:relay.hostname}}) } },
         default_permissions: 'decision',
         permissions: { decision: { network: { enabled: false } } },
         web_search: 'disabled', shell_environment_policy: { inherit: 'none' },
@@ -260,10 +271,11 @@ async function nativeDecision(context, signal, CodexImplementation, protocol, mo
       configOverrides: ['permissions.decision.filesystem={":root"="deny",":workspace_roots"="read"}'],
     });
     const thread = client.startThread({ workingDirectory: workspace, skipGitRepoCheck: true,
-      approvalPolicy: 'never', webSearchMode: 'disabled' });
+      approvalPolicy: 'never', webSearchMode: 'disabled', ...(protocol.settings?.reasoningEffort&&{modelReasoningEffort:protocol.settings.reasoningEffort}) });
     const result = await thread.run(protocol.instructions + '\n\n' + JSON.stringify(context),
       { outputSchema: protocol.schema, signal });
     const usage = result.usage;
+    if(usage) protocol.onUsage?.({input_tokens:usage.input_tokens,output_tokens:usage.output_tokens});
     spanAttributes({ inputTokens: usage?.input_tokens, outputTokens: usage?.output_tokens,
       cachedInputTokens: usage?.cached_input_tokens, reasoningOutputTokens: usage?.reasoning_output_tokens });
     let parsed;
@@ -274,6 +286,7 @@ async function nativeDecision(context, signal, CodexImplementation, protocol, mo
     }
     return protocol.validate(parsed);
   } finally {
+    await relay?.close();
     await rm(base, { recursive: true, force: true });
   }
 }
@@ -310,10 +323,14 @@ export function createDecisionServer(decide = sdkDecision, decideCompany) {
       const signal = AbortSignal.any([disconnect.signal, AbortSignal.timeout(60_000)]);
       let decision;
       if (company) {
-        if (!['message','plan','task','review','close'].includes(context?.kind) || !context.agent?.id ||
+        if (!['message','mail','plan','task','review','close'].includes(context?.kind) || !context.agent?.id ||
             !Array.isArray(context.allowed)) { res.writeHead(400).end(); return; }
         const { companySdkDecision, checkCompanyDecision } = await import('./company-decisions.mjs');
-        decision = checkCompanyDecision(await (decideCompany ?? companySdkDecision)(context,signal));
+        const settings=context.transportSettings;
+        delete context.transportSettings;
+        let usage;
+        decision = checkCompanyDecision(await (decideCompany ?? companySdkDecision)(context,signal,value=>{usage=value;},{settings}));
+        if(usage)decision={decision,usage};
       } else {
         if (typeof context?.message !== 'string') { res.writeHead(400).end(); return; }
         decision = checkDecision(await decide(context,signal));
