@@ -100,3 +100,14 @@ test('browser audit commits one metadata-only event per outcome, including disco
   assert.match(started.browserProfileId,/^bp-[0-9a-f]{32}$/);
   assert.equal(items.find(r=>r.kind==='browser.expired').actor,'system');
 });
+
+
+test('managed browser diagnostics keep signed headers and browsing details out of failure reasons',async()=>{
+  const {browserFailure}=await import('../src/interactive-browser.mjs');
+  for(const [stage,message,expected] of [
+    ['browser_connect','Unexpected server response: 403 secret-value','browser_connect_denied'],
+    ['browser_connect','EACCES: mkdir /sensitive','browser_connect_filesystem'],
+    ['browser_action','Only HTTP or HTTPS pages without embedded credentials are supported.','browser_page_origin'],
+    ['browser_action','private unexpected value','browser_action'],
+  ])assert.equal(browserFailure(stage,new Error(message)),expected);
+});

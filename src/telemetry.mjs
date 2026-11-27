@@ -20,6 +20,8 @@ const knownValues = new Set([
   'mail','pass','search','open','start','stop','read','write','list','get','save','forget','approve','revoke',
   'allocate','propose','build','preview','release','rollback','commit','attach','snapshot','provision','status',
   'navigate','download','screenshot','input','review','close','confirm','active','stopped','expired','granted','revoked',
+  'browser_connect','browser_connect_denied','browser_connect_http','browser_connect_network','browser_connect_filesystem',
+  'browser_connect_protocol','browser_context','browser_page_origin','browser_action_protocol','browser_action',
   'decision_format', 'decision_provider', 'store', 'store_retry', 'store_access', 'aborted', 'other',
   'empty_response', 'invalid_json', 'invalid_action', 'invalid_value', 'invalid_target', 'invalid_delay',
 ]);

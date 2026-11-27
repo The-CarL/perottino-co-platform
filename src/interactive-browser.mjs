@@ -4,6 +4,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {randomUUID} from 'node:crypto';
 import {browserControl} from './agentcore-browser.mjs';
+import {spanAttributes} from './telemetry.mjs';
 import {interactiveResource,validatePublicPage} from './browser.mjs';
 
 const viewport={width:1280,height:800};
@@ -76,14 +77,40 @@ async function operate(context,op,input,{origins,fixtureOrigin,deliveryOrigin}={
   }
 }
 
+export function browserFailure(stage,error) {
+  const message=String(error?.message ?? '');
+  if(stage==='browser_connect') {
+    if(/\b(?:401|403|AccessDenied|Forbidden)\b/i.test(message))return 'browser_connect_denied';
+    if(/\b(?:400|404|409|429|500|502|503|504)\b/.test(message))return 'browser_connect_http';
+    if(/ECONN|ENET|ENOTFOUND|ETIMEDOUT|timed? ?out|certificate/i.test(message))return 'browser_connect_network';
+    if(/EACCES|EPERM|EROFS|ENOENT|mkdtemp|EEXIST/i.test(message))return 'browser_connect_filesystem';
+    if(/Protocol error|Target closed|Target page|closed before|context is closed/i.test(message))return 'browser_connect_protocol';
+    return 'browser_connect';
+  }
+  if(stage==='browser_context')return 'browser_context';
+  if(/Only HTTP or HTTPS|Invalid URL|outside the browser profile|private address|non-public/i.test(message))return 'browser_page_origin';
+  if(/Protocol error|Target closed|Target page|closed before|timeout/i.test(message))return 'browser_action_protocol';
+  return 'browser_action';
+}
+
 export function agentCoreInteractiveBrowser({region=process.env.AWS_REGION||'us-east-1',browserIdentifier='aws.browser.v1',control=browserControl,deliveryOrigin}={}) {
   if(browserIdentifier!=='aws.browser.v1'||!/^[a-z]{2}(?:-[a-z]+)+-\d$/.test(region))throw new Error('Invalid public browser configuration.');
   async function service(fn){const api=await control(region,browserIdentifier);try{return await fn(api);}finally{api.close();}}
   async function act(sessionId,op,input,origins) {
     return service(async api=>{
-      const browser=await api.connect(sessionId);
-      try {const context=browser.contexts()[0];if(!context)throw new Error('Browser session unavailable.');return await operate(context,op,input,{origins,deliveryOrigin:await configured(deliveryOrigin)});}
-      finally{await browser.close();}
+      let stage='browser_connect',browser;
+      try {
+        browser=await api.connect(sessionId);
+        stage='browser_context';
+        const context=browser.contexts()[0];
+        if(!context)throw new Error('Browser session unavailable.');
+        stage='browser_action';
+        return await operate(context,op,input,{origins,deliveryOrigin:await configured(deliveryOrigin)});
+      } catch(error) {
+        // WebSocket exceptions may include the entire signed handshake. Export only fixed categories.
+        spanAttributes({reason:browserFailure(stage,error)});
+        throw error;
+      } finally {if(browser)await browser.close();}
     });
   }
   return {validate:async(url,origins)=>check(url,origins,undefined,await configured(deliveryOrigin)),action:act,
