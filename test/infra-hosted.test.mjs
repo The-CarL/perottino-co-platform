@@ -169,16 +169,10 @@ test('the owner, employees and trusted control code have disjoint entry points a
     assert.equal(invoke.length, 1);
     assert.ok(invoke[0].Resource.endsWith('-r-' + suffix));
     assert.ok(!actions(r, id).some(a => /^(ecs:|iam:PassRole)/.test(a)));
-    const ddb = grants(r, id).filter(g => Array.isArray(g.Action) && g.Action.some(a => a.startsWith('dynamodb:')));
-    assert.ok(ddb.length > 0);
-    for (const permission of ddb) {
-      const keys = permission.Condition['ForAllValues:StringLike']['dynamodb:LeadingKeys'];
-      assert.ok(!keys.some(key => key === '*' || key.startsWith('FACTORY')));
-      if (permission.Action.includes('dynamodb:UpdateItem')) assert.deepEqual(keys, ['AGENT#*']);
-    }
+    assert.ok(!actions(r, id).some(action => action.startsWith('dynamodb:')));
   }
   const gate = id => grants(r, id).find(s => s.Condition?.['ForAllValues:StringLike']?.['dynamodb:LeadingKeys']?.includes('COMPANY#GATE'));
-  assert.deepEqual(gate('WorkerRole').Action, ['dynamodb:ConditionCheckItem']);
+  assert.equal(gate('WorkerRole'), undefined);
   assert.equal(gate('WebRole'), undefined);
   assert.ok(gate('FactoryRole').Action.includes('dynamodb:PutItem'));
   const factory = grants(r, 'FactoryRole');
@@ -194,4 +188,34 @@ test('the owner, employees and trusted control code have disjoint entry points a
     { Effect: 'Allow', Action: 'bedrock:InvokeModel', Resource: 'arn:aws:bedrock:us-east-1:111111111111:project/default',
       Condition: { ArnEquals: { 'bedrock:ModelArn': 'arn:aws:bedrock:us-east-1:111111111111:inference-profile/us.openai.gpt-6-sol' } } },
   ]);
+});
+
+test('only trusted broker endpoints get company storage while every application role can emit scoped telemetry', t => {
+  const r = render(t, { ...sample(), traceSampleRate: 0.1 }).template.Resources;
+  const variable = id => props(r, id).Environment.Variables;
+  const worker = Object.fromEntries(props(r, 'WorkerTask').ContainerDefinitions[0].Environment.map(v => [v.Name, v.Value]));
+  for (const [env, service] of [[worker, 'resident'], [variable('WebFn'), 'api'], [variable('FactoryFn'), 'factory'],
+    [variable('ManagerFn'), 'factory'], [variable('OwnerFn'), 'factory']]) {
+    assert.equal(env.PEROTTINO_SERVICE, service);
+    assert.equal(env.PEROTTINO_TELEMETRY, 'aws');
+    assert.equal(env.PEROTTINO_FOUNDATIONS, '1');
+    assert.equal(env.PEROTTINO_TRACE_SAMPLE_RATE, '0.1');
+    assert.match(env.PEROTTINO_SCOPE, /-example$/);
+    assert.equal(env.PEROTTINO_RELEASE, fixture('example-provenance.json').tags['factory:last-source-commit']);
+  }
+  assert.equal(worker.PEROTTINO_STATE_TABLE, undefined);
+  assert.equal(variable('WebFn').PEROTTINO_STATE_TABLE, undefined);
+  assert.deepEqual(variable('ManagerFn').PEROTTINO_STATE_TABLE, {Ref:'State'});
+  const brokerKeys = grants(r,'FactoryRole').flatMap(g => g.Condition?.['ForAllValues:StringLike']?.['dynamodb:LeadingKeys'] ?? []);
+  assert.ok(brokerKeys.includes('V2#*') && !brokerKeys.includes('*'));
+  for (const id of ['WorkerRole','WebRole','FactoryRole']) {
+    assert.deepEqual(grants(r,id).filter(g => String(g.Action).includes('xray:')),
+      [{Effect:'Allow',Action:'xray:PutTraceSegments',Resource:'*'}]);
+  }
+  assert.ok(!actions(r, 'ExecutionRole').some(a => a.startsWith('xray:')));
+  const log = JSON.parse(props(r,'Stage').AccessLogSettings.Format);
+  assert.deepEqual(Object.keys(log).sort(), ['latencyMs','requestId','route','status']);
+  assert.equal(props(r,'CompanyDashboard').DashboardName.endsWith('us-east-1-operations'),true);
+  assert.equal(props(r,'ResidentFailureAlarm').TreatMissingData,'notBreaching');
+  assert.throws(() => render(t, {...sample(), traceSampleRate:2}), /traceSampleRate/);
 });

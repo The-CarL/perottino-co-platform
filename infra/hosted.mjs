@@ -4,7 +4,7 @@ import { isValidEmployeeLimit, maxCompanyEmployees } from '../src/headcount.mjs'
 
 const taggedIds = ['Hosted', 'State', 'Logs', 'WorkerSecurityGroup', 'Cluster', 'WorkerTask', 'ExecutionRole',
   'WorkerRole', 'WebRole', 'FactoryRole', 'WebFn', 'FactoryFn', 'OwnerFn', 'ManagerFn',
-  'RepairRule', 'StoppedWork', 'HttpApi', 'Stage', 'Domain'];
+  'RepairRule', 'StoppedWork', 'HttpApi', 'Stage', 'Domain', 'ResidentFailureAlarm'];
 
 const workerSizes = { small: ['256', '1024'], medium: ['512', '1024'], large: ['1024', '2048'] };
 
@@ -58,6 +58,10 @@ export function synthHosted(config, provenance, outdir) {
   const scope = tags.Hosted['factory:s'];
   const prefix = 'factory-' + scope + '-r-';
   requireField(prefix.length + 1 <= 64, 'project scope exceeds the Lambda function-name limit');
+  const sampleRate = config.traceSampleRate ?? 1;
+  requireField(Number.isFinite(sampleRate) && sampleRate >= 0 && sampleRate <= 1, 'traceSampleRate between 0 and 1');
+  const telemetryEnv = { PEROTTINO_FOUNDATIONS: '1', PEROTTINO_TELEMETRY: 'aws', PEROTTINO_SCOPE: scope,
+    PEROTTINO_RELEASE: tags.Hosted['factory:last-source-commit'], PEROTTINO_TRACE_SAMPLE_RATE: String(sampleRate) };
   const { account, region } = config;
   const app = new App({ outdir, autoSynth: false, analyticsReporting: false, treeMetadata: false });
   const stack = new Stack(app, 'Hosted', { stackName: prefix + 'events', env: { account, region }, terminationProtection: true,
@@ -107,9 +111,9 @@ export function synthHosted(config, provenance, outdir) {
   const scopedItems = (actions, keys) => ({ ...allow(actions, arn(state)), Condition: {
     'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': keys }, Null: { 'dynamodb:LeadingKeys': 'false' },
   } });
-  const employeeState = [scopedItems([...read, 'dynamodb:ConditionCheckItem'], ['DIRECTORY']),
-    scopedItems(write, ['AGENT#*'])];
-  const workerRole = role('WorkerRole', ecs, [...employeeState, scopedItems(['dynamodb:ConditionCheckItem'], ['COMPANY#GATE']),
+  // X-Ray's ingestion API authorizes only Resource '*'. No app role needs trace read or administration.
+  const traceWrite = allow('xray:PutTraceSegments', '*');
+  const workerRole = role('WorkerRole', ecs, [traceWrite,
     allow('lambda:InvokeFunction', functionArn('m')),
     allow(['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], config.bedrockResourceArns),
     { ...allow('bedrock:InvokeModel', 'arn:aws:bedrock:' + region + ':' + account + ':project/default'),
@@ -122,7 +126,7 @@ export function synthHosted(config, provenance, outdir) {
     TaskRoleArn: arn(workerRole), ExecutionRoleArn: arn(executionRole), ContainerDefinitions: [{
       Name: 'worker', Image: config.workerImage, User: '1000:1000', Command: ['node', 'src/resident.mjs'],
       Essential: true, StopTimeout: 30, LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: ['ALL'] } },
-      Environment: Object.entries({ NODE_ENV: 'production', PEROTTINO_RESIDENT: '1', PEROTTINO_COMPANY_GATE: '1', PEROTTINO_STATE_TABLE: state.ref,
+      Environment: Object.entries({ NODE_ENV: 'production', ...telemetryEnv, PEROTTINO_SERVICE: 'resident', PEROTTINO_RESIDENT: '1', PEROTTINO_COMPANY_GATE: '1',
         PEROTTINO_FACTORY_MANAGER_ARN: functionArn('m'), PEROTTINO_BEDROCK_MODEL: config.bedrockModel,
         PEROTTINO_BROWSER_ID: 'aws.browser.v1' }).map(([Name, Value]) => ({ Name, Value })),
       LogConfiguration: { LogDriver: 'awslogs', Options: { 'awslogs-region': region, 'awslogs-group': logs.ref, 'awslogs-stream-prefix': 'employee' } },
@@ -131,17 +135,17 @@ export function synthHosted(config, provenance, outdir) {
     return resource(id, 'Lambda::Function', { FunctionName: prefix + suffix, PackageType: 'Image', Architectures: ['x86_64'],
       Code: { ImageUri: config.lambdaImage }, ImageConfig: { Command: [handler] }, Role: arn(functionRole), Timeout: timeout,
       MemorySize: 512, LoggingConfig: { LogGroup: logs.ref, LogFormat: 'JSON' },
-      Environment: { Variables: { NODE_ENV: 'production', ...variables } } });
+      Environment: { Variables: { NODE_ENV: 'production', ...telemetryEnv, PEROTTINO_SERVICE: suffix === 'a' ? 'api' : 'factory', ...variables } } });
   }
 
-  const webRole = role('WebRole', lambda, [logWrite, ...employeeState, allow('lambda:InvokeFunction', functionArn('o')),
+  const webRole = role('WebRole', lambda, [logWrite, traceWrite, allow('lambda:InvokeFunction', functionArn('o')),
     { ...allow('secretsmanager:GetSecretValue', config.ownerSecretArn), Condition: scopeTags('owner-verifier') }]);
-  const web = fn('WebFn', 'a', 'src/cloud-api.handler', webRole, { PEROTTINO_STATE_TABLE: state.ref, PEROTTINO_RESIDENT: '1',
+  const web = fn('WebFn', 'a', 'src/cloud-api.handler', webRole, { PEROTTINO_RESIDENT: '1',
     PEROTTINO_OWNER_SECRET_ARN: config.ownerSecretArn, PUBLIC_ORIGIN: publicOrigin, PEROTTINO_FACTORY_OWNER_ARN: functionArn('o') }, 28);
 
   const taskArnPattern = ecsArn + 'task/' + clusterName + '/*';
   const sameCluster = { ArnEquals: { 'ecs:cluster': arn(cluster) } };
-  const factoryRole = role('FactoryRole', lambda, [logWrite, scopedItems(write, ['DIRECTORY', 'AGENT#*', 'FACTORY#*']),
+  const factoryRole = role('FactoryRole', lambda, [logWrite, traceWrite, scopedItems(write, ['DIRECTORY', 'AGENT#*', 'FACTORY#*', 'V2#*']),
     scopedItems(['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:ConditionCheckItem'], ['COMPANY#GATE']),
     { ...allow('ecs:RunTask', workerTask.ref), Condition: sameCluster },
     { ...allow('ecs:ListTasks', '*'), Condition: sameCluster },
@@ -188,6 +192,9 @@ export function synthHosted(config, provenance, outdir) {
     IntegrationUri: arn(web), PayloadFormatVersion: '2.0', TimeoutInMillis: 29000 });
   resource('DefaultRoute', 'ApiGatewayV2::Route', { ApiId: api.ref, RouteKey: '$default', Target: 'integrations/' + integration.ref });
   const stage = resource('Stage', 'ApiGatewayV2::Stage', { ApiId: api.ref, StageName: '$default', AutoDeploy: true,
+    AccessLogSettings: { DestinationArn: arn(logs), Format: JSON.stringify({
+      requestId: '$context.requestId', route: '$context.routeKey', status: '$context.status', latencyMs: '$context.responseLatency',
+    }) },
     DefaultRouteSettings: { ThrottlingRateLimit: 20, ThrottlingBurstLimit: 40 } }, true);
   resource('ApiInvoke', 'Lambda::Permission', { FunctionName: arn(web), Action: 'lambda:InvokeFunction', Principal: 'apigateway.amazonaws.com',
     SourceAccount: account, SourceArn: 'arn:aws:execute-api:' + region + ':' + account + ':' + api.ref + '/*' });
@@ -202,6 +209,28 @@ export function synthHosted(config, provenance, outdir) {
     new CfnOutput(stack, 'RegionalDnsName', { value: dnsName });
     new CfnOutput(stack, 'RegionalDnsZone', { value: zone });
   }
+  const metricNamespace = 'Perottino/Company';
+  const metric = (name, service) => [metricNamespace, name, 'scope', scope, 'service', service];
+  const widget = (title, x, y, metrics) => ({ type: 'metric', x, y, width: 12, height: 6,
+    properties: { title, region, period: 300, stat: 'Sum', metrics } });
+  const dashboard = resource('CompanyDashboard', 'CloudWatch::Dashboard', {
+    DashboardName: prefix + region + '-operations',
+    DashboardBody: JSON.stringify({ widgets: [
+      widget('Application failures', 0, 0, ['resident', 'api', 'factory'].map(service => metric('Failures', service))),
+      widget('Model usage reported by the worker', 12, 0, ['inputTokens', 'outputTokens', 'cachedInputTokens'].map(field => metric(field, 'resident'))),
+      widget('Owner API errors', 0, 6, ['4xx', '5xx'].map(name => ['AWS/ApiGateway', name, 'ApiId', api.ref])),
+      widget('Function errors', 12, 6, [web, factory, owner, manager].map(fn => ['AWS/Lambda', 'Errors', 'FunctionName', fn.ref])),
+    ] }),
+  });
+  const alarm = resource('ResidentFailureAlarm', 'CloudWatch::Alarm', {
+    AlarmDescription: 'Three or more failed resident operations in five minutes. Inspect the project logs and traces.',
+    Namespace: metricNamespace, MetricName: 'Failures',
+    Dimensions: [{ Name: 'scope', Value: scope }, { Name: 'service', Value: 'resident' }],
+    Statistic: 'Sum', Period: 300, EvaluationPeriods: 1, Threshold: 3,
+    ComparisonOperator: 'GreaterThanOrEqualToThreshold', TreatMissingData: 'notBreaching',
+  });
+  new CfnOutput(stack, 'OperationsDashboard', { value: dashboard.ref });
+  new CfnOutput(stack, 'ResidentFailureAlarmName', { value: alarm.ref });
   for (const [id, value] of Object.entries({ Url: publicOrigin + '/chat', StateTableName: state.ref, ClusterName: cluster.ref,
     FactoryArn: arn(factory), OwnerFactoryArn: arn(owner) })) new CfnOutput(stack, id, { value });
   return app.synth().getStackArtifact(stack.artifactId);

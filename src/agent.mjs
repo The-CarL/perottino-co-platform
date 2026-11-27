@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { spanAttributes, withSpan } from './telemetry.mjs';
 import { listenPrivateSocket, listenServer } from './private-socket.mjs';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
@@ -206,6 +207,10 @@ export async function sdkDecision(context, signal, CodexImplementation, protocol
   instructions, schema: decisionSchema, validate: checkDecision,
 }) {
   const model = process.env.PEROTTINO_BEDROCK_MODEL || 'us.openai.gpt-6-sol';
+  return withSpan('model.decision', { model }, () => nativeDecision(context, signal, CodexImplementation, protocol, model));
+}
+
+async function nativeDecision(context, signal, CodexImplementation, protocol, model) {
   const region = process.env.AWS_REGION || 'us-east-1';
   if (!/^(?:us|global)\.openai\.[a-z0-9.-]+$/.test(model)) throw new Error('Invalid Bedrock inference profile.');
   const Codex = CodexImplementation ?? (await import('@openai/codex-sdk')).Codex;
@@ -252,7 +257,16 @@ export async function sdkDecision(context, signal, CodexImplementation, protocol
       approvalPolicy: 'never', webSearchMode: 'disabled' });
     const result = await thread.run(protocol.instructions + '\n\n' + JSON.stringify(context),
       { outputSchema: protocol.schema, signal });
-    return protocol.validate(JSON.parse(result.finalResponse));
+    const usage = result.usage;
+    spanAttributes({ inputTokens: usage?.input_tokens, outputTokens: usage?.output_tokens,
+      cachedInputTokens: usage?.cached_input_tokens, reasoningOutputTokens: usage?.reasoning_output_tokens });
+    let parsed;
+    try { parsed = JSON.parse(result.finalResponse); }
+    catch (error) {
+      spanAttributes({ reason: result.finalResponse?.trim() ? 'invalid_json' : 'empty_response' });
+      throw error;
+    }
+    return protocol.validate(parsed);
   } finally {
     await rm(base, { recursive: true, force: true });
   }

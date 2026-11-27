@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { makeBrowser } from './browser.mjs';
+import { withSpan } from './telemetry.mjs';
 import { readBrowserDocument } from './renderer.mjs';
 
 const sessionSeconds = 90;
@@ -71,5 +72,6 @@ export function makeAgentCoreBrowser({
       } finally { service.close(); }
     }
   }
-  return makeBrowser({ render, fixtureOrigin });
+  const browse = makeBrowser({ render, fixtureOrigin });
+  return (url, options) => withSpan('browser.read', {}, () => browse(url, options));
 }
