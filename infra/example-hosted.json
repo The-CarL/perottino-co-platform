@@ -14,5 +14,6 @@
   "workerImage": "111111111111.dkr.ecr.us-east-1.amazonaws.com/example-company@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "publicSubnetIds": [
     "subnet-abcdef01234567890"
-  ]
+  ],
+  "employeeLimit": 2
 }

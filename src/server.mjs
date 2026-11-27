@@ -9,7 +9,7 @@ import { makeBrowser } from './browser.mjs';
 import { createStore } from './store.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-function createWorker(store, runner, browser, turnTimeoutMs) {
+function createWorker(store, runner, browser, turnTimeoutMs, mode) {
   const active = new Map();
   let stopping = false;
   async function work(job, controller) {
@@ -21,14 +21,40 @@ function createWorker(store, runner, browser, turnTimeoutMs) {
       else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
     });
     try {
-      const reply = await Promise.race([runner({
-        agent: job.agent, message: job.message, history: job.history, memories: job.memories, remember, recall,
-        browse, signal
-      }), aborted]);
+      let blocked = false;
+      async function execute() {
+        const text = job.message.text.trim();
+        const hire = /^hire[ \t]+([^\r\n]{1,120})(?:\r?\n([\s\S]+))?$/i.exec(text);
+        if (mode === 'local' && hire) {
+          if (!store.employee(job.agent.id).canHire) { blocked = true; return 'I do not have hiring authority.'; }
+          try {
+            const report = store.hireForTurn(job, hire[1], hire[2]?.trim());
+            return 'I hired ' + report.name + ' (@' + report.handle + ') as ' + report.role + '.';
+          } catch (error) {
+            if (error.code !== 'EMPLOYEE_LIMIT') throw error;
+            blocked = true;
+            return 'The company has reached its employee limit.';
+          }
+        }
+        if (mode === 'local' && job.goalId) {
+          const command = /^(remember|recall|browse)(?:\s+([\s\S]+))?$/i.exec(text);
+          if (!command || (!command[2]?.trim() && command[1].toLowerCase() !== 'recall')) {
+            blocked = true;
+            return 'This goal needs the hosted decision worker. The local worker can remember a note, recall matching notes, read a public URL, or hire through an authorized manager.';
+          }
+          if (command[1].toLowerCase() === 'browse') {
+            const page = await browse(command[2].trim());
+            return [page.title, page.url, page.text].filter(Boolean).join('\n\n').slice(0, 16000);
+          }
+        }
+        return runner({ agent: job.agent, message: job.message, history: job.history, memories: job.memories,
+          remember, recall, browse, signal });
+      }
+      const reply = await Promise.race([execute(), aborted]);
       signal.throwIfAborted();
       if (typeof reply !== 'string' || !reply.trim()) throw new Error('Empty reply.');
       try {
-        store.complete(job, reply.trim(), pending);
+        store.complete(job, reply.trim(), pending, blocked);
       } catch {
         // A transient disk error leaves the durable lease recoverable. Replaying
         // the transaction can never expose a partial reply or partial notes.
@@ -37,8 +63,7 @@ function createWorker(store, runner, browser, turnTimeoutMs) {
     } catch {
       try {
         if (stopping) store.release(job);
-        else {
-          store.fail(job);
+        else if (store.fail(job)) {
           console.error('Turn failed:', job.agent.id, job.message.id, signal.aborted ? 'timeout' : 'execution error');
         }
       } catch {
@@ -60,14 +85,16 @@ function createWorker(store, runner, browser, turnTimeoutMs) {
         const controller = new AbortController();
         // Register before starting the runner, including for synchronous failures.
         const done = Promise.resolve().then(() => work(job, controller));
-        active.set(job.token, { controller, done });
+        active.set(job.token, { controller, done, agentId: job.agent.id });
       }
     } catch { console.error('Could not claim queued work. The dispatcher will retry.'); }
   }
   const poll = setInterval(wake, 1000);
   poll.unref();
   setImmediate(wake);
-  return { wake, async stop() {
+  return { wake, suspend(agentId) {
+    for (const job of active.values()) if (job.agentId === agentId) job.controller.abort(new Error('Employment state changed.'));
+  }, async stop() {
     stopping = true;
     clearInterval(poll);
     const jobs = [...active.values()];
@@ -84,8 +111,14 @@ export function createApp({ dataDir, username, passwordHash, publicOrigin, runne
   if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs <= 0) throw new Error('Invalid turn timeout.');
   const auth = createOwnerAuth({ username, passwordHash, publicOrigin });
   const store = createStore(dataDir);
-  const worker = createWorker(store, runner, browser, turnTimeoutMs);
-  const server = createServer(createConsoleHandler({ store, auth, publicDir, mode, onEnqueued: worker.wake }));
+  const worker = createWorker(store, runner, browser, turnTimeoutMs, mode);
+  const ownerControl = action => {
+    const result = store.setEmployeeState(action);
+    if (result.ok && result.employee.desiredState !== 'active') worker.suspend(action.agentId);
+    if (result.ok && result.employee.desiredState === 'active') setImmediate(worker.wake);
+    return result;
+  };
+  const server = createServer(createConsoleHandler({ store, auth, publicDir, mode, onEnqueued: worker.wake, ownerControl }));
   server.headersTimeout = 15000;
   server.requestTimeout = 30000;
   let closing;

@@ -1,10 +1,9 @@
 import { App, CfnOutput, CfnResource, LegacyStackSynthesizer, RemovalPolicy, Stack } from 'aws-cdk-lib';
 import { resourceTags } from './foundation.mjs';
-import { turnWorkflow } from './workflow.mjs';
 
-const taggedIds = ['Hosted', 'State', 'Failures', 'Logs', 'WorkerSecurityGroup', 'Cluster', 'WorkerTask',
-  'ExecutionRole', 'WorkerRole', 'WebRole', 'DispatchRole', 'AdmissionRole', 'TerminalRole', 'WorkflowRole',
-  'WebFn', 'DispatchFn', 'AdmissionFn', 'TerminalFn', 'Workflow', 'StreamMapping', 'HttpApi', 'Stage', 'Domain', 'RecoveryQueue', 'StoppedWork'];
+const taggedIds = ['Hosted', 'State', 'Logs', 'WorkerSecurityGroup', 'Cluster', 'WorkerTask', 'ExecutionRole',
+  'WorkerRole', 'WebRole', 'FactoryRole', 'WebFn', 'FactoryFn', 'OwnerFn', 'ManagerFn',
+  'RepairRule', 'StoppedWork', 'HttpApi', 'Stage', 'Domain'];
 
 const workerSizes = { small: ['256', '1024'], medium: ['512', '1024'], large: ['1024', '2048'] };
 
@@ -14,6 +13,8 @@ function requireField(condition, key) {
 
 function validate(c) {
   const { account, region, ownerSecretArn, bedrockModel } = c;
+  const employeeLimit = c.employeeLimit ?? 2;
+  requireField(Number.isInteger(employeeLimit) && employeeLimit >= 1 && employeeLimit <= 30, 'employeeLimit (1 to 30)');
   requireField(Object.hasOwn(workerSizes, c.workerSize ?? 'small'), 'workerSize (small, medium, large)');
   requireField(typeof account === 'string' && /^\d{12}$/.test(account), 'account');
   requireField(/^(us|eu|ap|sa|ca|me|af|il|mx)-[a-z]+-\d+$/.test(region), 'commercial AWS region');
@@ -59,11 +60,11 @@ export function synthHosted(config, provenance, outdir) {
   const { account, region } = config;
   const app = new App({ outdir, autoSynth: false, analyticsReporting: false, treeMetadata: false });
   const stack = new Stack(app, 'Hosted', { stackName: prefix + 'events', env: { account, region }, terminationProtection: true,
-    synthesizer: new LegacyStackSynthesizer(), description: 'HTTPS owner console, persistent message queue and on-demand employee turns' });
+    synthesizer: new LegacyStackSynthesizer(), description: 'HTTPS owner console, bounded recruiting and resident employee tasks' });
   for (const [key, value] of Object.entries(tags.Hosted)) stack.tags.setTag(key, value);
   function resource(id, type, properties, tagMap = false) {
     if (tags[id]) properties.Tags = tagMap ? tags[id] : Object.entries(tags[id]).map(([Key, Value]) => ({ Key, Value }));
-    return new CfnResource(stack, id, { type: 'AWS::' + type, properties });
+    return new CfnResource(stack, id, { type: type.startsWith('Custom::') ? type : 'AWS::' + type, properties });
   }
   const arn = item => item.getAtt('Arn').toString();
   const retain = item => { item.applyRemovalPolicy(RemovalPolicy.RETAIN); return item; };
@@ -73,20 +74,10 @@ export function synthHosted(config, provenance, outdir) {
     BillingMode: 'PAY_PER_REQUEST', DeletionProtectionEnabled: true, PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true },
     AttributeDefinitions: ['pk', 'sk'].map(AttributeName => ({ AttributeName, AttributeType: 'S' })),
     KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' }, { AttributeName: 'sk', KeyType: 'RANGE' }],
-    StreamSpecification: { StreamViewType: 'NEW_IMAGE' },
   }));
-  const failures = retain(resource('Failures', 'S3::Bucket', {
-    BucketEncryption: { ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: 'AES256' } }] },
-    OwnershipControls: { Rules: [{ ObjectOwnership: 'BucketOwnerEnforced' }] }, VersioningConfiguration: { Status: 'Enabled' },
-    PublicAccessBlockConfiguration: { BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: true, RestrictPublicBuckets: true },
-  }));
-  retain(resource('FailurePolicy', 'S3::BucketPolicy', { Bucket: failures.ref, PolicyDocument: { Version: '2012-10-17', Statement: [
-    { Effect: 'Deny', Principal: '*', Action: 's3:*', Resource: [arn(failures), arn(failures) + '/*'],
-      Condition: { Bool: { 'aws:SecureTransport': 'false' } } },
-  ] } }));
   const logs = retain(resource('Logs', 'Logs::LogGroup', { LogGroupName: '/factory/' + scope + '/events', RetentionInDays: 14 }));
   const sg = resource('WorkerSecurityGroup', 'EC2::SecurityGroup', { GroupDescription: 'Outbound HTTPS from employee tasks',
-    VpcId: config.vpcId, SecurityGroupEgress: [{ IpProtocol: 'tcp', FromPort: 443, ToPort: 443, CidrIp: '0.0.0.0/0' }] });
+    VpcId: config.vpcId, SecurityGroupEgress: [80, 443].map(port => ({ IpProtocol: 'tcp', FromPort: port, ToPort: port, CidrIp: '0.0.0.0/0' })) });
   const clusterName = prefix + 'employees';
   const cluster = resource('Cluster', 'ECS::Cluster', { ClusterName: clusterName });
   const api = resource('HttpApi', 'ApiGatewayV2::Api', { Name: prefix + 'owner', ProtocolType: 'HTTP',
@@ -109,7 +100,16 @@ export function synthHosted(config, provenance, outdir) {
   const executionRole = role('ExecutionRole', ecs, [logWrite, allow('ecr:GetAuthorizationToken', '*'),
     { ...allow(['ecr:BatchCheckLayerAvailability', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchGetImage'], repo),
       Condition: scopeTags('runtime-images') }], ecsArn + '*');
-  const workerRole = role('WorkerRole', ecs, [allow(write, arn(state)),
+  // Build these two ARNs by the deterministic Lambda name to avoid an IAM/RunTask
+  // reference cycle. Each caller may invoke only its own entry point.
+  const functionArn = suffix => 'arn:aws:lambda:' + region + ':' + account + ':function:' + prefix + suffix;
+  const scopedItems = (actions, keys) => ({ ...allow(actions, arn(state)), Condition: {
+    'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': keys }, Null: { 'dynamodb:LeadingKeys': 'false' },
+  } });
+  const employeeState = [scopedItems([...read, 'dynamodb:ConditionCheckItem'], ['DIRECTORY']),
+    scopedItems(write, ['AGENT#*'])];
+  const workerRole = role('WorkerRole', ecs, [...employeeState, scopedItems(['dynamodb:ConditionCheckItem'], ['COMPANY#GATE']),
+    allow('lambda:InvokeFunction', functionArn('m')),
     allow(['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], config.bedrockResourceArns),
     allow(['bedrock-agentcore:StartBrowserSession', 'bedrock-agentcore:StopBrowserSession',
       'bedrock-agentcore:ConnectBrowserAutomationStream'], browser)], ecsArn + '*');
@@ -117,9 +117,10 @@ export function synthHosted(config, provenance, outdir) {
   const workerTask = resource('WorkerTask', 'ECS::TaskDefinition', { Family: prefix + 'worker', NetworkMode: 'awsvpc',
     RequiresCompatibilities: ['FARGATE'], Cpu: cpu, Memory: memory, RuntimePlatform: { OperatingSystemFamily: 'LINUX', CpuArchitecture: 'X86_64' },
     TaskRoleArn: arn(workerRole), ExecutionRoleArn: arn(executionRole), ContainerDefinitions: [{
-      Name: 'worker', Image: config.workerImage, User: '1000:1000', Command: ['node', 'src/cloud-worker.mjs'],
+      Name: 'worker', Image: config.workerImage, User: '1000:1000', Command: ['node', 'src/resident.mjs'],
       Essential: true, StopTimeout: 30, LinuxParameters: { InitProcessEnabled: true, Capabilities: { Drop: ['ALL'] } },
-      Environment: Object.entries({ NODE_ENV: 'production', PEROTTINO_STATE_TABLE: state.ref, PEROTTINO_BEDROCK_MODEL: config.bedrockModel,
+      Environment: Object.entries({ NODE_ENV: 'production', PEROTTINO_RESIDENT: '1', PEROTTINO_COMPANY_GATE: '1', PEROTTINO_STATE_TABLE: state.ref,
+        PEROTTINO_FACTORY_MANAGER_ARN: functionArn('m'), PEROTTINO_BEDROCK_MODEL: config.bedrockModel,
         PEROTTINO_BROWSER_ID: 'aws.browser.v1' }).map(([Name, Value]) => ({ Name, Value })),
       LogConfiguration: { LogDriver: 'awslogs', Options: { 'awslogs-region': region, 'awslogs-group': logs.ref, 'awslogs-stream-prefix': 'employee' } },
     }] });
@@ -130,61 +131,56 @@ export function synthHosted(config, provenance, outdir) {
       Environment: { Variables: { NODE_ENV: 'production', ...variables } } });
   }
 
-  const webRole = role('WebRole', lambda, [logWrite, allow(write, arn(state)),
+  const webRole = role('WebRole', lambda, [logWrite, ...employeeState, allow('lambda:InvokeFunction', functionArn('o')),
     { ...allow('secretsmanager:GetSecretValue', config.ownerSecretArn), Condition: scopeTags('owner-verifier') }]);
-  const web = fn('WebFn', 'a', 'src/cloud-api.handler', webRole, { PEROTTINO_STATE_TABLE: state.ref,
-    PEROTTINO_OWNER_SECRET_ARN: config.ownerSecretArn, PUBLIC_ORIGIN: publicOrigin }, 28);
-  const admission = fn('AdmissionFn', 'i', 'src/dispatch.admit', role('AdmissionRole', lambda, [logWrite, allow(read, arn(state))]),
-    { PEROTTINO_STATE_TABLE: state.ref });
-  const terminal = fn('TerminalFn', 't', 'src/dispatch.terminal', role('TerminalRole', lambda, [logWrite,
-    allow(['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'], arn(state))]), { PEROTTINO_STATE_TABLE: state.ref });
-  const workflowName = prefix + 'turn';
-  const machineArn = 'arn:aws:states:' + region + ':' + account + ':stateMachine:' + workflowName;
-  const managedRule = 'arn:aws:events:' + region + ':' + account + ':rule/StepFunctionsGetEventsForECSTaskRule';
+  const web = fn('WebFn', 'a', 'src/cloud-api.handler', webRole, { PEROTTINO_STATE_TABLE: state.ref, PEROTTINO_RESIDENT: '1',
+    PEROTTINO_OWNER_SECRET_ARN: config.ownerSecretArn, PUBLIC_ORIGIN: publicOrigin, PEROTTINO_FACTORY_OWNER_ARN: functionArn('o') }, 28);
+
   const taskArnPattern = ecsArn + 'task/' + clusterName + '/*';
-  const workflowRole = role('WorkflowRole', 'states.amazonaws.com', [
-    allow('lambda:InvokeFunction', [arn(admission), arn(terminal)]),
-    { ...allow('ecs:RunTask', workerTask.ref), Condition: { ArnEquals: { 'ecs:cluster': arn(cluster) } } },
-    { ...allow('ecs:TagResource', taskArnPattern), Condition: { StringEquals: { 'ecs:CreateAction': 'RunTask' } } },
+  const sameCluster = { ArnEquals: { 'ecs:cluster': arn(cluster) } };
+  const factoryRole = role('FactoryRole', lambda, [logWrite, scopedItems(write, ['DIRECTORY', 'AGENT#*', 'FACTORY#*']),
+    scopedItems(['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:ConditionCheckItem'], ['COMPANY#GATE']),
+    { ...allow('ecs:RunTask', workerTask.ref), Condition: sameCluster },
+    { ...allow('ecs:ListTasks', '*'), Condition: sameCluster },
     allow(['ecs:DescribeTasks', 'ecs:StopTask'], taskArnPattern),
+    { ...allow('ecs:TagResource', taskArnPattern), Condition: { StringEquals: { 'ecs:CreateAction': 'RunTask' } } },
     { ...allow('iam:PassRole', [arn(workerRole), arn(executionRole)]), Condition: { StringEquals: { 'iam:PassedToService': ecs } } },
-    allow(['events:PutRule', 'events:PutTargets', 'events:DescribeRule'], managedRule),
-    allow('s3:PutObject', arn(failures) + '/workflow-failures/*'),
-  ], machineArn);
-  const machine = resource('Workflow', 'StepFunctions::StateMachine', { StateMachineName: workflowName, StateMachineType: 'STANDARD',
-    RoleArn: arn(workflowRole), Definition: turnWorkflow({ cluster: arn(cluster), task: workerTask.ref, subnets: config.publicSubnetIds,
-      securityGroup: sg.getAtt('GroupId').toString(), admit: arn(admission), terminal: arn(terminal), failureBucket: failures.ref }) });
-  // Standard workflow timeouts and manual aborts bypass the workflow's own Catch path.
-  // Store only IDs/status for operators; keep prompts out of the EventBridge target.
-  const recovery = retain(resource('RecoveryQueue', 'SQS::Queue', { SqsManagedSseEnabled: true, MessageRetentionPeriod: 1209600 }));
-  const ruleName = prefix + 'x';
-  const recoveryPolicy = retain(resource('RecoveryPolicy', 'SQS::QueuePolicy', { Queues: [recovery.ref], PolicyDocument: {
-    Version: '2012-10-17', Statement: [
-      { Effect: 'Allow', Principal: { Service: 'events.amazonaws.com' }, Action: 'sqs:SendMessage', Resource: arn(recovery),
-        Condition: { ArnEquals: { 'aws:SourceArn': 'arn:aws:events:' + region + ':' + account + ':rule/' + ruleName } } },
-      { Effect: 'Deny', Principal: '*', Action: 'sqs:*', Resource: arn(recovery), Condition: { Bool: { 'aws:SecureTransport': 'false' } } },
-    ],
-  } }));
-  const stoppedRule = resource('StoppedWork', 'Events::Rule', { Name: ruleName, State: 'ENABLED', EventPattern: {
-    source: ['aws.states'], 'detail-type': ['Step Functions Execution Status Change'],
-    detail: { stateMachineArn: [machine.ref], status: ['FAILED', 'ABORTED', 'TIMED_OUT'] },
-  }, Targets: [{ Id: 'Recovery', Arn: arn(recovery), InputTransformer: { InputPathsMap: {
-    execution: '$.detail.executionArn', status: '$.detail.status', name: '$.detail.name',
-  }, InputTemplate: '{"executionArn":<execution>,"status":<status>,"name":<name>}' } }] });
-  stoppedRule.addDependency(recoveryPolicy);
-  const streamArn = state.getAtt('StreamArn').toString();
-  const dispatchRole = role('DispatchRole', lambda, [logWrite, allow('states:StartExecution', machine.ref),
-    allow(['dynamodb:DescribeStream', 'dynamodb:GetRecords', 'dynamodb:GetShardIterator'], streamArn), allow('dynamodb:ListStreams', '*'),
-    { ...allow('s3:ListBucket', arn(failures)), Condition: { StringEquals: { 's3:ResourceAccount': account } } },
-    { ...allow('s3:PutObject', arn(failures) + '/*'), Condition: { StringEquals: { 's3:ResourceAccount': account } } },
   ]);
-  const dispatcher = fn('DispatchFn', 'd', 'src/dispatch.handler', dispatchRole, { PEROTTINO_STATE_MACHINE_ARN: machine.ref });
-  resource('StreamMapping', 'Lambda::EventSourceMapping', { EventSourceArn: streamArn, FunctionName: arn(dispatcher),
-    StartingPosition: 'TRIM_HORIZON', BatchSize: 10, Enabled: true, BisectBatchOnFunctionError: true, MaximumRetryAttempts: 8,
-    MaximumRecordAgeInSeconds: 21600, FunctionResponseTypes: ['ReportBatchItemFailures'],
-    FilterCriteria: { Filters: [{ Pattern: JSON.stringify({ dynamodb: { NewImage: {
-      kind: { S: ['job'] }, state: { S: ['queued'] },
-    } } }) }] }, DestinationConfig: { OnFailure: { Destination: arn(failures) } } });
+  const limit = String(config.employeeLimit ?? 2);
+  const groupId = sg.getAtt('GroupId').toString();
+  const factoryConfig = { PEROTTINO_RESIDENT: '1', PEROTTINO_COMPANY_GATE: '1', PEROTTINO_STATE_TABLE: state.ref,
+    PEROTTINO_CLUSTER_ARN: arn(cluster), PEROTTINO_TASK_DEFINITION_ARN: workerTask.ref,
+    PEROTTINO_PUBLIC_SUBNET_IDS: config.publicSubnetIds.join(','), PEROTTINO_SECURITY_GROUP_ID: groupId,
+    PEROTTINO_EMPLOYEE_LIMIT: limit };
+  const factory = fn('FactoryFn', 'f', 'src/factory.handler', factoryRole, factoryConfig, 240);
+  const owner = fn('OwnerFn', 'o', 'src/factory.owner', factoryRole, factoryConfig, 60);
+  const manager = fn('ManagerFn', 'm', 'src/factory.manager', factoryRole, factoryConfig, 60);
+  const retry = { MaximumEventAgeInSeconds: 600, MaximumRetryAttempts: 3 };
+  const stopped = resource('StoppedWork', 'Events::Rule', { Name: prefix + 'x', State: 'ENABLED',
+    EventPattern: { source: ['aws.ecs'], 'detail-type': ['ECS Task State Change'], detail: {
+      clusterArn: [arn(cluster)], lastStatus: ['STOPPED'], group: [{ prefix: 'employee-' }],
+    } },
+    // ECS events can carry launch overrides. Only these four binding/status fields
+    // go to application code, so per-generation capabilities stay out of the event.
+    Targets: [{ Id: 'Factory', Arn: arn(factory), RetryPolicy: retry, InputTransformer: {
+      InputPathsMap: { cluster: '$.detail.clusterArn', task: '$.detail.taskArn', group: '$.detail.group' },
+      InputTemplate: '{"source":"aws.ecs","detail":{"clusterArn":<cluster>,"taskArn":<task>,"group":<group>,"lastStatus":"STOPPED"}}',
+    } }] });
+  const repair = resource('RepairRule', 'Events::Rule', { Name: prefix + 'p', State: 'ENABLED', ScheduleExpression: 'rate(5 minutes)',
+    Targets: [{ Id: 'Factory', Arn: arn(factory), RetryPolicy: retry }] });
+  function invokePermission(id, rule) {
+    return resource(id, 'Lambda::Permission', { FunctionName: arn(factory), Action: 'lambda:InvokeFunction',
+      Principal: 'events.amazonaws.com', SourceArn: arn(rule), SourceAccount: account });
+  }
+  // During deletion, the callback quiesces the full company while IAM, both rules
+  // and the task definition still exist. Late events must check the durable stop.
+  const bootstrap = resource('ResidentCompany', 'Custom::ResidentCompany', {
+    ServiceToken: arn(factory), ServiceTimeout: 300, EmployeeLimit: limit, TaskDefinitionArn: workerTask.ref,
+    SecurityGroupId: groupId, PublicSubnetIds: config.publicSubnetIds, WorkerImage: config.workerImage, ReleaseImage: config.lambdaImage,
+  });
+  for (const dependency of [invokePermission('StoppedInvoke', stopped), invokePermission('RepairInvoke', repair), manager, owner]) {
+    bootstrap.addDependency(dependency);
+  }
   const integration = resource('ApiIntegration', 'ApiGatewayV2::Integration', { ApiId: api.ref, IntegrationType: 'AWS_PROXY',
     IntegrationUri: arn(web), PayloadFormatVersion: '2.0', TimeoutInMillis: 29000 });
   resource('DefaultRoute', 'ApiGatewayV2::Route', { ApiId: api.ref, RouteKey: '$default', Target: 'integrations/' + integration.ref });
@@ -203,7 +199,7 @@ export function synthHosted(config, provenance, outdir) {
     new CfnOutput(stack, 'RegionalDnsName', { value: dnsName });
     new CfnOutput(stack, 'RegionalDnsZone', { value: zone });
   }
-  for (const [id, value] of Object.entries({ Url: publicOrigin + '/chat', StateTableName: state.ref, StateMachineArn: machine.ref,
-    FailedEventBucket: failures.ref, RecoveryQueueUrl: recovery.ref, ClusterName: cluster.ref })) new CfnOutput(stack, id, { value });
+  for (const [id, value] of Object.entries({ Url: publicOrigin + '/chat', StateTableName: state.ref, ClusterName: cluster.ref,
+    FactoryArn: arn(factory), OwnerFactoryArn: arn(owner) })) new CfnOutput(stack, id, { value });
   return app.synth().getStackArtifact(stack.artifactId);
 }

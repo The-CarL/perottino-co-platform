@@ -196,3 +196,71 @@ test('owner memory corrections and forget preserve provenance and replay safely 
     assert.deepEqual((await (await app.get(memoryPath)).json()).memories, []);
   } finally { allowReply.resolve(); await app.close(); }
 });
+
+test('local manager hires once, paused employees keep durable goals across restart, and firing preserves the archive', async t => {
+  const dir = await directory(t);
+  let app = await open(dir);
+  t.after(() => app.close());
+  const call = async (agentId, path, data) => {
+    const origin = 'http://127.0.0.1:' + app.server.address().port;
+    return fetch(origin + '/api/agents/' + agentId + '/' + path, {method: data ? 'POST' : 'GET',
+      headers:{Authorization:auth, Origin:origin, 'Content-Type':'application/json'}, body: data && JSON.stringify(data)});
+  };
+  const act = (id, op, requestId) => call(id,'lifecycle/' + op,{requestId});
+  const goal = {requestId:'goal-qa',text:'remember Check the release notes'};
+  const profile = async id => (await call(id,'employee')).json();
+  assert.equal((await profile('ceo')).employee.canHire, true);
+  assert.equal((await act('ceo','hire','forged')).status, 404);
+  const firstAssignment = 'recall release';
+  await app.post('hire-request','hire Engineer\n' + firstAssignment);
+  await app.post('hire-request','hire Engineer\n' + firstAssignment);
+  const employee = await until(async () => {
+    const { agents } = await (await app.get('/api/directory')).json();
+    assert.ok(agents.length <= 2);
+    return agents.find(agent => agent.role === 'Engineer');
+  });
+  const id = employee.id;
+  assert.equal((await profile(id)).employee.managerId, 'ceo');
+  assert.equal((await profile(id)).employee.canHire, false);
+  await until(async () => (await profile(id)).goals.find(g => g.text === firstAssignment && g.status === 'done'));
+  const assigned = (await (await call(id,'messages')).json()).messages.find(m => m.text === firstAssignment);
+  assert.equal(assigned.author,'employee');
+  assert.equal(assigned.senderAgentId,'ceo');
+  await app.post('overflow','hire Writer');
+  await until(async () => (await (await call('ceo','messages')).json()).messages.some(m => m.text.includes('employee limit')));
+  await call(id,'messages',{requestId:'forbidden',text:'hire QA'});
+  await until(async () => (await (await call(id,'messages')).json()).messages.some(m => m.text.includes('do not have hiring authority')));
+  assert.equal((await (await app.get('/api/directory')).json()).agents.length, 2);
+  const paused = await (await act(id,'pause','pause-1')).json();
+  assert.equal(paused.employee.desiredState, 'paused');
+  assert.deepEqual(await (await act(id,'pause','pause-1')).json(), paused);
+  assert.equal((await act(id,'resume','pause-1')).status, 409);
+  const created = await (await call(id,'goals',goal)).json();
+  assert.equal(created.goal.status, 'ready');
+  const goalId = created.goal.id;
+  await app.close();
+  app = await open(dir);
+  assert.equal((await profile(id)).employee.desiredState, 'paused');
+  const queued = (await profile(id)).goals;
+  assert.equal(queued.length, 2);
+  assert.equal(queued[0].id, goalId);
+  assert.equal(queued[0].status, 'ready');
+  assert.equal((await act(id,'resume','resume-1')).status, 200);
+  const done = await until(async () => {
+    const rows = (await profile(id)).goals;
+    return rows.find(g => g.id === goalId && g.status === 'done');
+  });
+  assert.equal(done.stepCount, 1);
+  assert.match(done.checkpoint,/Check the release notes/);
+  const memo = (await (await call(id,'memory')).json()).memories[0];
+  assert.equal((await (await call(id,'messages/' + memo.sourceMessageId)).json()).message.text, goal.text);
+  await call(id,'goals',{requestId:'general',text:'Design the new product'});
+  await until(async () => (await profile(id)).goals.some(g => g.status === 'blocked' && g.checkpoint.includes('hosted decision worker')));
+  assert.equal((await (await act(id,'fire','fire-1')).json()).employee.desiredState, 'fired');
+  assert.equal((await act(id,'resume','resume-after-fire')).status, 409);
+  assert.equal((await call(id,'goals',{requestId:'after',text:'New goal'})).status, 409);
+  assert.equal((await call(id,'messages',{requestId:'after',text:'New message'})).status, 409);
+  assert.equal((await (await call(id,'goals',goal)).json()).goal.id, goalId);
+  assert.equal((await profile(id)).goals.length, 3);
+  assert.equal((await (await call(id,'memory')).json()).memories[0].id, memo.id);
+});

@@ -36,7 +36,7 @@ jobs:
         run: >-
           pipx run --spec cfn-lint==1.45.0 cfn-lint --non-zero-exit-code error -t
           cdk.hosted.out/Hosted.template.json cdk.out/Foundation.template.json
-          infra/runtime-bootstrap.yaml infra/github-pat.yaml
+          infra/runtime-bootstrap.yaml infra/github-pat.yaml infra/inbound-email.yaml
   runtime-image:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -51,7 +51,7 @@ jobs:
         run: |
           docker buildx build --platform linux/amd64 --provenance=false --load --file Dockerfile.lambda --tag perottino-lambda:ci .
           docker buildx build --platform linux/amd64 --provenance=false --load --file Dockerfile --tag perottino-worker:ci .
-      - name: Exercise packaged Lambda handlers and one-shot worker with DynamoDB Local
+      - name: Exercise the packaged owner API, factory and resident employee with DynamoDB Local
         env:
           DYNAMODB_LOCAL_IMAGE: amazon/dynamodb-local@sha256:bc216b4351fab2299ed73511118405721ecc6e26d9a231344b08dc3e8bdddcaf
         run: |

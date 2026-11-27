@@ -1,3 +1,4 @@
+import { createEmployeeStore, firedError } from './employee-store.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -18,7 +19,8 @@ const uniqueKey = (pk, text) => ({ pk, sk: 'NOTE_TEXT#' + hash(text) });
 function publicAgent({ id, name, handle, role }) { return { id, name, handle, role }; }
 function publicNote({ pk, sk, ...note }) { return note; }
 function ownerMessage(turn) {
-  return { id: turn.jobId, author: 'owner', text: turn.text, createdAt: turn.createdAt };
+  return { id: turn.jobId, author: turn.author ?? 'owner', text: turn.text, createdAt: turn.createdAt,
+    ...(turn.senderAgentId && { senderAgentId: turn.senderAgentId }), ...(turn.inReplyTo && {inReplyTo:turn.inReplyTo}), ...(turn.email && { sourceKind:'email', email:turn.email }) };
 }
 function transcript(turn) {
   const rows = [turn.state === 'error' ? { ...ownerMessage(turn), status: 'error' } : ownerMessage(turn)];
@@ -26,7 +28,7 @@ function transcript(turn) {
   return rows;
 }
 
-export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE, client, now = Date.now } = {}) {
+export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE, client, now = Date.now, resident = process.env.PEROTTINO_RESIDENT === '1' } = {}) {
   if (!tableName) throw new Error('PEROTTINO_STATE_TABLE is required.');
   const ddb = client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ region: process.env.AWS_REGION }));
   const get = async Key => (await ddb.send(new GetCommand({ TableName: tableName, Key, ConsistentRead: true }))).Item;
@@ -83,6 +85,7 @@ export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE
 
   let ready;
   function initialize() {
+    if (resident) return; // The factory owns directory provisioning in the hosted resident deployment.
     ready ??= optimistic(async () => {
       const id = { pk: 'DIRECTORY', sk: agentPk(ceo.id) };
       if (await get(id)) return true;
@@ -104,17 +107,17 @@ export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE
     const lookup = await get(lookupKey(pk, jobId));
     return lookup && await get(turnKey(pk, lookup.seq));
   }
-  async function admission(turn) {
+  async function admission(turn, binding) {
     if (!turn || turn.state === 'error') return 'failed';
     if (turn.state === 'done') return 'done';
     const [head] = await query(turn.pk, 'PENDING#', { first: true });
-    return head?.seq === turn.seq && (turn.state === 'queued' || turn.leaseUntil <= now()) ? 'ready' : 'wait';
+    return head?.seq === turn.seq && (turn.state === 'queued' || turn.leaseUntil <= now() || (binding && turn.runArn && (turn.runArn !== binding.taskArn || turn.runGeneration !== binding.generation))) ? 'ready' : 'wait';
   }
-  async function terminal(turn, token) {
+  async function terminal(turn, token, binding) {
     const values = { ':error': 'error', ':working': 'working' };
     if (token) values[':token'] = token;
     else Object.assign(values, { ':queued': 'queued', ':now': now() });
-    return write([update(turnKey(turn.pk, turn.seq), {
+    return write([...(binding ? [...people.gateChecks(),people.bindingCheck(binding)] : []),update(turnKey(turn.pk, turn.seq), {
       UpdateExpression: 'SET #s=:error REMOVE #t, leaseUntil',
       ConditionExpression: token ? '#s=:working AND #t=:token' : '#s=:queued OR (#s=:working AND leaseUntil<=:now)',
       ExpressionAttributeNames: { '#s': 'state', '#t': 'token' }, ExpressionAttributeValues: values
@@ -141,16 +144,69 @@ export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE
     return { items: page.Items ?? [], ...(page.LastEvaluatedKey && { nextCursor: page.LastEvaluatedKey.sk }) };
   }
   async function release(job, restoreAttempt = false) {
+    if (resident && !job.binding) return false;
+    if (job.goal) return people.checkpointGoal(job, { checkpoint:job.goal.checkpoint, status:'ready' }, false);
     const values = { ':q': 'queued', ':w': 'working', ':t': job.token };
     if (restoreAttempt) values[':one'] = 1;
     return write([update(turnKey(agentPk(job.agent.id), job.seq), {
       UpdateExpression: 'SET #s=:q' + (restoreAttempt ? ', attempts = attempts - :one' : '') + ' REMOVE #t, leaseUntil',
       ConditionExpression: '#s=:w AND #t=:t',
       ExpressionAttributeNames: { '#s': 'state', '#t': 'token' }, ExpressionAttributeValues: values
-    }), markPending(agentPk(job.agent.id), job.seq, 'queued')]);
+    }), markPending(agentPk(job.agent.id), job.seq, 'queued'), ...(job.binding ? [...people.gateChecks(), people.bindingCheck(job.binding), people.unlockWork(job)] : [])]);
   }
 
-  return {
+  async function getHistory(id) {
+    const rows = await query(agentPk(id), 'TURN#', { recent:16 });
+    return rows.filter(turn => turn.author !== 'external').flatMap(transcript).slice(-16);
+  }
+  const people = createEmployeeStore({ ddb, tableName, get, query, write, insert, put, remove, update, optimistic, now, getMemories, getHistory });
+  async function enqueue(agentId, text, requestId, source = {}) {
+      if (!await getAgent(agentId)) throw new Error('Unknown agent.');
+      const pk = agentPk(agentId);
+      const jobId = hash(agentId + '\0' + (source.author ? source.author + '\0' : '') + requestId);
+      const lookup = lookupKey(pk, jobId);
+      return optimistic(async () => {
+        const existing = await locate(agentId, jobId);
+        if (existing) {
+          // SES can deliver the same message separately to two aliases of one employee.
+          // Keep the original envelope recipient while validating the sender, subject and body.
+          const differentEmail = source.email && ['messageId', 'from', 'subject'].some(key => existing.email?.[key] !== source.email[key]);
+          return { conflict: existing.text !== text || existing.inReplyTo !== source.inReplyTo || Boolean(differentEmail),
+            message: ownerMessage(existing), turnId: jobId };
+        }
+        const target = await people.employee(agentId);
+        if (target.desiredState === 'fired') throw firedError();
+        if (source.binding) {
+          const sender = await people.employee(source.binding.agentId);
+          if (sender?.desiredState !== 'active' || sender?.generation !== source.binding.generation || sender?.taskArn !== source.binding.taskArn)
+            throw Object.assign(new Error('Sender binding is inactive.'), { status:403 });
+        }
+        const meta = await get(metaKey(pk));
+        const seq = meta.lastSequence + 1;
+        const turn = { ...turnKey(pk, seq), kind: 'turn', agentId, jobId, text, seq, state: 'queued', attempts: 0,
+          createdAt: new Date(now()).toISOString(), ...(source.author && {author:source.author}),
+          ...(source.senderAgentId && {senderAgentId:source.senderAgentId}), ...(source.inReplyTo && {inReplyTo:source.inReplyTo}), ...(source.email && {email:source.email}) };
+        const guards = source.binding ? [...people.gateChecks(), people.bindingCheck(source.binding)] : [];
+        if (!source.binding || source.binding.agentId !== agentId) guards.push(people.accepting(agentId));
+        const saved = await write([...guards, insert(turn), insert({ ...lookup, seq }),
+          insert({ ...pendingKey(pk, seq), kind: 'job', agentId, jobId, seq, state: 'queued' }),
+          update(metaKey(pk), { UpdateExpression: 'SET lastSequence=:next', ConditionExpression: 'lastSequence=:old',
+            ExpressionAttributeValues: { ':next': seq, ':old': meta.lastSequence } })]);
+        if (saved) return { conflict: false, message: ownerMessage(turn), turnId: jobId };
+      });
+    }
+  async function enqueueEmail(agentId, { messageId, from, to, subject, text }) {
+    if (![messageId,from,to,subject,text].every(x => typeof x === 'string') || !messageId || !from || !to ||
+        messageId.length > 1000 || from.length > 500 || to.length > 500 || subject.length > 1000 || text.length > 16000)
+      throw new RangeError('Invalid inbound email.');
+    return enqueue(agentId,text,'email:' + messageId,{ author:'external', email:{messageId,from,to,subject} });
+  }
+  async function sendFromResident(binding, agentId, text, requestId, {inReplyTo} = {}) {
+    if (inReplyTo !== undefined && (typeof inReplyTo !== 'string' || !inReplyTo || inReplyTo.length > 160)) throw new RangeError('Invalid reply reference.');
+    if (typeof text !== 'string' || !text.trim() || text.length > 16000 || typeof requestId !== 'string' || !requestId || requestId.length>160) throw new RangeError('Invalid employee message.');
+    return enqueue(agentId,text,'employee:'+binding.agentId+':'+requestId, {author:'employee',senderAgentId:binding.agentId,binding,inReplyTo});
+  }
+  const api = {
     async directory() { await initialize(); return (await query('DIRECTORY', 'AGENT#')).map(publicAgent); },
     getAgent, getMemories,
     close() { if (!client) ddb.destroy(); },
@@ -180,57 +236,43 @@ export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE
       return { messages: turns.flatMap(transcript), status,
         ...(status === 'error' && { error: 'The agent could not complete the last turn. You can send it again.' }) };
     },
-    async enqueue(agentId, text, requestId) {
-      if (!await getAgent(agentId)) throw new Error('Unknown agent.');
-      const pk = agentPk(agentId);
-      const jobId = hash(agentId + '\0' + requestId);
-      const lookup = lookupKey(pk, jobId);
-      return optimistic(async () => {
-        const existing = await locate(agentId, jobId);
-        if (existing) return { conflict: existing.text !== text, message: ownerMessage(existing), turnId: jobId };
-        const meta = await get(metaKey(pk));
-        const seq = meta.lastSequence + 1;
-        const turn = { ...turnKey(pk, seq), kind: 'turn', agentId, jobId, text, seq, state: 'queued', attempts: 0,
-          createdAt: new Date(now()).toISOString() };
-        const saved = await write([insert(turn), insert({ ...lookup, seq }),
-          insert({ ...pendingKey(pk, seq), kind: 'job', agentId, jobId, seq, state: 'queued' }),
-          update(metaKey(pk), { UpdateExpression: 'SET lastSequence=:next', ConditionExpression: 'lastSequence=:old',
-            ExpressionAttributeValues: { ':next': seq, ':old': meta.lastSequence } })]);
-        if (saved) return { conflict: false, message: ownerMessage(turn), turnId: jobId };
-      });
-    },
+    enqueue: (id,content,requestId) => enqueue(id,content,requestId), enqueueEmail, sendFromResident,
     async turnAdmission(agentId, jobId) { return admission(await locate(agentId, jobId)); },
-    async claimTurn(agentId, jobId, leaseMs) {
+    async claimTurn(agentId, jobId, leaseMs, binding) {
+      if (resident && !binding) return {state:'inactive'};
       if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) throw new Error('Invalid turn lease.');
       const turn = await locate(agentId, jobId);
       if (!turn) return { state: 'missing' };
       if (['done', 'error'].includes(turn.state)) return { state: turn.state };
-      if (await admission(turn) !== 'ready') return { state: 'busy' };
+      if (await admission(turn,binding) !== 'ready') return { state: 'busy' };
       if (turn.attempts >= 3) {
-        const settled = await terminal(turn, turn.token);
+        const settled = await terminal(turn, turn.token,binding);
         return { state: settled ? 'error' : 'busy' };
       }
       const pk = turn.pk;
       const time = now();
       const token = randomUUID();
-      const acquired = await write([update(turnKey(pk, turn.seq), {
-        UpdateExpression: 'SET #s=:w, #t=:t, leaseUntil=:until ADD attempts :one',
-        ConditionExpression: 'attempts=:attempts AND (#s=:q OR (#s=:w AND leaseUntil<=:now))',
+      const replaced = binding ? ' OR (attribute_exists(runArn) AND (runArn<>:arn OR runGeneration<>:gen))' : '';
+      const acquired = await write([...(binding ? people.lockWork(binding, token, leaseMs) : []), update(turnKey(pk, turn.seq), {
+        UpdateExpression: 'SET #s=:w, #t=:t, leaseUntil=:until' + (binding ? ', runArn=:arn, runGeneration=:gen' : '') + ' ADD attempts :one',
+        ConditionExpression: 'attempts=:attempts AND (#s=:q OR (#s=:w AND (leaseUntil<=:now' + replaced + ')))',
         ExpressionAttributeNames: { '#s': 'state', '#t': 'token' },
         ExpressionAttributeValues: { ':w': 'working', ':q': 'queued', ':t': token, ':until': time + leaseMs,
-          ':one': 1, ':attempts': turn.attempts, ':now': time }
+          ':one': 1, ':attempts': turn.attempts, ':now': time, ...(binding && {':arn':binding.taskArn, ':gen':binding.generation}) }
       }), markPending(pk, turn.seq, 'working')]);
       if (!acquired) return { state: 'busy' };
       // Read the revision before loading notes. Completion checks it in the same transaction as the reply.
       const meta = await get(metaKey(pk));
       const [agent, memories, prior] = await Promise.all([
-        get({ pk: 'DIRECTORY', sk: pk }), getMemories(agentId),
+        people.employee(agentId), getMemories(agentId),
         turn.seq > 1 ? query(pk, 'TURN#', { before: turnKey(pk, turn.seq - 1).sk, recent: 16 }) : []
       ]);
-      return { state: 'claimed', job: { token, seq: turn.seq, agent: publicAgent(agent), message: ownerMessage(turn),
-        history: prior.flatMap(transcript).slice(-16), memories, memoryRevision: meta.memoryRevision } };
+      return { state: 'claimed', job: { token, seq: turn.seq, agent: binding ? agent : publicAgent(agent), ...(binding && {binding}), message: ownerMessage(turn),
+        history: prior.filter(t=>t.author !== 'external').flatMap(transcript).slice(-16), memories, memoryRevision: meta.memoryRevision } };
     },
-    async complete(job, reply, pendingNotes = []) {
+    async complete(job, reply, pendingNotes = [], newGoal) {
+      if (resident && !job.binding) return false;
+      if (newGoal && job.message.author === 'external') throw Object.assign(new Error('External email cannot assign company work.'),{status:403});
       const pk = agentPk(job.agent.id);
       const rows = [];
       const texts = new Set(job.memories.map(m => m.text));
@@ -239,7 +281,7 @@ export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE
         texts.add(candidate.text);
         rows.push({ id: candidate.id, text: candidate.text, createdAt: candidate.createdAt, sourceMessageId: job.message.id });
       }
-      if (rows.length > 32) throw new Error('Too many notes for one turn.');
+      if (rows.length > Math.min(32, Math.floor((100 - 3 - Number(!!job.binding) - (job.binding ? people.gateChecks().length : 0) - (newGoal ? 3 : 0)) / 3))) throw new Error('Too many notes for one turn.');
       const actions = [update(turnKey(pk, job.seq), {
         UpdateExpression: 'SET #s=:done, replyId=:id, reply=:reply, completedAt=:at REMOVE #t, leaseUntil',
         ConditionExpression: '#s=:w AND #t=:t AND leaseUntil>:now',
@@ -247,7 +289,9 @@ export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE
         ExpressionAttributeValues: { ':done': 'done', ':id': randomUUID(), ':reply': reply, ':at': new Date(now()).toISOString(),
           ':w': 'working', ':t': job.token, ':now': now() }
       }), remove(pendingKey(pk, job.seq))];
-      if (rows.length) actions.push(bumpRevision(pk, job.memoryRevision));
+      if (newGoal) actions.push(...people.goalItems(job.agent.id, job.message.id, newGoal.text, newGoal.checkpoint ?? '', newGoal.nextRunAt ?? now(), 'message').actions);
+      if (job.binding) actions.push(...people.gateChecks(),people.bindingCheck(job.binding), people.unlockWork(job, job.memoryRevision, rows.length > 0));
+      else if (rows.length) actions.push(bumpRevision(pk, job.memoryRevision));
       else actions.push({ ConditionCheck: { TableName: tableName, Key: metaKey(pk), ...revisionCheck(job.memoryRevision) } });
       for (const row of rows) {
         const key = noteKey(pk, row.id, row.createdAt);
@@ -259,8 +303,15 @@ export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE
       return false;
     },
     release,
-    async fail(job) { return terminal({ pk: agentPk(job.agent.id), seq: job.seq }, job.token); },
+    async fail(job) {
+      if (resident && !job.binding) return false;
+      if (job.goal) return people.checkpointGoal(job, { checkpoint:job.goal.checkpoint, status:'blocked' }, false);
+      if (job.binding) return write([...people.gateChecks(),people.bindingCheck(job.binding), people.unlockWork(job),
+        update(turnKey(agentPk(job.agent.id),job.seq),{ UpdateExpression:'SET #s=:err REMOVE #t,leaseUntil', ConditionExpression:'#t=:tok',
+          ExpressionAttributeNames:{'#s':'state','#t':'token'}, ExpressionAttributeValues:{':err':'error',':tok':job.token} }), remove(pendingKey(agentPk(job.agent.id),job.seq))]);
+      return terminal({ pk: agentPk(job.agent.id), seq: job.seq }, job.token); },
     async finishTurnWithError(agentId, jobId) {
+      if (resident) throw Object.assign(new Error('Only a bound resident can end its turn.'),{status:403});
       return optimistic(async () => {
         const turn = await locate(agentId, jobId);
         if (!turn || turn.state === 'error') return { status: 'failed' };
@@ -309,4 +360,21 @@ export function createCloudStore({ tableName = process.env.PEROTTINO_STATE_TABLE
       });
     }
   };
+  const { accepting, bindingCheck, gateChecks, lockWork, unlockWork, goalItems, claimGoal, ...employeeApi } = people;
+  return { ...api, ...employeeApi, async claimNextWork({ agentId, generation, taskArn, leaseMs }) {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || !Number.isSafeInteger(generation) || !taskArn) throw new RangeError('Invalid resident claim.');
+    const binding = { agentId, generation, taskArn };
+    const person = await people.employee(agentId);
+    if (person?.desiredState !== 'active' || person.generation !== generation || (person.taskArn && (person.taskArn !== taskArn || person.taskGeneration !== generation))) return {state:'inactive'};
+    if (!person.taskArn) return {state:'busy'};
+    const control = await get(metaKey(agentPk(agentId)));
+    if (control.activeArn === taskArn && control.activeGeneration === generation && control.activeUntil > now()) return {state:'busy'};
+    const [head] = await query(agentPk(agentId),'PENDING#',{first:true});
+    if (head) {
+      const id = head.jobId ?? (await get(turnKey(agentPk(agentId),head.seq)))?.jobId;
+      const claimed = await api.claimTurn(agentId,id,leaseMs,binding);
+      return claimed.state==='claimed' ? {...claimed,kind:'message'} : {state:'busy'};
+    }
+    return people.claimGoal(binding, leaseMs, control.lastSequence);
+  } };
 }

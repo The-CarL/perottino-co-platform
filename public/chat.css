@@ -189,3 +189,18 @@ dialog::backdrop { background: #20261e42; }
 .page-button:disabled { opacity: .65; }
 .failed-message { display: block; color: #8b3e36; text-align: right; font-size: 11px; margin: 3px 0; }
 #sourceBody { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 55dvh; overflow-y: auto; }
+#employeeDialog { width: min(520px, calc(100vw - 30px)); max-height: 88dvh; overflow-y: auto; }
+#employeeDialog h3 { font-size: 15px; margin: 18px 0 8px; }
+#employeeRole { margin: -5px 0 14px; }
+#employeeFacts { display: grid; grid-template-columns: auto 1fr; gap: 5px 16px; font-size: 14px; }
+#employeeFacts dt { color: var(--muted); }
+#employeeFacts dd { margin: 0; overflow-wrap: anywhere; }
+.employee-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+#fireEmployee { color: #893c34; }
+#goalForm { border-block: 1px solid var(--line); padding: 14px 0; }
+#goalForm textarea { min-height: 55px; }
+#assignGoal { padding: 7px 13px; min-height: 34px; margin-top: 8px; font-size: 13px; }
+.goal-summary { border-bottom: 1px solid var(--line); padding: 8px 0; font-size: 14px; }
+.goal-summary strong, .goal-summary p { overflow-wrap: anywhere; white-space: pre-wrap; }
+.goal-summary p { margin: 4px 0; }
+.email-subject { margin: 0 0 3px; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }

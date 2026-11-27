@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Optional inbound company mail delivered to the hosted employee directory and durable inbox.
+Parameters:
+  ProjectScope:
+    Type: String
+    MinLength: 38
+    MaxLength: 52
+    AllowedPattern: '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}-[a-z][a-z0-9-]*'
+  MailDomain:
+    Type: String
+    Description: A dedicated, SES-verified receiving domain in this region.
+    AllowedPattern: '([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}'
+  ActiveReceiptRuleSet:
+    Type: String
+    Description: Name of the existing active SES receipt rule set in this region.
+    AllowedPattern: '[a-zA-Z0-9_-]{1,64}'
+  StateTableName:
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9_.-]{3,255}'
+  LambdaImage:
+    Type: String
+    AllowedPattern: '[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9._/-]+@sha256:[a-f0-9]{64}'
+  PermissionsBoundaryArn:
+    Type: String
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:policy/.+'
+Resources:
+  Topic:
+    Type: AWS::SNS::Topic
+  TopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref Topic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ses.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref Topic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${ActiveReceiptRuleSet}:receipt-rule/co-${ProjectScope}-mail'
+  Failures:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  FailurePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref Failures]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: sns.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt Failures.Arn
+            Condition: {ArnEquals: {'aws:SourceArn': !Ref Topic}}
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/factory-${ProjectScope}-r-e'
+      RetentionInDays: 14
+  MailRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub '/factory/${ProjectScope}/'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReceiveEmployeeMail
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt Logs.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:ConditionCheckItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}'
+                Condition:
+                  'Null': {'dynamodb:LeadingKeys': 'false'}
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: [DIRECTORY, 'AGENT#*']
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}'
+                Condition:
+                  'Null': {'dynamodb:LeadingKeys': 'false'}
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: ['AGENT#*']
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Failures.Arn
+  MailFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'factory-${ProjectScope}-r-e'
+      Architectures: [x86_64]
+      PackageType: Image
+      Code: {ImageUri: !Ref LambdaImage}
+      ImageConfig: {Command: [src/email-ingress.handler]}
+      Role: !GetAtt MailRole.Arn
+      Timeout: 45
+      MemorySize: 512
+      Environment:
+        Variables:
+          PEROTTINO_STATE_TABLE: !Ref StateTableName
+          PEROTTINO_MAIL_DOMAIN: !Ref MailDomain
+          PEROTTINO_MAIL_TOPIC_ARN: !Ref Topic
+          PEROTTINO_RESIDENT: '1'
+  DeliveryFailure:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref MailFunction
+      Qualifier: '$LATEST'
+      MaximumRetryAttempts: 2
+      DestinationConfig:
+        OnFailure: {Destination: !GetAtt Failures.Arn}
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MailFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref Topic
+  Subscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: [InvokePermission, FailurePolicy, DeliveryFailure]
+    Properties:
+      TopicArn: !Ref Topic
+      Protocol: lambda
+      Endpoint: !GetAtt MailFunction.Arn
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt Failures.Arn}
+  Receipt:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: [TopicPolicy, Subscription]
+    Properties:
+      RuleSetName: !Ref ActiveReceiptRuleSet
+      Rule:
+        Name: !Sub 'co-${ProjectScope}-mail'
+        Enabled: true
+        ScanEnabled: true
+        Recipients: [!Ref MailDomain]
+        Actions:
+          - SNSAction: {TopicArn: !Ref Topic, Encoding: Base64}
+Outputs:
+  FailureQueueUrl:
+    Value: !Ref Failures

@@ -189,3 +189,37 @@ test('production entry point loads the real adapter and fetches only the configu
   assert.equal(get.mock.callCount(), 1);
   assert.equal(db.mock.callCount(), 0);
 });
+
+test('only the authenticated owner can send bounded lifecycle commands and assign goals', async () => {
+  const calls = [];
+  const person = { id:'ceo',name:'Mara',handle:'mara',role:'CEO',canHire:true,
+    desiredState:'active',generation:2,taskGeneration:2,taskArn:'private-task-identifier',privateToken:'secret-test-value' };
+  const goal = { id:'goal-1',text:'Inspect release',status:'ready',stepCount:0,checkpoint:'',privateLease:'do not expose'};
+  const api = createCloudHandler({publicOrigin:origin, readOwner:async () => credential,
+    ownerControl:async action => {
+      calls.push(action);
+      return action.operation === 'fire' ? {ok:false,status:409,code:'EMPLOYEE_STATE'} : {ok:true,employee:person};
+    },
+    store:{ getAgent:async id => id === person.id ? person : null, employee:async () => person,
+      listGoals:async () => [goal], assignGoal:async () => ({goal,conflict:false}) }});
+  const endpoint = name => '/api/agents/ceo/' + name;
+  const body = JSON.stringify({requestId:'action-1',agentId:'other',actor:'admin',operation:'fire'});
+  const request = (name, headers, content = body) => api(event(endpoint(name),{method:'POST',headers,body:content}));
+  const headers = {...authorized,origin,'content-type':'application/json'};
+  assert.equal((await request('lifecycle/pause',{origin,'content-type':'application/json'})).statusCode,401);
+  assert.equal((await request('lifecycle/pause',{...headers,origin:'https://other.test'})).statusCode,403);
+  assert.equal((await request('lifecycle/hire',headers)).statusCode,404);
+  assert.equal((await request('goals',{...headers,origin:'https://other.test'})).statusCode,403);
+  assert.deepEqual(calls,[]);
+  const result = await request('lifecycle/pause',headers);
+  assert.equal(result.statusCode,200);
+  assert.deepEqual(calls,[{operation:'pause',agentId:'ceo',requestId:'action-1'}]);
+  assert.doesNotMatch(result.body,/private-task|privateToken|secret-test-value/);
+  const profile = await api(event(endpoint('employee'),{headers:authorized}));
+  assert.equal(JSON.parse(profile.body).employee.runtimeStatus,'Task registered');
+  assert.doesNotMatch(profile.body,/private-task|privateToken|privateLease/);
+  const assignment = await request('goals',headers,JSON.stringify({requestId:'goal-1',text:'Inspect release'}));
+  assert.equal(assignment.statusCode,202);
+  assert.equal(JSON.parse(assignment.body).goal.id, goal.id);
+  assert.equal((await request('lifecycle/fire',headers)).statusCode,409);
+});

@@ -17,13 +17,14 @@ test('owner browser loads older pages, opens a historical source and keeps loade
   const memoCursor = 'NOTE#2026-11-26T13:00:00.000Z#new-note';
   const turnCursor = 'TURN#0000000000000002';
   let oldNote = memory('old-note', 'Older note', source);
+  let newMessages = [];
   const reads = [];
   const handle = createCloudHandler({ publicOrigin: origin, readOwner: async () => ({ username: 'owner', passwordHash }),
     store: {
-      directory: async () => [agent], getAgent: async id => id === agent.id ? agent : null,
+      directory: async () => [agent,{ id:'iris',name:'Iris',handle:'iris',role:'Engineer' }], getAgent: async id => id === agent.id ? agent : null,
       async messagePage(_id, cursor) {
         reads.push(['turns', cursor]);
-        if (cursor === undefined) return { messages: [recent], status: 'idle', nextCursor: turnCursor };
+        if (cursor === undefined) return { messages: [recent,...newMessages], status: 'idle', nextCursor: turnCursor };
         assert.equal(cursor, turnCursor);
         return { messages: [earlier], status: 'idle' };
       },
@@ -85,5 +86,11 @@ test('owner browser loads older pages, opens a historical source and keeps loade
   await corrected.waitFor({ state: 'detached' });
   assert.equal(oldNote, null);
   assert.ok(reads.some(([op, key]) => op === 'source' && key === source.id));
+  newMessages = [{ ...sent('email','A public question','27'), author:'external',email:{from:'reader@example.test',subject:'Preview availability'} },
+    { ...sent('coworker','Review is ready','27'), author:'employee',senderAgentId:'iris'}];
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await timeline.getByText('Email from reader@example.test',{exact:true}).waitFor();
+  await timeline.getByText('Preview availability',{exact:true}).waitFor();
+  await timeline.locator('#message-coworker').getByText('Iris',{exact:true}).waitFor();
   assert.deepEqual(errors, []);
 });

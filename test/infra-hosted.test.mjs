@@ -17,40 +17,39 @@ const grants = (r, role) => r[role].Properties.Policies[0].PolicyDocument.Statem
 const actions = (r, role) => grants(r, role).flatMap(statement => statement.Action);
 const att = (id, name) => ({ 'Fn::GetAtt': [id, name] });
 
-test('cold-start infrastructure has zero resident compute and a durable replay source', t => {
+test('one explicitly bootstrapped CEO uses standalone employee tasks with durable state', t => {
   const template = render(t).template;
   const r = template.Resources;
   const types = Object.values(r).map(x => x.Type);
-  for (const kind of ['EC2::Instance', 'EC2::Volume', 'EC2::EIP', 'EC2::NatGateway', 'EFS::FileSystem', 'ECS::Service',
-    'ElasticLoadBalancingV2::LoadBalancer', 'Scheduler::Schedule']) assert.ok(!types.includes('AWS::' + kind));
-  assert.ok(!JSON.stringify(template).includes('ProvisionedConcurrency'));
-  const stops = props(r, 'StoppedWork');
-  assert.equal(stops.ScheduleExpression, undefined);
-  assert.deepEqual(stops.EventPattern.detail.status, ['FAILED', 'ABORTED', 'TIMED_OUT']);
-  assert.deepEqual(stops.EventPattern.detail.stateMachineArn, [{ Ref: 'Workflow' }]);
-  assert.deepEqual(stops.Targets[0].Arn, att('RecoveryQueue', 'Arn'));
-  assert.doesNotMatch(stops.Targets[0].InputTransformer.InputTemplate, /prompt|input|credential/i);
-  assert.equal(props(r, 'RecoveryQueue').SqsManagedSseEnabled, true);
+  for (const kind of ['EC2::Instance', 'EC2::Volume', 'EC2::EIP', 'EC2::NatGateway', 'EFS::FileSystem',
+    'ECS::Service', 'Lambda::EventSourceMapping', 'StepFunctions::StateMachine', 'ElasticLoadBalancingV2::LoadBalancer']) {
+    assert.ok(!types.includes('AWS::' + kind));
+  }
   assert.equal(types.filter(x => x === 'AWS::Lambda::Function').length, 4);
   assert.equal(types.filter(x => x === 'AWS::ECS::TaskDefinition').length, 1);
   const table = props(r, 'State');
   assert.equal(table.BillingMode, 'PAY_PER_REQUEST');
   assert.ok(table.DeletionProtectionEnabled && table.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled);
-  assert.equal(table.StreamSpecification.StreamViewType, 'NEW_IMAGE');
   assert.deepEqual(table.KeySchema.map(k => k.AttributeName), ['pk', 'sk']);
-  for (const id of ['State', 'Failures', 'FailurePolicy', 'Logs']) {
+  assert.equal(table.StreamSpecification, undefined);
+  for (const id of ['State', 'Logs']) {
     assert.equal(r[id].DeletionPolicy, 'Retain');
     assert.equal(r[id].UpdateReplacePolicy, 'Retain');
   }
-  const mapping = props(r, 'StreamMapping');
-  assert.equal(mapping.StartingPosition, 'TRIM_HORIZON');
-  assert.deepEqual(mapping.FunctionResponseTypes, ['ReportBatchItemFailures']);
-  assert.deepEqual(JSON.parse(mapping.FilterCriteria.Filters[0].Pattern), {
-    dynamodb: { NewImage: { kind: { S: ['job'] }, state: { S: ['queued'] } } },
-  });
-  assert.deepEqual(mapping.DestinationConfig.OnFailure.Destination, att('Failures', 'Arn'));
-  assert.ok(props(r, 'Failures').PublicAccessBlockConfiguration.BlockPublicPolicy);
-  assert.equal(props(r, 'Failures').VersioningConfiguration.Status, 'Enabled');
+  const bootstrap = r.ResidentCompany;
+  assert.equal(bootstrap.Type, 'Custom::ResidentCompany');
+  assert.equal(bootstrap.DeletionPolicy, undefined);
+  assert.deepEqual(bootstrap.Properties.ServiceToken, att('FactoryFn', 'Arn'));
+  assert.deepEqual(bootstrap.Properties.TaskDefinitionArn, { Ref: 'WorkerTask' });
+  assert.equal(bootstrap.Properties.WorkerImage, sample().workerImage);
+  assert.equal(bootstrap.Properties.ReleaseImage, sample().lambdaImage);
+  assert.equal(bootstrap.Properties.EmployeeLimit, '2');
+  assert.ok(bootstrap.Properties.ServiceTimeout > props(r, 'FactoryFn').Timeout);
+  assert.deepEqual(bootstrap.DependsOn.sort(), ['ManagerFn', 'OwnerFn', 'RepairInvoke', 'StoppedInvoke']);
+  const change = render(t, { ...sample(), employeeLimit: 6 }).template.Resources;
+  assert.equal(change.ResidentCompany.Properties.EmployeeLimit, '6');
+  assert.equal(change.FactoryFn.Properties.Environment.Variables.PEROTTINO_EMPLOYEE_LIMIT, '6');
+  assert.deepEqual(change.State, r.State);
 });
 
 test('two commercial accounts synthesize independently, including optional HTTPS custom domain and private inputs', t => {
@@ -85,6 +84,9 @@ test('invalid AWS bindings, PAT reuse, mutable image tags and a namespace too lo
     c => { c.lambdaImage = c.lambdaImage.replace('example-company', 'other-company'); },
     c => { c.publicSubnetIds = []; },
     c => { c.workerSize = 'huge'; },
+    c => { c.employeeLimit = 0; },
+    c => { c.employeeLimit = 31; },
+    c => { c.employeeLimit = '2'; },
     c => { c.ownerSecretArn = c.ownerSecretArn.replace('example/owner', '/perottino-co/github/pat'); },
     c => { c.bedrockResourceArns.push('*'); },
     c => { c.customDomain = { hostname: 'test.example.com', certificateArn: '*' }; },
@@ -94,28 +96,27 @@ test('invalid AWS bindings, PAT reuse, mutable image tags and a namespace too lo
   assert.throws(() => render(t, sample(), prov), /function-name limit/);
 });
 
-test('only admitted jobs launch bounded Fargate workers, and completed launches re-read durable state', t => {
+test('scheduled repair and task-stop recovery are limited to the infrastructure entry point', t => {
   const r = render(t).template.Resources;
-  assert.equal(props(r, 'Workflow').StateMachineType, 'STANDARD');
-  const states = props(r, 'Workflow').Definition.States;
-  assert.equal(states.Initialize.Next, 'CheckAdmission');
-  assert.deepEqual(states.CheckAdmission.Resource, att('AdmissionFn', 'Arn'));
-  assert.ok(states.Admission.Choices.some(c => c.Next === 'CountLaunch' && c.And.some(v => v.StringEquals === 'ready')
-    && c.And.some(v => v.NumericLessThan === 3)));
-  assert.ok(states.Admission.Choices.some(c => c.StringEquals === 'failed' && c.Next === 'TurnFailed'));
-  assert.equal(states.CountLaunch.Next, 'RunEmployee');
-  assert.equal(states.WaitForAgent.Next, 'CheckAdmission');
-  assert.equal(states.RunEmployee.Resource, 'arn:aws:states:::ecs:runTask.sync');
-  assert.equal(states.RunEmployee.TimeoutSeconds, 600);
-  assert.deepEqual(states.RunEmployee.Parameters.TaskDefinition, { Ref: 'WorkerTask' });
-  assert.equal(states.RunEmployee.Parameters.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp, 'ENABLED');
-  assert.equal(states.CheckExit.Choices[0].Next, 'CheckAdmission');
-  assert.equal(states.RunEmployee.Catch[0].Next, 'RecoverLease');
-  assert.equal(states.RecoverLease.Next, 'CheckAdmission');
-  assert.deepEqual(states.RecordFailure.Resource, att('TerminalFn', 'Arn'));
-  assert.equal(states.RecordFailure.Catch[0].Next, 'PrepareRecoveryRecord');
-  assert.equal(states.TerminalResult.Default, 'PrepareRecoveryRecord');
-  assert.deepEqual(states.ArchiveRecoveryRecord.Parameters.Bucket, { Ref: 'Failures' });
+  const stopped = props(r, 'StoppedWork');
+  assert.equal(stopped.ScheduleExpression, undefined);
+  assert.deepEqual(stopped.EventPattern.detail, {
+    clusterArn: [att('Cluster', 'Arn')], lastStatus: ['STOPPED'], group: [{ prefix: 'employee-' }],
+  });
+  assert.deepEqual(stopped.Targets[0].Arn, att('FactoryFn', 'Arn'));
+  const transformer = stopped.Targets[0].InputTransformer;
+  assert.deepEqual(Object.keys(transformer.InputPathsMap).sort(), ['cluster', 'group', 'task']);
+  assert.doesNotMatch(transformer.InputTemplate, /override|capability|credential/i);
+  assert.equal(props(r, 'RepairRule').ScheduleExpression, 'rate(5 minutes)');
+  for (const [permission, id] of [['StoppedInvoke', 'StoppedWork'], ['RepairInvoke', 'RepairRule']]) {
+    assert.deepEqual(props(r, permission).SourceArn, att(id, 'Arn'));
+    assert.equal(props(r, permission).Principal, 'events.amazonaws.com');
+    assert.deepEqual(props(r, permission).FunctionName, att('FactoryFn', 'Arn'));
+  }
+});
+
+test('the resident task runs at the configured size with no incoming network connections', t => {
+  const r = render(t).template.Resources;
   const task = props(r, 'WorkerTask');
   assert.equal(task.Cpu, '256');
   assert.equal(task.Memory, '1024');
@@ -130,33 +131,56 @@ test('only admitted jobs launch bounded Fargate workers, and completed launches 
   const [worker] = task.ContainerDefinitions;
   assert.equal(worker.PortMappings, undefined);
   assert.equal(worker.Secrets, undefined);
-  assert.deepEqual(worker.Command, ['node', 'src/cloud-worker.mjs']);
+  assert.deepEqual(worker.Command, ['node', 'src/resident.mjs']);
+  const vars = Object.fromEntries(worker.Environment.map(v => [v.Name, v.Value]));
+  assert.equal(vars.PEROTTINO_RESIDENT, '1');
+  assert.equal(vars.PEROTTINO_COMPANY_GATE, '1');
+  assert.match(vars.PEROTTINO_FACTORY_MANAGER_ARN, /-r-m$/);
+  assert.equal(vars.PEROTTINO_EMPLOYEE_CAPABILITY, undefined);
   assert.equal(props(r, 'WorkerSecurityGroup').SecurityGroupIngress, undefined);
-  assert.deepEqual(props(r, 'WorkerSecurityGroup').SecurityGroupEgress.map(e => e.ToPort), [443]);
+  assert.deepEqual(props(r, 'WorkerSecurityGroup').SecurityGroupEgress.map(e => e.ToPort), [80, 443]);
 });
 
-test('control roles, owner credentials, employee inference and stream recovery have distinct authority', t => {
+test('the owner, employees and trusted control code have disjoint entry points and permissions', t => {
   const config = sample(), r = render(t, config).template.Resources;
-  const asserted = [['WebFn', 'a', 'src/cloud-api.handler'], ['DispatchFn', 'd', 'src/dispatch.handler'],
-    ['AdmissionFn', 'i', 'src/dispatch.admit'], ['TerminalFn', 't', 'src/dispatch.terminal']];
+  const asserted = [['WebFn', 'a', 'src/cloud-api.handler'], ['FactoryFn', 'f', 'src/factory.handler'],
+    ['OwnerFn', 'o', 'src/factory.owner'], ['ManagerFn', 'm', 'src/factory.manager']];
   for (const [id, suffix, handler] of asserted) {
     assert.equal(props(r, id).FunctionName, 'factory-11111111-1111-4111-8111-111111111111-example-r-' + suffix);
     assert.deepEqual(props(r, id).ImageConfig.Command, [handler]);
     assert.deepEqual(props(r, id).Code, { ImageUri: config.lambdaImage });
+    assert.equal(props(r, id).Environment.Variables.PEROTTINO_RESIDENT, '1');
   }
   const owner = grants(r, 'WebRole').find(s => s.Action === 'secretsmanager:GetSecretValue');
   assert.equal(owner.Resource, config.ownerSecretArn);
   assert.equal(owner.Condition.StringEquals['aws:ResourceTag/perottino:purpose'], 'owner-verifier');
-  assert.ok(!actions(r, 'WebRole').includes('states:StartExecution'));
-  for (const id of ['DispatchRole', 'WorkflowRole', 'ExecutionRole', 'WorkerRole', 'AdmissionRole', 'TerminalRole']) {
+  for (const id of ['FactoryRole', 'ExecutionRole', 'WorkerRole']) {
     assert.ok(!actions(r, id).includes('secretsmanager:GetSecretValue'));
     assert.equal(props(r, id).PermissionsBoundary, config.permissionsBoundaryArn);
   }
-  assert.ok(!actions(r, 'AdmissionRole').includes('dynamodb:UpdateItem'));
-  assert.ok(!actions(r, 'DispatchRole').includes('dynamodb:PutItem'));
-  assert.ok(actions(r, 'WorkerRole').includes('bedrock-agentcore:ConnectBrowserAutomationStream'));
-  assert.deepEqual(grants(r, 'WorkerRole').find(g => g.Action.includes('bedrock:InvokeModel')).Resource, config.bedrockResourceArns);
-  const pass = grants(r, 'WorkflowRole').find(s => s.Action === 'iam:PassRole');
+  for (const [id, suffix] of [['WebRole', 'o'], ['WorkerRole', 'm']]) {
+    const invoke = grants(r, id).filter(g => g.Action === 'lambda:InvokeFunction');
+    assert.equal(invoke.length, 1);
+    assert.ok(invoke[0].Resource.endsWith('-r-' + suffix));
+    assert.ok(!actions(r, id).some(a => /^(ecs:|iam:PassRole)/.test(a)));
+    const ddb = grants(r, id).filter(g => Array.isArray(g.Action) && g.Action.some(a => a.startsWith('dynamodb:')));
+    assert.ok(ddb.length > 0);
+    for (const permission of ddb) {
+      const keys = permission.Condition['ForAllValues:StringLike']['dynamodb:LeadingKeys'];
+      assert.ok(!keys.some(key => key === '*' || key.startsWith('FACTORY')));
+      if (permission.Action.includes('dynamodb:UpdateItem')) assert.deepEqual(keys, ['AGENT#*']);
+    }
+  }
+  const gate = id => grants(r, id).find(s => s.Condition?.['ForAllValues:StringLike']?.['dynamodb:LeadingKeys']?.includes('COMPANY#GATE'));
+  assert.deepEqual(gate('WorkerRole').Action, ['dynamodb:ConditionCheckItem']);
+  assert.equal(gate('WebRole'), undefined);
+  assert.ok(gate('FactoryRole').Action.includes('dynamodb:PutItem'));
+  const factory = grants(r, 'FactoryRole');
+  assert.deepEqual(factory.find(s => s.Action === 'ecs:RunTask').Resource, { Ref: 'WorkerTask' });
+  assert.deepEqual(factory.find(s => s.Action === 'ecs:ListTasks').Condition.ArnEquals['ecs:cluster'], att('Cluster', 'Arn'));
+  const pass = factory.find(s => s.Action === 'iam:PassRole');
   assert.deepEqual(pass.Resource, [att('WorkerRole', 'Arn'), att('ExecutionRole', 'Arn')]);
   assert.equal(pass.Condition.StringEquals['iam:PassedToService'], 'ecs-tasks.amazonaws.com');
+  assert.ok(actions(r, 'WorkerRole').includes('bedrock-agentcore:ConnectBrowserAutomationStream'));
+  assert.deepEqual(grants(r, 'WorkerRole').find(g => g.Action.includes('bedrock:InvokeModel')).Resource, config.bedrockResourceArns);
 });

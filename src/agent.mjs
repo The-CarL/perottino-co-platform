@@ -200,9 +200,11 @@ export async function runTurn(job, { mode = process.env.PEROTTINO_AGENT_MODE || 
   }
 }
 
-// Runs inside the trusted model worker, including the on-demand Fargate employee task.
+// Runs inside the trusted model worker, including a resident Fargate employee task.
 // Keep owner credentials out of this task; model-callable filesystem tools are confined below.
-export async function sdkDecision(context, signal, CodexImplementation) {
+export async function sdkDecision(context, signal, CodexImplementation, protocol = {
+  instructions, schema: decisionSchema, validate: checkDecision,
+}) {
   const model = process.env.PEROTTINO_BEDROCK_MODEL || 'us.openai.gpt-6-sol';
   const region = process.env.AWS_REGION || 'us-east-1';
   if (!/^(?:us|global)\.openai\.[a-z0-9.-]+$/.test(model)) throw new Error('Invalid Bedrock inference profile.');
@@ -233,9 +235,9 @@ export async function sdkDecision(context, signal, CodexImplementation) {
     });
     const thread = client.startThread({ workingDirectory: workspace, skipGitRepoCheck: true,
       approvalPolicy: 'never', webSearchMode: 'disabled' });
-    const result = await thread.run(instructions + '\n\n' + JSON.stringify(context),
-      { outputSchema: decisionSchema, signal });
-    return checkDecision(JSON.parse(result.finalResponse));
+    const result = await thread.run(protocol.instructions + '\n\n' + JSON.stringify(context),
+      { outputSchema: protocol.schema, signal });
+    return protocol.validate(JSON.parse(result.finalResponse));
   } finally {
     await rm(base, { recursive: true, force: true });
   }

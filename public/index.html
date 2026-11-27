@@ -46,6 +46,7 @@
         <div class="header-contact"><h1 id="contactName">Company chat</h1><p id="contactMeta">Private workspace</p></div>
         <div class="header-actions">
           <button type="button" class="tool-button" id="directory" aria-label="Open employee directory" title="Directory"><svg><use href="#i-directory"/></svg><span>Directory</span></button>
+          <button type="button" class="tool-button" id="employeeButton" aria-label="Open employee details" title="Employee details" aria-haspopup="dialog" disabled><svg><use href="#i-person"/></svg><span>Employee</span></button>
           <button type="button" class="tool-button" id="memoryButton" aria-label="Open memory" title="Memory" aria-expanded="false" aria-controls="memoryPanel" disabled><svg><use href="#i-memory"/></svg><span>Memory</span></button>
         </div>
       </header>
@@ -82,6 +83,22 @@
     <div class="dialog-heading"><h2 id="pickerTitle">Directory</h2><button type="button" class="icon-button" id="closePicker" aria-label="Close directory"><svg><use href="#i-close"/></svg></button></div>
     <label class="search-field"><svg><use href="#i-search"/></svg><span class="sr-only">Search employees by name, handle, or role</span><input id="search" type="search" autocomplete="off" placeholder="Search by name, handle, or role"></label>
     <div id="results" class="results" aria-label="Employee results"></div>
+  </dialog>
+  <dialog id="employeeDialog" aria-labelledby="employeeHeading">
+    <div class="dialog-heading"><h2 id="employeeHeading">Employee</h2><button type="button" class="icon-button" id="closeEmployee" aria-label="Close employee details"><svg><use href="#i-close"/></svg></button></div>
+    <p class="muted" id="employeeRole"></p>
+    <dl id="employeeFacts"></dl>
+    <div class="employee-actions">
+      <button type="button" class="tool-button" id="toggleEmployment" hidden>Pause employee</button>
+      <button type="button" class="tool-button" id="fireEmployee" hidden>Fire employee</button>
+      <button type="button" class="tool-button" id="refreshEmployee">Refresh</button>
+    </div>
+    <p id="employeeStatus" class="muted" role="status"></p>
+    <form id="goalForm" hidden>
+      <label class="note-field"><strong>Assign a goal</strong><textarea rows="2" maxlength="16000" required id="goalText" placeholder="What should this employee accomplish?"></textarea></label>
+      <button type="submit" class="primary" id="assignGoal">Assign goal</button>
+    </form>
+    <section aria-labelledby="goalsHeading"><h3 id="goalsHeading">Recent goals</h3><div id="employeeGoals"></div></section>
   </dialog>
   <dialog id="sourceDialog" aria-labelledby="sourceTitle">
     <div class="dialog-heading"><h2 id="sourceTitle">Source message</h2><button type="button" class="icon-button" id="closeSource" aria-label="Close source message"><svg><use href="#i-close"/></svg></button></div>

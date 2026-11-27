@@ -92,14 +92,14 @@ function reject(statusCode, message) {
   body: JSON.stringify({ error: message }) };
 }
 
-export function createCloudHandler({ store, readOwner, publicOrigin, publicDir = publicFiles, now = Date.now }) {
+export function createCloudHandler({ store, readOwner, ownerControl, publicOrigin, publicDir = publicFiles, now = Date.now }) {
   let expected;
   if (publicOrigin) {
     const url = new URL(publicOrigin);
     if (url.protocol !== 'https:' || url.href !== url.origin + '/') throw new Error('PUBLIC_ORIGIN must be an HTTPS origin.');
     expected = url.origin;
   }
-  const handle = createConsoleHandler({ store, mode: 'bedrock', publicDir, auth: ownerMiddleware(readOwner, expected, now) });
+  const handle = createConsoleHandler({ store, mode: 'bedrock', publicDir, ownerControl, auth: ownerMiddleware(readOwner, expected, now) });
   return async event => {
     const req = gatewayRequest(event, expected);
     if (!req) return reject(403, 'Request source denied.');
@@ -123,8 +123,22 @@ async function production() {
     import('./cloud-store.mjs'), import('@aws-sdk/client-secrets-manager'),
   ]);
   const secrets = new SecretsManagerClient({ region: process.env.AWS_REGION, maxAttempts: 2 });
+  const factoryArn = process.env.PEROTTINO_FACTORY_OWNER_ARN;
+  let ownerControl;
+  if (factoryArn) {
+    const { LambdaClient, InvokeCommand } = await import('@aws-sdk/client-lambda');
+    const client = new LambdaClient({ region: process.env.AWS_REGION, maxAttempts: 2 });
+    ownerControl = async event => {
+      try {
+        const response = await client.send(new InvokeCommand({ FunctionName: factoryArn, InvocationType: 'RequestResponse',
+          Payload: Buffer.from(JSON.stringify(event)) }), { abortSignal: AbortSignal.timeout(20_000) });
+        if (response.FunctionError || response.StatusCode !== 200) return { ok: false, status: 503 };
+        return JSON.parse(Buffer.from(response.Payload).toString('utf8'));
+      } catch { return { ok: false, status: 503 }; }
+    };
+  }
   return createCloudHandler({
-    store: await createCloudStore({ tableName }), publicOrigin: process.env.PUBLIC_ORIGIN,
+    store: await createCloudStore({ tableName }), publicOrigin: process.env.PUBLIC_ORIGIN, ownerControl,
     readOwner: async () => {
       const value = await secrets.send(new GetSecretValueCommand({ SecretId: secretArn, VersionStage: 'AWSCURRENT' }),
         { abortSignal: AbortSignal.timeout(4000) });

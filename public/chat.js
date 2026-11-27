@@ -19,6 +19,10 @@ let directoryCheckedAt = 0;
 let lastFocus = null;
 let noteAction = null;
 let sourceRequest = 0;
+const employment = new Map();
+const employeeRequests = new Map();
+let profileRead = 0;
+let actionPending = false;
 const pages = {
   messages:{button:get('earlierMessages'),label:'Load earlier messages',items:'messages'},
   memory:{button:get('moreNotes'),label:'More notes',items:'memories'}
@@ -94,7 +98,7 @@ async function openSource(messageId) {
     if (version !== sourceRequest) return;
     const stamp = new Date(message.createdAt);
     const date = Number.isNaN(stamp.getTime()) ? '' : dayLabel.format(stamp);
-    get('sourceMeta').textContent = [message.author === 'owner' ? 'You' : state.agent.name,date].filter(Boolean).join(' · ');
+    get('sourceMeta').textContent = [messageAuthor(message),date].filter(Boolean).join(' · ');
     get('sourceBody').textContent = message.text;
   } catch {
     if (version === sourceRequest) get('sourceBody').textContent = 'The source message is unavailable.';
@@ -106,6 +110,113 @@ function element(tag, className, content) {
   if (className) result.className = className;
   if (content !== undefined) result.textContent = content;
   return result;
+}
+function messageAuthor(message) {
+  if (message.author === 'owner') return 'You';
+  if (message.author === 'employee') return state.agents.find(person => person.id === message.senderAgentId)?.name || 'Coworker';
+  if (message.author === 'external') return message.email?.from ? 'Email from ' + message.email.from : 'External email';
+  return state.agent.name;
+}
+function showEmployeeState(profile) {
+  employment.set(profile.id, profile.desiredState);
+  if (state.agent?.id !== profile.id) return;
+  input.disabled = profile.desiredState === 'fired';
+  updateComposer();
+  renderStatus();
+}
+function renderEmployee({employee, goals}) {
+  showEmployeeState(employee);
+  const manager = state.agents.find(person => person.id === employee.managerId);
+  const fields = [['Employment', employee.desiredState], ['Runtime', employee.runtimeStatus],
+    ['Reports to', manager?.name || employee.managerId || 'Owner'], ['Can hire', employee.canHire ? 'Yes' : 'No']];
+  get('employeeFacts').replaceChildren(...fields.flatMap(([key,value]) => [element('dt','',key), element('dd','',value)]));
+  const archived = employee.desiredState === 'fired';
+  get('toggleEmployment').hidden = archived;
+  get('toggleEmployment').textContent = employee.desiredState === 'paused' ? 'Resume employee' : 'Pause employee';
+  get('fireEmployee').hidden = archived;
+  get('goalForm').hidden = archived;
+  const rows = goals.map(goal => {
+    const article = element('article','goal-summary');
+    article.append(element('strong','',goal.text), element('p','muted',goal.status + ' · ' + goal.stepCount + (goal.stepCount === 1 ? ' step' : ' steps')));
+    if (goal.checkpoint) {
+      let progress = goal.checkpoint;
+      try {
+        const checkpoint = JSON.parse(progress);
+        if (Array.isArray(checkpoint?.progress)) progress = checkpoint.progress.filter(item => typeof item === 'string').join('\n');
+      } catch { /* Local checkpoints contain human-readable progress. */ }
+      if (progress) article.append(element('p','',progress));
+    }
+    if (goal.status === 'waiting' && goal.nextRunAt) {
+      const next = new Date(goal.nextRunAt);
+      if (Number.isFinite(next.getTime())) article.append(element('p','muted','Next check ' + next.toLocaleString()));
+    }
+    return article;
+  });
+  get('employeeGoals').replaceChildren(...(rows.length ? rows : [element('p','muted','No goals assigned.')]));
+}
+async function refreshEmployee() {
+  const id = state.agent?.id;
+  const version = ++profileRead;
+  try {
+    const result = await (await api(url(id,'employee'))).json();
+    if (version === profileRead && id === state.agent?.id && get('employeeDialog').open) renderEmployee(result);
+  } catch {
+    if (version === profileRead && get('employeeDialog').open) get('employeeStatus').textContent = 'Employee details could not be loaded. Select Refresh to try again.';
+  }
+}
+function openEmployee() {
+  const agent = state.agent;
+  if (!agent) return;
+  get('employeeHeading').textContent = agent.name;
+  get('employeeRole').textContent = fullRole(agent);
+  get('goalText').value = employeeRequests.get(agent.id + '/goals')?.text || '';
+  get('employeeFacts').replaceChildren();
+  get('employeeGoals').replaceChildren();
+  get('toggleEmployment').hidden = get('fireEmployee').hidden = get('goalForm').hidden = true;
+  get('employeeStatus').textContent = '';
+  get('employeeDialog').showModal();
+  void refreshEmployee();
+}
+async function employeeAction(operation) {
+  const agent = state.agent;
+  if (!agent || actionPending) return;
+  const goal = operation === 'goals';
+  const text = goal ? get('goalText').value.trim() : '';
+  if (goal && !text) return;
+  if (operation === 'fire' && !window.confirm('Fire ' + agent.name + '? Their work will stop permanently. Their history will remain available.')) return;
+  const resource = goal ? operation : 'lifecycle/' + operation;
+  const key = agent.id + '/' + resource;
+  let request = employeeRequests.get(key);
+  if (!request || (goal && request.text !== text)) {
+    request = {requestId:crypto.randomUUID(), ...(goal ? {text} : {})};
+    employeeRequests.set(key,request);
+  }
+  actionPending = true;
+  const controls = ['assignGoal','toggleEmployment','fireEmployee','refreshEmployee','goalText'];
+  for (const id of controls) get(id).disabled = true;
+  const sameEmployee = () => state.agent?.id === agent.id && get('employeeDialog').open;
+  get('employeeStatus').textContent = 'Saving…';
+  try {
+    const response = await api(url(agent.id,resource),{method:'POST',
+      headers:{'Content-Type':'application/json','X-Requested-With':'owner-console'}, body:JSON.stringify(request)});
+    const result = await response.json();
+    employeeRequests.delete(key);
+    if (result.employee) showEmployeeState(result.employee);
+    if (sameEmployee()) {
+      if (goal) get('goalText').value = '';
+      get('employeeStatus').textContent = goal ? 'Goal assigned.' : 'Employment updated.';
+      await refreshEmployee();
+    }
+  } catch (error) {
+    if (sameEmployee()) {
+      get('employeeStatus').textContent = error.status === 409 ? 'This action conflicts with the current employee state or a previous request.' :
+        'The action could not be confirmed. Retry it to check the same request.';
+      if (error.status === 409) await refreshEmployee();
+    }
+  } finally {
+    actionPending = false;
+    for (const id of controls) get(id).disabled = false;
+  }
 }
 function icon(id) {
   const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
@@ -238,6 +349,7 @@ function selectAgent(agent, focus = false) {
     input.value = state.drafts.get(agent.id) || '';
     get('timeline').replaceChildren();
     get('memoryButton').disabled = false;
+    get('employeeButton').disabled = false;
     get('memoryOwner').textContent = agent.name + '’s notes';
     renderMemory();
   }
@@ -246,7 +358,7 @@ function selectAgent(agent, focus = false) {
   get('contactName').textContent = agent.name;
   get('contactMeta').textContent = headerMeta(agent);
   identifyAvatar(get('headerAvatar'),agent);
-  input.disabled = false;
+  input.disabled = employment.get(agent.id) === 'fired';
   input.placeholder = 'Message ' + agent.name + '…';
   document.title = agent.name + ' · Company chat · Perottino & Co.';
   renderStatus();
@@ -273,6 +385,8 @@ function renderStatus() {
   const busy = state.status === 'queued' || state.status === 'working';
   activity.classList.toggle('busy', busy);
   activity.textContent = !agent ? '' : state.sending.has(agent.id) ? 'Sending…' :
+    employment.get(agent.id) === 'fired' ? 'Employment ended. This conversation is archived.' :
+    employment.get(agent.id) === 'paused' ? 'Employee paused. New work will wait until they resume.' :
     state.status === 'queued' ? 'Message queued for ' + agent.name + '.' :
     state.status === 'working' ? agent.name + ' is working…' :
     state.status === 'error' ? 'The last agent run encountered an error.' :
@@ -296,16 +410,19 @@ function renderTimeline(scrollToBottom) {
     row.tabIndex = -1;
     const body = element('div','message-body');
     const meta = element('div','message-meta');
-    const author = owner ? 'You' : state.agent.name;
+    const author = messageAuthor(msg);
     meta.append(element('strong','',author));
     if (valid) {
       const time = element('time','',timeLabel.format(date));
       time.dateTime = date.toISOString();
       meta.append(time);
     }
-    body.append(meta,element('div','bubble',msg.text));
-    if (owner && msg.status === 'error') body.append(element('small','failed-message','Reply failed'));
-    if (!owner) row.append(avatar(state.agent));
+    body.append(meta);
+    if (msg.author === 'external' && msg.email?.subject) body.append(element('p','email-subject',msg.email.subject));
+    body.append(element('div','bubble',msg.text));
+    if (msg.status === 'error') body.append(element('small','failed-message','Reply failed'));
+    const sender = msg.author === 'agent' ? state.agent : state.agents.find(person => person.id === msg.senderAgentId);
+    if (sender) row.append(avatar(sender));
     row.append(body);
     fragment.append(row);
   }
@@ -470,6 +587,7 @@ async function loadDirectory() {
         input.disabled = true;
         get('send').disabled = true;
         get('memoryButton').disabled = true;
+        get('employeeButton').disabled = true;
         renderNav();
         renderStatus();
       }
@@ -485,7 +603,7 @@ async function loadDirectory() {
 }
 function updateComposer() {
   const agent = state.agent;
-  get('send').disabled = !agent || !input.value.trim() || state.sending.has(agent?.id);
+  get('send').disabled = !agent || input.disabled || !input.value.trim() || state.sending.has(agent?.id);
   input.rows = 1;
   // Size to the text while keeping long drafts scrollable under a restrictive CSP.
   const style = getComputedStyle(input);
@@ -500,7 +618,7 @@ async function send(event) {
   event.preventDefault();
   const agent = state.agent;
   const text = input.value.trim();
-  if (!agent || !text || state.sending.has(agent.id)) return;
+  if (!agent || input.disabled || !text || state.sending.has(agent.id)) return;
   let request = state.requests.get(agent.id);
   if (!request || request.text !== text) {
     request = {text, requestId:crypto.randomUUID()};
@@ -526,6 +644,7 @@ async function send(event) {
   } catch (error) {
     state.sendErrors.set(agent.id,
       error.status === 400 || error.status === 413 ? 'The message could not be accepted. Check its length and try again.' :
+      error.status === 409 ? 'This message conflicts with an earlier request or the employee has left the company. Open Employee for details.' :
       'The send could not be confirmed. Try sending the same message again.');
   } finally {
     state.sending.delete(agent.id);
@@ -540,6 +659,13 @@ function setDraft(text) {
 }
 get('newMessage').addEventListener('click', () => showPicker('New message'));
 get('directory').addEventListener('click', () => showPicker('Directory'));
+get('employeeButton').addEventListener('click',openEmployee);
+get('closeEmployee').addEventListener('click',() => get('employeeDialog').close());
+get('employeeDialog').addEventListener('close',() => { profileRead++; });
+get('refreshEmployee').addEventListener('click',() => { get('employeeStatus').textContent = ''; void refreshEmployee(); });
+get('toggleEmployment').addEventListener('click',() => void employeeAction(employment.get(state.agent?.id) === 'paused' ? 'resume' : 'pause'));
+get('fireEmployee').addEventListener('click',() => void employeeAction('fire'));
+get('goalForm').addEventListener('submit',event => { event.preventDefault(); void employeeAction('goals'); });
 get('earlierMessages').addEventListener('click',() => void loadEarlier('messages'));
 get('moreNotes').addEventListener('click',() => void loadEarlier('memory'));
 get('closeSource').addEventListener('click',() => get('sourceDialog').close());
@@ -560,7 +686,7 @@ get('memoryShade').addEventListener('click', () => toggleMemory(false));
 narrow.addEventListener('change', () => { if (!narrow.matches) closeNavigation(); updateOverlay(); });
 overlayMemory.addEventListener('change', updateOverlay);
 document.addEventListener('keydown', event => {
-  if (event.key !== 'Escape' || picker.open || get('noteEditor').open || get('sourceDialog').open) return;
+  if (event.key !== 'Escape' || picker.open || get('noteEditor').open || get('sourceDialog').open || get('employeeDialog').open) return;
   if (!get('memoryPanel').hidden) toggleMemory(false);
   else closeNavigation();
 });
@@ -598,7 +724,8 @@ async function poll() {
       directoryCheckedAt = Date.now();
     }
     // Selecting an employee in loadDirectory already fetches the first message page.
-    if (selected && state.agent?.id === selected) await refresh(false);
+    if (selected && state.agent?.id === selected) await Promise.all([refresh(false),
+      get('employeeDialog').open && !actionPending ? refreshEmployee() : undefined]);
   } finally { schedulePoll(); }
 }
 document.addEventListener('visibilitychange', () => schedulePoll(0));

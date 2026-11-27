@@ -1,6 +1,6 @@
 # Release into a target AWS account
 
-The release runner builds the images and prepares the CloudFormation change set. The owner needs no development machine. The active hosted stack uses a managed HTTPS API, Lambda functions, DynamoDB Streams, Step Functions Standard, and one-shot AWS Fargate tasks. The target supplies its own account, public subnet, permissions boundary and Bedrock access. [Architecture, cost and recovery](HOSTED.md)
+The release runner builds the images and prepares the CloudFormation change set. The owner needs no development machine. The active hosted stack uses a managed HTTPS API, Lambda functions, DynamoDB, EventBridge and one standalone Fargate task per active employee. The target supplies its own account, public subnet, permissions boundary and Bedrock access. [Architecture, cost and recovery](HOSTED.md)
 
 ## Select the target
 
@@ -12,7 +12,7 @@ Select public IPv4 subnets in the specified VPC with working DNS and an internet
 
 | Template | What it provisions |
 | --- | --- |
-| [Runtime bootstrap](runtime-bootstrap.yaml) | A provider-named ECR repository with immutable tags and permission for the four project-scoped Lambda functions to pull their image, and an empty Secrets Manager slot for the owner verifier. |
+| [Runtime bootstrap](runtime-bootstrap.yaml) | A provider-named ECR repository with immutable tags and permission for the project-scoped console, factory and optional mail functions to pull their image, and an empty Secrets Manager slot for the owner verifier. |
 | [Git credential](github-pat.yaml) | The retained projects Git credential slot at `/perottino-co/github/pat`. The owner supplies the value separately. The current runtime has no grant to read it. Reuse its owning stack if it already exists in the destination account and region. |
 
 For a fresh target, create the runtime bootstrap stack with the scope used in hosted synthesis. The Git credential template takes no parameters. Use a distinct stack name for each. For existing stacks, review a change set against the recorded stack instead of creating another copy.
@@ -42,7 +42,7 @@ Fill the private hosted configuration with `workerImage` and `lambdaImage` from 
 
 ## Review and execute the change set
 
-Use `artifacts.Hosted.properties.stackName` from the generated assembly manifest as `HOSTED_STACK`, and supply its tags. Choose `CREATE` for a fresh stack and `UPDATE` for a subsequent release. Preserve the production table identity, stream mapping and stored conversations. Do not execute a template that would inadvertently replace durable state.
+Use `artifacts.Hosted.properties.stackName` from the generated assembly manifest as `HOSTED_STACK`, and supply its tags. Choose `CREATE` for a fresh stack and `UPDATE` for a subsequent release. Preserve the production table identity and stored conversations. For an upgrade from per-turn execution, pause writes and finish outstanding workflow executions before enabling the resident runtime. Review any in-flight side effects and keep a recovery point for the retained table. Do not execute a template that would inadvertently replace durable state.
 
 ```sh
 aws cloudformation create-change-set --region "$AWS_REGION" --stack-name "$HOSTED_STACK" \
@@ -61,15 +61,16 @@ The new hosted stack has a different name from the earlier single-host design. T
 
 ## Cost at pilot scale
 
-These are US East (N. Virginia) public on-demand rates checked on November 26, 2026, before credits or taxes. The number of directory entries does not set the compute bill. With the console closed and no queued jobs, the system runs zero employee tasks and starts zero browser sessions.
+Monthly estimates below use 730 hours at US East (N. Virginia) Linux x86 on-demand rates, before credits or taxes. Each active employee runs continuously, including while waiting for work. A paused employee stops incurring task compute and public IPv4 charges when Fargate releases those resources.
 
-| Usage driver | How to estimate |
-| --- | --- |
-| Fargate worker | The lean Linux x86 size is 0.25 vCPU and 1 GB. At $0.000011244 per vCPU-second and $0.000001235 per GB-second, compute costs about $0.01457 per task-hour. Billing starts at image download, with a one-minute minimum. [Fargate pricing](https://aws.amazon.com/fargate/pricing/) |
-| Temporary public IPv4 | Budget $0.005 per address-hour during the task's IP allocation, with a one-minute minimum. A simple estimate for 1,000 tasks using **five billed minutes each** is **$1.63 for worker compute plus IPv4**. Retries add billable launches. [VPC pricing](https://aws.amazon.com/vpc/pricing/) |
-| Control plane | HTTP API starts at $1 per million requests. Lambda x86 charges $0.20 per million requests plus duration. Step Functions Standard charges $0.000025 per transition. Its waits release compute. Rechecking a busy employee adds transitions, Lambda calls and DynamoDB reads. A foreground owner tab polls every minute when idle and every 2.5 seconds while work is pending. Hidden tabs suspend polling. [API Gateway](https://aws.amazon.com/api-gateway/pricing/) · [Lambda](https://aws.amazon.com/lambda/pricing/) · [Step Functions](https://aws.amazon.com/step-functions/pricing/) |
-| Durable records and images | Budget $0.40 per retained Secrets Manager secret per month, or $0.80 for the owner and Git slots together, plus read charges. Private ECR storage is $0.10 per GB-month. DynamoDB on-demand reads and writes, storage, point-in-time recovery, S3 failure archives and log storage depend on usage. [Secrets Manager](https://aws.amazon.com/secrets-manager/pricing/) · [ECR](https://aws.amazon.com/ecr/pricing/) · [DynamoDB](https://aws.amazon.com/dynamodb/pricing/) |
-| Model and browser | Price actual Bedrock input/output tokens for the selected model, and actual AgentCore Browser session memory and active CPU. These are separate from the $1.63 example. [Bedrock pricing](https://aws.amazon.com/bedrock/pricing/) · [AgentCore pricing](https://aws.amazon.com/bedrock/agentcore/pricing/) |
-| Domain and network | The default execute-api hostname is included. An existing Route 53 zone adds no second hosted-zone fee. A new standard hosted zone generally starts at $0.50 per month. Account for applicable egress, DNS and log ingestion. [Route 53 pricing](https://aws.amazon.com/route53/pricing/) |
+| Active employees | Fargate compute | Public IPv4 | Monthly subtotal |
+| ---: | ---: | ---: | ---: |
+| 1 | $10.63 | $3.65 | $14.28 |
+| 2 | $21.27 | $7.30 | $28.57 |
+| 30 | $318.99 | $109.50 | $428.49 |
 
-A first chat reply includes workflow and Fargate cold-start time. Record time to first reply, billed task seconds, token counts and browser usage in a live pilot before forecasting a company-wide monthly total.
+Each task uses 0.25 vCPU and 1 GB. Compute is `3600 × (0.25 × $0.000011244 + $0.000001235)` per hour. Public IPv4 is $0.005 per address-hour. Subtotals use unrounded rates. [Fargate pricing](https://aws.amazon.com/fargate/pricing/) · [VPC pricing](https://aws.amazon.com/vpc/pricing/)
+
+Add Bedrock tokens, AgentCore Browser sessions, on-demand DynamoDB reads on pulses, writes/checkpoints, backups, HTTP API, Lambda, EventBridge where applicable, logging, data transfer, image storage and any enabled mail infrastructure. The model and browser incur charges as used. The retained owner and Git credential slots together cost about $0.80 per month plus reads. Measure dwell time, model calls per completed assignment, and end-to-end response latency in a live pilot. [DynamoDB](https://aws.amazon.com/dynamodb/pricing/) · [Bedrock](https://aws.amazon.com/bedrock/pricing/) · [AgentCore](https://aws.amazon.com/bedrock/agentcore/pricing/) · [Secrets Manager](https://aws.amazon.com/secrets-manager/pricing/)
+
+The optional SES ingress stack takes the hosted table name and the same Lambda image digest. Release it separately when a company receiving domain is ready. [Inbound mail setup](INBOUND-EMAIL.md)

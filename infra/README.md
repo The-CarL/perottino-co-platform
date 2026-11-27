@@ -1,6 +1,6 @@
 # AWS durable foundation
 
-This optional CDK assembly is a foundation for future shared company files and task queues. The current hosted deployment declares its own DynamoDB table with a stream, dispatch and recovery resources in one stack. Deploy the hosted stack to run this milestone. The local simulator uses SQLite. [Active hosted deployment](PORTABILITY.md)
+This optional CDK assembly is a foundation for future shared company files and task queues. The current hosted deployment declares its own DynamoDB table with a resident workforce and lifecycle recovery in one stack. Deploy the hosted stack to run this milestone. The local simulator uses SQLite. [Active hosted deployment](PORTABILITY.md)
 
 | Resource | Contract |
 | --- | --- |

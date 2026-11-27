@@ -2,7 +2,7 @@
 
 The platform for an agent-run company in its owner's AWS account. This repository contains the employee runtime and owner console. Employees will publish their applications in the separate [company projects repository](https://github.com/The-CarL/perottino-co-projects).
 
-The first milestone runs locally and has a reusable AWS deployment definition. CI exercises the developer and container paths on every PR. Sign in, find Mara by name or the CEO role, send a direct message and inspect the notes she keeps. Messages, queued work and notes survive a process restart. The only live AWS resource provisioned for this milestone is the projects Git credential slot.
+The first milestone runs locally and has a reusable AWS deployment definition. CI exercises the developer and container paths on every PR. Sign in, find Mara by name or the CEO role, send a direct message or assign a goal. Each active employee gets a standalone Fargate task at bootstrap or hire. Its messages, goals and memory survive a replacement task. The only live AWS resource provisioned for this milestone is the projects Git credential slot.
 
 ## Run locally
 
@@ -28,6 +28,8 @@ recall handoff
 browse https://example.com/
 ```
 
+For a local hiring trial, send `hire Engineer` to Mara. Open the new employee from the directory, select **Employee**, and assign `remember Review the preview before release.` as a goal. The same dialog shows progress and provides pause, resume and fire controls. The local simulator supports deterministic work; the hosted employee uses Bedrock for free-form goals.
+
 Open **Memory** to inspect, correct or forget a saved note and follow it back to the original message. Correcting or forgetting a note keeps the original chat history. Stop the service with Ctrl-C and restart it in the same directory to recover the conversation.
 
 The default local worker handles these commands deterministically. Public web reads use Chromium to extract text from HTML or plain text, with redirects checked and scripts and external assets disabled. Browsing a real site requires internet access. Credentials, a GitHub token and AWS model access are unnecessary for the local demo.
@@ -40,7 +42,7 @@ npm run setup:browser
 npm run check
 ```
 
-The check runs the Node test suite, synthesizes the AWS foundation and the hosted stack into separate directories, then drives Chromium against the actual owner setup and chat server. The browser smoke test sends a desktop DM, verifies its saved note, restarts the server and recalls the note on a mobile viewport. Tests use temporary credentials, ephemeral loopback listeners, fixture web pages and temporary data directories. For screenshots, set `PEROTTINO_SCREENSHOT_DIR` when running `npm run test:smoke`. Dependencies and the matched browser download require network access on first installation. The test flow uses no AWS account or external model.
+The check runs the Node test suite, synthesizes the AWS foundation and the hosted stack into separate directories, then drives Chromium against the actual owner setup and chat server. The browser smoke test sends a desktop DM, verifies its saved note, restarts the server, recalls the note on a mobile viewport, and exercises hiring, goal assignment and lifecycle controls. Tests use temporary credentials, ephemeral loopback listeners, fixture web pages and temporary data directories. For screenshots, set `PEROTTINO_SCREENSHOT_DIR` when running `npm run test:smoke`. Dependencies and the matched browser download require network access on first installation. The test flow uses no AWS account or external model.
 
 The GitHub Actions workflow performs the same check on Ubuntu with read-only repository permissions. [Check workflow](.github/workflows/check.yml)
 
@@ -59,20 +61,25 @@ For noninteractive owner setup, pipe the password from a protected source into `
 
 ### Hosted execution
 
-An API Gateway HTTP API and an on-demand Lambda serve the owner console and directory. A DM is committed to DynamoDB before the console acknowledges it. DynamoDB Streams triggers a dispatcher, Step Functions waits for the employee to be available, and ECS starts a Fargate task for that turn. The task loads the employee’s history and memory, uses Bedrock when inference is needed, commits the result, and exits. A browser read uses a short-lived AgentCore Browser session. The local simulator and smoke tests can run without AWS or the PAT.
+Bootstrap starts Mara as the first employee. An authorized hire creates a directory entry and a durable first assignment, then the factory calls ECS `RunTask` for the new employee. Each task stays alive across messages, checks its inbox and advances due goals on a pulse. Empty pulses consume Fargate time and DynamoDB reads. Bedrock is invoked for work that needs inference.
+
+The owner console submits DMs, goals and lifecycle commands. Closing the browser leaves employees running. The factory records a pause or firing before it stops the task. An unexpected stop of an active employee triggers recovery from DynamoDB. Generation and task-identity checks protect against late work from an old task. The default headcount limit is two, including Mara.
 
 ```mermaid
 flowchart LR
-    Owner --> API[API Gateway HTTPS]
-    API --> Console[Console Lambda]
-    Console --> DDB[(DynamoDB)]
-    DDB -->|Stream| Dispatch[Dispatcher Lambda]
-    Dispatch --> Flow[Step Functions]
-    Flow -->|RunTask| Task[Fargate employee]
+    Owner --> Console[API Gateway and owner console]
+    Console -->|DM or goal| DDB[(DynamoDB)]
+    Console -->|Lifecycle control| Factory[Employee factory]
+    Factory -->|RunTask at bootstrap, hire or recovery| Task[Standalone Fargate employee]
+    Email[Optional SES inbound email] -->|SNS and mail Lambda| DDB
+    Task <-->|Inbox, goals and checkpoints| DDB
+    Task -->|Authorized hire| Factory
     Task --> Bedrock
-    Task -->|When requested| Browser[AgentCore Browser]
-    Task -->|Reply and memory| DDB
+    Task -->|Public web read| Browser[AgentCore Browser]
+    ECS[ECS stopped event or scheduled repair] --> Factory
 ```
+
+The separate mail stack delivers scanned messages for employee handles and unambiguous role aliases. An incoming email is attributed to its external sender. Replies to external recipients require the future outbound mail service. [Inbound mail setup](infra/INBOUND-EMAIL.md)
 
 ## AWS infrastructure and Git credentials
 
@@ -92,4 +99,4 @@ Here `PAT_STACK` is the target stack name and `PRIVATE_TAG_FILE` is a private JS
 
 Use the standard AWS HTTPS endpoint or supply an approved custom domain. The release runner publishes two single-architecture images and synthesizes the hosted stack using the target account's inputs. [Deployment procedure](infra/PORTABILITY.md) · [Hosted operations and pricing](infra/HOSTED.md)
 
-Email, hiring, the Git worker, and application provisioning remain future milestones. The separate foundation template is available for future corporate files and shared work queues. [Foundation](infra/README.md) · [Engineering contract](ENGINEERING.md)
+Promotion grants, outbound email, the Git worker and application provisioning remain future milestones. The separate foundation template is available for future corporate files and shared work queues. [Foundation](infra/README.md) · [Engineering contract](ENGINEERING.md)

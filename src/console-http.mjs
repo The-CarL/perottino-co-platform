@@ -78,7 +78,19 @@ async function readPage(store, agentId, section, query) {
   return section === 'messages' ? store.messages(agentId) : { memories: await store.getMemories(agentId) };
 }
 
-export function createConsoleHandler({ store, auth, publicDir, mode, onEnqueued }) {
+function employeeProfile(row) {
+  const { id, name, handle, role, managerId, canHire, desiredState, generation } = row;
+  const runtimeStatus = row.runtimeStatus ?? (desiredState === 'active'
+    ? (row.taskArn && row.taskGeneration === generation ? 'Task registered' : 'Awaiting task') : 'Stopped or stopping');
+  return { id, name, handle, role, managerId: managerId ?? null, canHire: Boolean(canHire), desiredState, generation, runtimeStatus };
+}
+
+function goalSummary(row) {
+  const { id, text, status, checkpoint, stepCount, nextRunAt, createdAt, updatedAt } = row;
+  return { id, text, status, checkpoint, stepCount, nextRunAt, createdAt, updatedAt };
+}
+
+export function createConsoleHandler({ store, auth, publicDir, mode, onEnqueued, ownerControl }) {
   return async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -94,14 +106,43 @@ export function createConsoleHandler({ store, auth, publicDir, mode, onEnqueued 
         if (req.method !== 'GET') throw new HttpError(405, 'Method not allowed.');
         return json(res, 200, { agents: await store.directory(), mode });
       }
-      const route = /^\/api\/agents\/([a-zA-Z0-9_-]+)\/(memory|messages)(?:\/([a-zA-Z0-9_-]+))?$/.exec(pathname);
+      const route = /^\/api\/agents\/([a-zA-Z0-9_-]+)\/(memory|messages|employee|goals|lifecycle)(?:\/([a-zA-Z0-9_-]+))?$/.exec(pathname);
       if (!route || !(await store.getAgent(route[1]))) throw new HttpError(404, 'Resource not found.');
       const [, agentId, section, itemId] = route;
+      if (section === 'employee' || section === 'goals') {
+        if (itemId) throw new HttpError(404, 'Resource not found.');
+        if (req.method === 'GET') {
+          if (section === 'goals') return json(res, 200, { goals: (await store.listGoals(agentId)).map(goalSummary) });
+          const [employee, goals] = await Promise.all([store.employee(agentId), store.listGoals(agentId)]);
+          return json(res, 200, { employee: employeeProfile(employee), goals: goals.map(goalSummary) });
+        }
+        if (section !== 'goals' || req.method !== 'POST') throw new HttpError(405, 'Method not allowed.');
+        const { text, requestId } = await readAction(req, true);
+        const result = await store.assignGoal(agentId, text, requestId);
+        if (result.conflict) throw new HttpError(409, 'That requestId belongs to another goal.');
+        json(res, 202, { goal: goalSummary(result.goal) });
+        if (onEnqueued) setImmediate(onEnqueued);
+        return;
+      }
+      if (section === 'lifecycle') {
+        if (!['pause','resume','fire'].includes(itemId)) throw new HttpError(404, 'Resource not found.');
+        if (req.method !== 'POST') throw new HttpError(405, 'Method not allowed.');
+        const { requestId } = await readAction(req, false);
+        if (!ownerControl) throw new HttpError(503, 'Employee controls are unavailable.');
+        const result = await ownerControl({ operation: itemId, agentId, requestId });
+        if (!result?.ok) {
+          const messages = { 400: 'Invalid employee action.', 403: 'Employee action denied.', 404: 'Employee not found.',
+            409: 'This action conflicts with the current employment state or a previous request.', 429: 'Employee action limit reached.' };
+          const status = Number(result?.status);
+          throw new HttpError(Object.hasOwn(messages, status) ? status : 503, messages[status] || 'Employee action could not be confirmed. Retry the same request.');
+        }
+        return json(res, 200, { employee: employeeProfile(result.employee) });
+      }
       if (itemId) {
         if (section === 'messages') {
           if (req.method !== 'GET') throw new HttpError(405, 'Method not allowed.');
           const message = store.messageSource ? await store.messageSource(agentId, itemId) :
-            (await store.messages(agentId)).messages.find(m => m.id === itemId && m.author === 'owner');
+            (await store.messages(agentId)).messages.find(m => m.id === itemId && m.author !== 'agent');
           if (!message) throw new HttpError(404, 'Source message not found.');
           return json(res, 200, { message });
         }
@@ -121,6 +162,7 @@ export function createConsoleHandler({ store, auth, publicDir, mode, onEnqueued 
       json(res, 202, { message: result.message });
       if (onEnqueued) setImmediate(onEnqueued);
     } catch (error) {
+      if (error.code === 'EMPLOYEE_FIRED' && !res.headersSent) return json(res, 409, { error: 'This employee has left the company.' });
       const known = error instanceof HttpError;
       if (!res.headersSent && !res.destroyed) json(res, known ? error.status : 500, { error: known ? error.message : 'The request could not be completed.' });
       if (!known) console.error('Request failed:', error.code || error.name);
