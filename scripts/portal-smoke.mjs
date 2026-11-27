@@ -320,32 +320,42 @@ export async function checkBrowserControl({ page, nav }) {
     .click({ position: { x: 20, y: 20 } });
   await page.getByLabel('Browser key').selectOption('Enter');
   await button(page, 'Send key').click();
-  // Hold one real frame on the wire while the owner confirms stop.
-  const frameGate = Promise.withResolvers(), order = [];
-  const framePath = '**/api/company/browser.frame';
-  const onStop = request => {
-    if (request.url().endsWith('/api/company/browser.stop')) order.push('stop');
-  };
-  page.on('request', onStop);
-  await page.route(framePath, async route => {
-    await frameGate.promise;
-    const response = await route.fetch();
-    order.push('frame');
-    await route.fulfill({ response });
-  }, { times: 1 });
-  const pending = page.waitForRequest(framePath, { timeout: 10000 });
+  await button(page, 'Hand back control').click();
+  await page.getByText('Employee has control.', { exact: true }).waitFor();
+
+  // Keep Chromium's own authenticated request. Delay delivery of one real
+  // response to the portal, then observe when the portal sends its stop.
+  await page.evaluate(() => {
+    const original = window.fetch;
+    const gate = Promise.withResolvers();
+    const probe = window.browserStopProbe = { held: false, order: [], release: gate.resolve,
+      restore() { window.fetch = original; delete window.browserStopProbe; } };
+    window.fetch = async (...args) => {
+      const path = new URL(args[0] instanceof Request ? args[0].url : args[0], location.href).pathname;
+      if (path === '/api/company/browser.stop') probe.order.push('stop');
+      const response = await original.apply(window, args);
+      if (path === '/api/company/browser.frame' && response.ok && !probe.held) {
+        probe.held = true;
+        await gate.promise;
+        probe.order.push('frame');
+      }
+      return response;
+    };
+  });
   try {
-    await button(page, 'Hand back control').click();
-    await page.getByText('Employee has control.', { exact: true }).waitFor();
-    await pending;
+    await button(page, 'Refresh view').click();
+    await page.waitForFunction(() => window.browserStopProbe.held, undefined, { timeout: 15000 });
     await button(page, 'Stop session').click();
     await dialog(page).getByRole('button', { name: 'Stop session', exact: true }).click();
+    await page.evaluate(() => window.browserStopProbe.release());
+    await page.getByText('Stopped', { exact: true }).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.browserStopProbe.order), ['frame', 'stop']);
   } finally {
-    frameGate.resolve();
+    await page.evaluate(() => {
+      window.browserStopProbe.release();
+      window.browserStopProbe.restore();
+    });
   }
-  await page.getByText('Stopped', { exact: true }).waitFor();
-  page.off('request', onStop);
-  assert.deepEqual(order, ['frame', 'stop']);
   await button(page, 'Revoke profile').click();
   await button(page, 'Revoke access').click();
   await page.getByText('No profiles assigned.', { exact: true }).waitFor();
