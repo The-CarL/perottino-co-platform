@@ -251,9 +251,30 @@ test('a long goal keeps confirmed early side effects when newer observations fil
 });
 
 test('persistent infrastructure failure exits the task for bounded factory recovery', async () => {
-  let failures=0;
-  await assert.rejects(runResident({binding, wait:async()=>{}, store:{
-    claimNextWork:async()=>{ failures++; throw new Error('unavailable'); }
-  }}),/healthy pulse/);
-  assert.equal(failures,8);
+  const records = [];
+  await assert.rejects(runResident({ binding, wait: async () => {}, reportFailure: record => records.push(record), store: {
+    claimNextWork: async () => { throw Object.assign(new Error('private credential'), { $metadata: { httpStatusCode: 503 } }); },
+  } }), /healthy pulse/);
+  assert.deepEqual(records, Array.from({ length: 8 }, (_, i) => ({ category: 'store_retry', attempt: i + 1 })));
+});
+
+test('hosted diagnostics report only a fixed failure category and consecutive attempt', async () => {
+  const privateText = 'private company message, token and response';
+  for (const [category, setup] of [
+    ['decision_provider', o => { o.decide = () => { throw new Error(privateText); }; }],
+    ['decision_format', o => { o.decide = () => JSON.parse(privateText); }],
+    ['decision_format', o => { o.decide = () => ({ action: privateText }); }],
+    ['aborted', o => { o.decide = () => { throw new DOMException(privateText, 'TimeoutError'); }; }],
+    ['store_access', o => { o.store.listEmployees = () => { throw Object.assign(new Error(privateText), { name: 'AccessDeniedException' }); }; }],
+    ['other', o => { o.browse = () => { throw Object.assign(new Error(privateText), { code: 'BROWSER_RENDER_FAILED' }); }; }],
+  ]) {
+    const { options, events } = fixture(category === 'other' ? 'browse https://example.com' : privateText);
+    setup(options);
+    const stop = new AbortController();
+    const output = [];
+    await runResident({ ...options, signal: stop.signal, wait: async () => stop.abort(),
+      reportFailure: record => output.push(JSON.stringify(record)) });
+    assert.deepEqual(events, ['claim', 'release']);
+    assert.deepEqual(output, [JSON.stringify({ category, attempt: 1 })]);
+  }
 });

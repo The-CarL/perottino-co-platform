@@ -13,15 +13,17 @@ const stepMs = 120_000;
 const leaseMs = 150_000;
 const text = (value, limit) => typeof value === 'string' ? value.trim().slice(0, limit) : '';
 
+class InvalidResidentDecision extends Error {}
+
 function validate(value) {
   if (!value || !actions.includes(value.action) || typeof value.value !== 'string' ||
       value.value.length > 8000 || (!value.value.trim() && value.action !== 'recall')) {
-    throw new Error('Invalid resident decision.');
+    throw new InvalidResidentDecision('Invalid resident decision.');
   }
   const target = text(value.target, 128);
-  if (effects.includes(value.action) && (!target || value.target.length > 128)) throw new Error('Missing action target.');
+  if (effects.includes(value.action) && (!target || value.target.length > 128)) throw new InvalidResidentDecision('Missing action target.');
   const delay = value.delaySeconds;
-  if (delay != null && (!Number.isInteger(delay) || delay < 0 || delay > 86_400)) throw new Error('Invalid wake delay.');
+  if (delay != null && (!Number.isInteger(delay) || delay < 0 || delay > 86_400)) throw new InvalidResidentDecision('Invalid wake delay.');
   return { action: value.action, value: value.value.trim(), target, delaySeconds: delay };
 }
 
@@ -286,14 +288,41 @@ export async function executeResidentPulse({ binding, store, decide = decideWith
 
 const defaultWait = (duration, signal) => sleep(duration, undefined, { signal });
 
+function storeFailure(error) {
+  const status = error?.$metadata?.httpStatusCode;
+  if (status === 403 || error?.name === 'AccessDeniedException') return 'store_access';
+  if (status === 429 || status >= 500 || error?.$retryable || error?.name === 'ProvisionedThroughputExceededException') return 'store_retry';
+  return 'store';
+}
+
 export async function runResident({ binding, store, now = Date.now, wait = defaultWait,
-  signal = new AbortController().signal, ...tools }) {
+  signal = new AbortController().signal, reportFailure, decide = decideWithBedrock, ...tools }) {
+  // Track the operation that threw without changing the error seen by retries or tool handlers.
+  const categories = new WeakMap();
+  if (reportFailure) {
+    const observe = (operation, classify) => async (...args) => {
+      try { return await operation(...args); }
+      catch (error) {
+        if (error instanceof Error) categories.set(error, classify(error, ...args));
+        throw error;
+      }
+    };
+    const underlying = store;
+    store = Object.create(underlying);
+    for (const method of ['claimNextWork', 'listEmployees', 'complete', 'checkpointGoal', 'sendFromResident', 'release', 'recordPulse']) {
+      store[method] = observe((...args) => underlying[method](...args), storeFailure);
+    }
+    decide = observe(decide, (error, _context, stepSignal) => {
+      if (stepSignal.aborted) return 'aborted';
+      return error instanceof SyntaxError ? 'decision_format' : 'decision_provider';
+    });
+  }
   let nextHeartbeat = 0;
   let failures = 0;
   while (!signal.aborted) {
     let delay = idleMs;
     try {
-      const state = await executeResidentPulse({ binding, store, now, signal, ...tools });
+      const state = await executeResidentPulse({ binding, store, now, signal, decide, ...tools });
       if (state === 'inactive') return;
       delay = state === 'worked' ? 1000 : idleMs;
       if (state !== 'busy' && now() >= nextHeartbeat) {
@@ -302,9 +331,15 @@ export async function runResident({ binding, store, now = Date.now, wait = defau
         nextHeartbeat = now() + heartbeatMs;
       }
       failures = 0;
-    } catch {
+    } catch (error) {
       if (signal.aborted) return;
       failures++;
+      if (reportFailure) {
+        let category = categories.get(error) ?? 'other';
+        if (error instanceof InvalidResidentDecision) category = 'decision_format';
+        if (error?.name === 'AbortError' || error?.name === 'TimeoutError') category = 'aborted';
+        reportFailure({ category, attempt: failures });
+      }
       // Work-level retries are durable and bounded by the store. Persistently failing infrastructure
       // also terminates the process so the factory observes the stopped task and can replace it.
       if (failures >= 8) throw new Error('Employee worker could not reach a healthy pulse.');
@@ -362,7 +397,8 @@ async function main() {
     client = new LambdaClient({});
     const recruit = managerTool(binding, { client, InvokeCommand, functionName: process.env.PEROTTINO_FACTORY_MANAGER_ARN,
       capability: process.env.PEROTTINO_EMPLOYEE_CAPABILITY });
-    await runResident({ binding, store, recruit, signal: stop.signal });
+    await runResident({ binding, store, recruit, signal: stop.signal,
+      reportFailure: record => console.log(JSON.stringify(record)) });
   } finally {
     client?.destroy();
     await store?.close?.();
