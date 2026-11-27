@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { traceCarrier } from './telemetry.mjs';
 
-const fields = ['actor','threadId','browserSessionId','browserProfileId','resourceId','managerId','proposalId','reservationId','purpose','amountKind','amountCents', 'projectId', 'jobId', 'buildId', 'grantId', 'policyVersion', 'conversationId', 'messageId', 'goalId', 'taskId', 'employeeId', 'assigneeId', 'reviewerId', 'accountableId', 'status', 'reasonCode'];
+const fields = ['actor','threadId','browserSessionId','browserProfileId','resourceId','managerId','proposalId','reservationId','purpose','amountKind','amountCents', 'projectId', 'jobId', 'buildId', 'grantId', 'fundingGrantId', 'policyVersion', 'conversationId', 'messageId', 'goalId', 'taskId', 'employeeId', 'assigneeId', 'reviewerId', 'accountableId', 'status', 'reasonCode'];
 
 // This allowlist is the public audit schema. Business content belongs in its
 // access-controlled record, never inside a company activity row.
@@ -21,6 +21,6 @@ export function eventRows(kind, attributes, eventId) {
   return [
     { pk: 'event-id', sk: id, expect: null, value: { id } },
     { pk: 'company-events', sk, expect: null, value },
-    ...(/^(?:goal|task|employee)\./.test(kind) ? [{ pk: 'work-events', sk, expect: null, value }] : []),
+    ...(/^(?:goal|task|employee|project|build|delivery|infra|promotion|budget|grant|policy|settings)\./.test(kind) ? [{ pk: 'work-events', sk, expect: null, value }] : []),
   ];
 }
