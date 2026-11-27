@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { dynamoRecordWrites } from './foundation-records.mjs';
+import { employmentWrites, governanceChanged } from './company-governance.mjs';
 import { isValidEmployeeLimit, maxCompanyEmployees } from './headcount.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -90,7 +92,7 @@ export function createEmployeeStore({ ddb, tableName, get, query, write, insert,
     });
   }
 
-  async function hireEmployee({ callerId, name, handle, role, requestId, assignment, binding, companyGate, companyVersion, generatedIdentity = false, maxEmployees = Number(process.env.PEROTTINO_EMPLOYEE_LIMIT ?? maxCompanyEmployees) }) {
+  async function hireEmployee({ callerId, name, handle, role, requestId, assignment, binding, companyGate, companyVersion, governancePermit, generatedIdentity = false, maxEmployees = Number(process.env.PEROTTINO_EMPLOYEE_LIMIT ?? maxCompanyEmployees) }) {
     name = text(name, 100, 'name'); role = text(role, 160, 'role'); handle = text(handle, 48, 'handle').toLowerCase();
     if (!/^[a-z][a-z0-9-]{0,47}$/.test(handle) || ['owner','ceo','mara'].includes(handle)) throw problem(409, 'Handle is reserved or invalid.');
     if (!isValidEmployeeLimit(maxEmployees)) throw problem(400, 'Invalid employee limit.');
@@ -103,7 +105,7 @@ export function createEmployeeStore({ ddb, tableName, get, query, write, insert,
       const existing = await replay(receipt, signature);
       if (existing) return existing;
       const manager = await employee(managerId);
-      if (manager?.desiredState !== 'active' || (callerId !== 'owner' && (!manager.canHire || !sameBinding(manager, binding)))) throw forbidden();
+      if (manager?.desiredState !== 'active' || (callerId !== 'owner' && ((!governancePermit && !manager.canHire) || !sameBinding(manager, binding)))) throw forbidden();
       const [byHandle, byName, count] = await Promise.all([get(alias(handle)), get(givenName(name)), get(roster)]);
       const reserved = byHandle || byName;
       if (!count) throw problem(409, 'The company must be bootstrapped first.');
@@ -117,13 +119,16 @@ export function createEmployeeStore({ ddb, tableName, get, query, write, insert,
         insert({ ...alias(handle), employeeId: id }), insert({ ...givenName(name), employeeId: id }), insert({ ...receipt, signature, employeeId: id }),
         update(roster, { UpdateExpression: 'ADD headcount :one', ConditionExpression: 'headcount < :cap', ExpressionAttributeValues: { ':cap': maxEmployees, ':one': 1 } }),
         ...(callerId === 'owner' ? [] : gateChecks(companyGate,companyVersion)),
-        callerId === 'owner' ? check(profile(managerId), 'desiredState=:active', { ':active': 'active' }) : bindingCheck(binding, ' AND canHire=:yes')];
+        callerId === 'owner' ? check(profile(managerId), 'desiredState=:active', { ':active': 'active' }) : bindingCheck(binding, governancePermit ? '' : ' AND canHire=:yes'),
+        ...dynamoRecordWrites(tableName,employmentWrites(governancePermit,callerId,'employee.hire',id,{role,requestId}))];
       if (assignment) actions.push(...goalItems(id, requestId, assignment, '', now(), 'manager').actions);
       if (await write(actions)) return employeeView(row);
+      if (governancePermit) throw governanceChanged();
+      if (await get({pk:'V2#governance:policy',sk:'company'})) throw forbidden();
     });
   }
 
-  async function setEmployeeState({ callerId, agentId, desiredState, requestId, binding, companyGate, companyVersion }) {
+  async function setEmployeeState({ callerId, agentId, desiredState, requestId, binding, companyGate, companyVersion, governancePermit }) {
     if (!['active','paused','fired'].includes(desiredState)) throw problem(400, 'Invalid desired employee state.');
     if (callerId !== 'owner' && binding?.agentId !== callerId) throw forbidden();
     const receipt = receiptFor('state', callerId, requestId);
@@ -135,7 +140,7 @@ export function createEmployeeStore({ ddb, tableName, get, query, write, insert,
       if (!target) throw problem(404, 'Employee not found.');
       if (callerId !== 'owner') {
         const manager = await employee(callerId);
-        if (target.managerId !== callerId || !manager?.canHire || !sameBinding(manager, binding)) throw forbidden();
+        if (target.managerId !== callerId || (!governancePermit && !manager?.canHire) || !sameBinding(manager, binding)) throw forbidden();
       }
       if (target.desiredState === 'fired' && desiredState !== 'fired') throw firedError();
       const changed = target.desiredState !== desiredState;
@@ -144,10 +149,14 @@ export function createEmployeeStore({ ddb, tableName, get, query, write, insert,
         update(profile(agentId), { UpdateExpression: 'SET desiredState=:d, generation=:n, updatedAt=:at',
           ConditionExpression: 'generation=:g AND desiredState=:s', ExpressionAttributeValues: { ':d': desiredState, ':n': next,
             ':g': target.generation, ':s': target.desiredState, ':at': iso(now()) } })];
-      if (callerId !== 'owner') actions.push(...gateChecks(companyGate,companyVersion),bindingCheck(binding, ' AND canHire=:yes'));
+      if (callerId !== 'owner') actions.push(...gateChecks(companyGate,companyVersion),bindingCheck(binding, governancePermit ? '' : ' AND canHire=:yes'));
+      if (desiredState === 'fired' && (callerId !== 'owner' || governancePermit))
+        actions.push(...dynamoRecordWrites(tableName,employmentWrites(governancePermit,callerId,'employee.fire',agentId)));
       if (changed && desiredState === 'fired') actions.push(update(roster, { UpdateExpression: 'ADD headcount :minus',
         ConditionExpression: 'headcount > :zero', ExpressionAttributeValues: { ':minus': -1, ':zero': 0 } }));
       if (await write(actions)) return employee(agentId);
+      if (governancePermit) throw governanceChanged();
+      if (callerId !== 'owner' && await get({pk:'V2#governance:policy',sk:'company'})) throw forbidden();
     });
   }
 

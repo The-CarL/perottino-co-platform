@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { makeSqliteRecords } from './foundation-records.mjs';
+import { employmentWrites, governanceChanged } from './company-governance.mjs';
 import { isValidEmployeeLimit, maxCompanyEmployees } from './headcount.mjs';
 
 function ownerMessage(turn) {
@@ -89,6 +91,11 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
       updated_at TEXT NOT NULL, UNIQUE(agent_id,request_id)
     );
   `);
+
+  const employmentRecords = makeSqliteRecords({db});
+  function commitGovernance(permit,actor,op,employeeId,hire) {
+    if (!employmentRecords.applyInTransaction(employmentWrites(permit,actor,op,employeeId,hire))) throw governanceChanged();
+  }
 
   function transaction(operation) {
     db.exec('BEGIN IMMEDIATE');
@@ -188,12 +195,12 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
         return { goal: insertGoal(agentId, text, requestId), conflict: false };
       });
     },
-    setEmployeeState({ agentId, operation, requestId, callerId, generation }) {
+    setEmployeeState({ agentId, operation, requestId, callerId, generation, governancePermit }) {
       return transaction(() => {
         const current = employee(agentId);
         if (callerId) {
           const caller = employee(callerId);
-          if (caller?.desiredState !== 'active' || caller.generation !== generation || !caller.canHire ||
+          if (caller?.desiredState !== 'active' || caller.generation !== generation || (!governancePermit && !caller.canHire) ||
               operation !== 'fire' || current?.managerId !== callerId) return { ok: false, status: 403 };
         }
         if (!current) return { ok: false, status: 404 };
@@ -202,6 +209,7 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
         const next = { pause: 'paused', resume: 'active', fire: 'fired' }[operation];
         if (!next) return { ok: false, status: 400 };
         if (current.desiredState === 'fired' && next !== 'fired') return { ok: false, status: 409 };
+        if (operation === 'fire' && (callerId || governancePermit)) commitGovernance(governancePermit,callerId ?? 'owner','employee.fire',agentId);
         if (current.desiredState !== next) {
           db.prepare('UPDATE employment SET desired_state=?,generation=generation+1 WHERE agent_id=?').run(next, agentId);
           if (next === 'paused') db.prepare(`UPDATE turn SET state='queued',attempts=MAX(attempts-1,0),token=NULL,lease_until=NULL
@@ -217,11 +225,11 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
         return { ok: true, employee: employee(agentId) };
       });
     },
-    hireCompanyEmployee(callerId, generation, input) {
+    hireCompanyEmployee(callerId, generation, input, governancePermit) {
       return transaction(() => {
         const managerId = callerId === 'owner' ? 'ceo' : callerId;
         const manager = employee(managerId);
-        if (manager?.desiredState !== 'active' || (callerId !== 'owner' && (manager.generation !== generation || !manager.canHire))) {
+        if (manager?.desiredState !== 'active' || (callerId !== 'owner' && (manager.generation !== generation || (!governancePermit && !manager.canHire)))) {
           throw Object.assign(new Error('This employee cannot hire.'), { status: 403 });
         }
         const { requestId, role, goalId, title, acceptance } = input;
@@ -233,6 +241,7 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
           return employee(prior.employee_id);
         }
         const hire = createEmployee(manager, role);
+        commitGovernance(governancePermit,callerId,'employee.hire',hire.id,input);
         db.prepare('INSERT INTO company_hire_receipt(manager_id,request_id,fingerprint,employee_id) VALUES(?,?,?,?)')
           .run(managerId, receiptKey, fingerprint, hire.id);
         return hire;
@@ -247,6 +256,7 @@ export function createStore(dataDir, {employeeLimit = Number(process.env.PEROTTI
         const existing = db.prepare('SELECT agent_id FROM hire_receipt WHERE turn_id=?').get(job.message.id);
         if (existing) return employee(existing.agent_id);
         const { id } = createEmployee(manager, role);
+        commitGovernance(null,manager.id,'employee.hire',id);
         db.prepare('INSERT INTO hire_receipt(turn_id,agent_id) VALUES(?,?)').run(job.message.id, id);
         if (assignment) insertGoal(id, assignment, 'hire/' + job.message.id, manager.id);
         return employee(id);

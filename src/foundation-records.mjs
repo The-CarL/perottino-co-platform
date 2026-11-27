@@ -78,24 +78,32 @@ export function makeSqliteRecords({ filename, db: suppliedDb }) {
     AND substr(sk,1,length(?))=? ORDER BY sk LIMIT ?`);
   const put = db.prepare(`INSERT INTO foundation_records (pk,sk,version,data) VALUES (?,?,1,?)
     ON CONFLICT(pk,sk) DO UPDATE SET version=version+1, data=excluded.data`);
+  // The trusted employee factory uses this inside its existing directory transaction.
+  function apply(changes) {
+    for (const { pk, sk, expect, data } of writes(changes)) {
+      const row = select.get(pk, sk);
+      const version = row?.data == null ? null : row.version;
+      if (version !== expect) return false;
+      // Tombstones fence stale writers across a later recreation.
+      if (data !== null || expect !== null) put.run(pk, sk, data);
+    }
+    return true;
+  }
   return {
     async get(pk, sk) { return readRow(select.get(partition(pk), sortKey(sk))); },
     async list(pk, options) {
       const { prefix, limit, after } = listOptions(options);
       return page(list.all(partition(pk), prefix, after ?? '', prefix, prefix, limit + 1), limit);
     },
+    applyInTransaction(changes) {
+      if (!db.isTransaction) throw new Error('An employee transaction is required.');
+      return apply(changes);
+    },
     async transact(changes, authorize) {
-      const batch = writes(changes);
       db.exec('BEGIN IMMEDIATE');
       try {
         authorize?.();
-        for (const { pk, sk, expect, data } of batch) {
-          const row = select.get(pk, sk);
-          const version = row?.data == null ? null : row.version;
-          if (version !== expect) { db.exec('ROLLBACK'); return false; }
-          // Deletion keeps only the version, fencing stale writers even after the key is recreated.
-          if (data !== null || expect !== null) put.run(pk, sk, data);
-        }
+        if (!apply(changes)) { db.exec('ROLLBACK'); return false; }
         db.exec('COMMIT');
         return true;
       } catch (error) { db.exec('ROLLBACK'); throw error; }
@@ -115,6 +123,10 @@ function dynamoWrite(tableName, { pk, sk, expect, data }) {
     UpdateExpression: 'SET #v = if_not_exists(#v,:zero) + :one' + (data === null ? ', #gone = :yes REMOVE #d' : ', #d = :data REMOVE #gone'),
     ExpressionAttributeValues: { ...common.ExpressionAttributeValues, ':zero': 0, ':one': 1,
       ...(data === null ? { ':yes': true } : { ':data': data }) } } };
+}
+
+export function dynamoRecordWrites(tableName, changes) {
+  return writes(changes).map(change => dynamoWrite(tableName, change));
 }
 
 function transactionGuards(tableName, conditions) {
