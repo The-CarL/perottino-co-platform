@@ -36,7 +36,7 @@ jobs:
         run: >-
           pipx run --spec cfn-lint==1.45.0 cfn-lint --non-zero-exit-code error -t
           cdk.hosted.out/Hosted.template.json cdk.out/Foundation.template.json
-          infra/runtime-bootstrap.yaml infra/github-pat.yaml infra/inbound-email.yaml
+          infra/runtime-bootstrap.yaml infra/github-pat.yaml infra/inbound-email.yaml infra/pilot-network.yaml
   runtime-image:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

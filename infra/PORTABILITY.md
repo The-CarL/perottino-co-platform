@@ -8,6 +8,12 @@ Use a reviewed source revision and a scoped AWS commercial-region deployment ide
 
 Select public IPv4 subnets in the specified VPC with working DNS and an internet-gateway default route. Fargate assigns a temporary public IPv4 address to the running task for ECR, Bedrock and permitted outbound requests. Its security group has no inbound rules. The API and orchestration Lambdas use the Lambda-managed network. The standard API Gateway HTTPS URL works without a custom domain, hosted zone, certificate, load balancer or NAT gateway.
 
+### Optional project-owned network
+
+If the target has no suitable shared network, create a separate stack from the [pilot network template](pilot-network.yaml). Set `AvailabilityZoneA` and `AvailabilityZoneB` to distinct standard AZ names in the target account and region. Use an unused, aligned RFC 1918 `VpcCidr` of size /22. The default `10.230.0.0/22` produces `10.230.0.0/23` and `10.230.2.0/23`, each with 507 assignable addresses. The stack creates one internet gateway and a shared public route. The employee factory explicitly requests a public IPv4 address when it starts each task. This network requires no NAT gateway, load balancer or public DNS changes.
+
+Pass the complete project provenance through the stack’s `--tags` option at creation and on updates. CloudFormation propagates stack tags to taggable VPC, gateway, subnet and route-table resources. After `CREATE_COMPLETE`, record the stack outputs privately. Set `vpcId` to `VpcId` and `publicSubnetIds` to [`PublicSubnetA`, `PublicSubnetB`] in the hosted configuration. Preserve these CIDR and zone inputs across releases while employees use the network.
+
 ## Bootstrap once per target
 
 | Template | What it provisions |
