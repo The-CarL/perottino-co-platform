@@ -60,12 +60,15 @@ test('configured origin grants, exclusive profile, transfer and revocation',asyn
   await assert.rejects(invoke('eng','profile.grant',assign),{status:403});
   await invoke('owner','profile.grant',assign);await invoke('owner','profile.grant',{...assign,employeeId:'ceo'});
   const s={sessionId:(await invoke('eng','start',{profileId:profile.id,url:'https://example.org/bill'})).session.id};
+  assert.equal((await invoke('owner','view',s)).path,'/chat#browsers?sessionId='+s.sessionId);
   await assert.rejects(invoke('ceo','start',{profileId:profile.id}),{status:409});
   await assert.rejects(invoke('eng','navigate',{...s,url:'https://another.example/bill'}),{status:403});
   const replay={...s,kind:'key',key:'Enter',requestId:randomUUID()};
   await invoke('eng','input',replay);await invoke('eng','input',replay);assert.equal(inputs,1);
   await assert.rejects(invoke('eng','stop',{...s,saveProfile:true}),{status:403});assert.equal(published,0);
   await invoke('owner','profile.revoke',assign);await assert.rejects(invoke('eng','read',s),{status:403});
+  await invoke('owner','profile.grant',assign);
+  await assert.rejects(invoke('eng','read',s),{status:403});
   await invoke('owner','stop',s);
   const {session:fresh}=await invoke('ceo','start',{profileId:profile.id});
   await invoke('owner','stop',{sessionId:fresh.id,saveProfile:true});assert.equal(published,1);

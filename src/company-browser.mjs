@@ -16,12 +16,16 @@ const profileKey=id=>'profile#'+id;
 const seatKey=id=>'employee#'+id;
 function summary(s,now) {
   return {id:s.id,employeeId:s.employeeId,profileId:s.profileId,controller:s.controller,
+    takeoverPath:'/chat#browsers?sessionId='+encodeURIComponent(s.id),
     status:s.expiresAt<=now && !['failed','stopped'].includes(s.status)?'expired':s.status,expiresAt:s.expiresAt};
 }
 
 export function createManagedBrowser({records,employee,provider,profiles=[],files,now=Date.now}) {
   const pk='browser-sessions',locks='browser-locks';
-  const catalog=new Map(profiles.map(p=>[p.id,{id:p.id,label:p.label??p.id,origins:(p.origins??[]).map(origin)}]));
+  const catalog=new Map(profiles.map(p=>{
+    if(typeof p.id!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(p.id))fail(400,'Invalid configured browser profile.');
+    return [p.id,{id:p.id,label:p.label??p.id,origins:(p.origins??[]).map(origin)}];
+  }));
   async function person(actor,requested) {
     const target=requested??(actor==='owner'?'ceo':actor);
     if(actor!=='owner' && target!==actor) fail(403,'Private employee browser.');
@@ -61,17 +65,18 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
       const signature=digest(employeeId,profileId,input.url??null);
       let row=await records.get(pk,sessionId);
       if(row && row.signature!==signature)fail(409,'Browser request already used.');
-      let origins;
+      let origins,grantVersion;
       if(profileId) {
         const grant=await records.get('browser-grants#'+employeeId,profileId);
         if(!grant||!catalog.has(profileId))fail(403,'Profile not granted.');
+        grantVersion=grant.version;
         origins=grant.allowedOrigins.filter(o=>catalog.get(profileId).origins.includes(o));
         if(!origins.length)fail(403,'Profile has no enabled origins.');
       }
       if(input.url)await provider.validate(input.url,origins);
       if(!row) {
         const at=now(),expiresAt=at+ttl;
-        const s={id:sessionId,employeeId,profileId,origins:origins??[],expiresAt,controller:'agent',status:'starting',signature};
+        const s={id:sessionId,employeeId,profileId,origins:origins??[],...(grantVersion && {grantVersion}),expiresAt,controller:'agent',status:'starting',signature};
         const lockNames=[seatKey(employeeId),...(profileId?[profileKey(profileId)]:[])];
         const held=await Promise.all(lockNames.map(k=>records.get(locks,k)));
         if(held.some(l=>l && l.expiresAt>at))fail(409,'An employee or profile session is already open.');
@@ -90,11 +95,12 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
     if(!id(input.sessionId)) fail(400,'Invalid browser session.');
     const row=await records.get(pk,input.sessionId);
     if(!row||actor!=='owner'&&actor!==row.employeeId)fail(404,'Browser session not found.');
-    if(op==='browser.view')return {session:summary(row,now()),path:'/chat'};
+    if(op==='browser.view')return {session:summary(row,now()),path:summary(row,now()).takeoverPath};
     if(op==='browser.frame'&&actor!=='owner')fail(403,'Owner view required.');
     let origins;
     if(row.profileId && op!=='browser.stop') {
       const grant=await records.get('browser-grants#'+row.employeeId,row.profileId);
+      if(grant?.version!==row.grantVersion)fail(403,'The profile grant changed. Start a new session.');
       origins=(grant?.allowedOrigins??[]).filter(o=>row.origins.includes(o)&&catalog.get(row.profileId)?.origins.includes(o));
       if(!origins.length)fail(403,'The profile grant has been revoked.');
     }
@@ -122,6 +128,8 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
       const result=await provider.action(row.providerId,op,{},origins);
       const latest=await records.get(pk,row.id);
       if(latest.status!=='active'||latest.controller!==row.controller)fail(409,'Browser control changed.');
+      if(row.profileId && (await records.get('browser-grants#'+row.employeeId,row.profileId))?.version!==row.grantVersion)
+        fail(403,'The profile grant changed. Start a new session.');
       return {...result,controller:row.controller};
     }
     if(!['browser.takeover','browser.release','browser.stop','browser.input','browser.navigate','browser.download','browser.screenshot'].includes(op))fail(404,'Unknown browser operation.');
@@ -134,7 +142,7 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
         if(input.saveProfile && row.profileId) {
           if(actor!=='owner')fail(403,'Only the owner may publish authenticated profile state.');
           const grant=await records.get('browser-grants#'+row.employeeId,row.profileId);
-          if(!grant||!catalog.has(row.profileId))fail(403,'Profile grant has been revoked.');
+          if(!grant||grant.version!==row.grantVersion||!catalog.has(row.profileId))fail(403,'Profile grant has been revoked.');
           await provider.save(row.providerId,row.profileId,input.requestId);
         }
         await provider.stop(row.providerId);stopped=true;
@@ -144,8 +152,18 @@ export function createManagedBrowser({records,employee,provider,profiles=[],file
         // explicitly publish pixels or imported documents to company-wide files.
         if(row.profileId && actor!=='owner')fail(403,'Owner is required to publish authenticated profile data.');
         const blob=await provider.action(row.providerId,op,input,origins);
-        saved=(await files.execute(actor,'files.write',{path:input.path,contentBase64:blob.contentBase64,
-          requestId:digest(row.id,input.requestId)})).file;
+        const requestId=digest(row.id,input.requestId),bytes=Buffer.from(blob.contentBase64,'base64');
+        if(bytes.length>512*1024)fail(400,'Evidence exceeds the import limit.');
+        if(bytes.length<=60*1024) {
+          saved=(await files.execute(actor,'files.write',{path:input.path,contentBase64:blob.contentBase64,requestId})).file;
+        } else {
+          const parts=[];
+          for(let offset=0;offset<bytes.length;offset+=60*1024) {
+            const {sha256}=await files.execute(actor,'files.part',{contentBase64:bytes.subarray(offset,offset+60*1024).toString('base64')});
+            parts.push(sha256);
+          }
+          saved=(await files.execute(actor,'files.commit',{path:input.path,parts,requestId})).file;
+        }
       } else if(['browser.input','browser.navigate'].includes(op))await provider.action(row.providerId,op,input,origins);
       success=true;
     } finally {
