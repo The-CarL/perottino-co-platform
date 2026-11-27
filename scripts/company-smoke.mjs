@@ -153,6 +153,21 @@ export async function runCompanySmoke() {
 
     await page.getByRole('heading', { name: 'Dashboard', exact: true }).waitFor();
     await page.getByText('No tasks need review or intervention.').waitFor();
+    // Change pages while the previous request is still in flight.
+    let releaseActivity;
+    const activityGate = new Promise((resolve) => { releaseActivity = resolve; });
+    await page.route('**/api/company/activity.list', async (route) => {
+      await activityGate;
+      await route.continue();
+    }, { times: 1 });
+    await page.locator('#nav-activity').click();
+    await page.getByRole('heading', { name: 'Company events', exact: true }).waitFor();
+    await nav(page, 'files');
+    const activityFinished = page.waitForResponse((response) => response.url().endsWith('/api/company/activity.list'));
+    releaseActivity();
+    await activityFinished;
+    await page.waitForLoadState('networkidle');
+    assert.equal(await page.getByRole('button', { name: 'New document', exact: true }).count(), 1);
     await nav(page, 'directory');
     await page.locator('#directory-search').fill('@ceo');
     await page.getByRole('button', { name: 'Message Mara', exact: true }).click();

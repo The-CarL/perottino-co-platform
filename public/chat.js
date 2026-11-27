@@ -192,29 +192,30 @@ function navigate(target) {
 async function render() {
   const token = ++revision;
   clearTimeout(refreshTimer);
-  page = pageName();
+  const currentPage = pageName();
+  page = currentPage;
   chat = null;
   if (dialog.open) dialog.close();
   notify();
   setMenu(false);
-  byId('page-title').textContent = sections[page];
-  document.title = sections[page] + ' · Perottino & Co.';
+  byId('page-title').textContent = sections[currentPage];
+  document.title = sections[currentPage] + ' · Perottino & Co.';
   for (const key of Object.keys(sections)) {
-    if (key === page) byId('nav-' + key).setAttribute('aria-current', 'page');
+    if (key === currentPage) byId('nav-' + key).setAttribute('aria-current', 'page');
     else byId('nav-' + key).removeAttribute('aria-current');
   }
   content.setAttribute('aria-busy', 'true');
   content.replaceChildren(empty('Loading…'));
   actions.replaceChildren();
   try {
-    const overview = await api(page === 'dashboard' ? 'company.overview' : 'directory');
+    const overview = await api(currentPage === 'dashboard' ? 'company.overview' : 'directory');
     if (token !== revision) return;
     roster = overview.agents || [];
-    if (!['chat', 'admin'].includes(page)) actions.append(btn('Refresh', render));
-    if (page === 'dashboard') dashboard(overview);
-    if (page === 'goals' || page === 'tasks') await workPage(page, token);
-    if (page === 'activity') await activityPage(token);
-    if (page === 'directory') directoryPage();
+    if (!['chat', 'admin'].includes(currentPage)) actions.append(btn('Refresh', render));
+    if (currentPage === 'dashboard') dashboard(overview);
+    if (currentPage === 'goals' || currentPage === 'tasks') await workPage(currentPage, token);
+    if (currentPage === 'activity') await activityPage(token);
+    if (currentPage === 'directory') directoryPage();
     const extraPages = {
       files: filesPage,
       settings: settingsPage,
@@ -222,8 +223,8 @@ async function render() {
       mail: mailPage,
       browsers: browsersPage,
     };
-    if (Object.hasOwn(extraPages, page)) await extraPages[page](token);
-    if (page === 'chat' || page === 'admin') await chatPage(page === 'admin', token);
+    if (Object.hasOwn(extraPages, currentPage)) await extraPages[currentPage](token);
+    if (currentPage === 'chat' || currentPage === 'admin') await chatPage(currentPage === 'admin', token);
   } catch (error) {
     if (token === revision) {
       content.replaceChildren(empty('The workspace could not be loaded.'), btn('Retry', render));
