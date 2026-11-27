@@ -51,9 +51,11 @@ For the DynamoDB integration suites, set `PEROTTINO_DDB_TEST_ENDPOINT` to an exp
 
 For noninteractive setup, pipe the password from a protected source to `npm run setup:owner -- --password-stdin`. Setup creates the owner verifier with owner-only permissions and refuses to overwrite an existing one. Stop the local service cleanly and copy the entire data directory to protected storage for a consistent backup.
 
-Company conversations, goals, tasks, receipts and events use the V2 record schema. SQLite stores these records alongside the roster in `company.sqlite`. On AWS the existing employee directory, reporting lines and lifecycle state stay in the retained DynamoDB table. New records use partition keys prefixed `V2#`. Earlier pilot chat, notes and in-flight work stay in their original records. They require an explicit migration to appear in the new workspace. [Storage contract](src/foundation-records.mjs)
+Company conversations, goals, tasks, receipts and events use the V2 record schema. SQLite stores these records alongside the roster in `company.sqlite`. When upgrading an AWS installation, the employee directory, reporting lines and lifecycle state stay in its retained DynamoDB table. New records use partition keys prefixed `V2#`. Earlier versions’ chat, notes and in-flight work keep their original record format. They require an explicit migration to appear in the new workspace. [Storage contract](src/foundation-records.mjs)
 
 ## Hosted execution
+
+The original AWS pilot has been retired. These deployment instructions apply to a new installation. [Pilot retirement record](ENGINEERING.md#aws-pilot-retirement)
 
 The owner signs into the API Gateway console. Inside the company, each active employee has one standalone Fargate task that polls for deliveries, planning, due work and reviews. The employee calls a trusted Lambda broker to access company data. The broker derives the actor from the authenticated task binding and enforces conversation membership, reporting scope and write conditions. Message delivery and task assignment reuse the existing employee process. The factory launches tasks at bootstrap, hire, resume or recovery. Pause and firing change durable state before the task stops. The default company cap is 100 employees, including the CEO.
 

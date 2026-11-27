@@ -48,7 +48,7 @@ A logical command carries a stable request ID. Goal and task mutations commit th
 
 ## Data and observability
 
-SQLite shares `company.sqlite` between the local directory and the `foundation_records` table. DynamoDB uses the hosted company's retained table. Versioned V2 records have a distinct `V2#` partition-key namespace. Directory, employment and factory records retain their established keys and identity. Earlier pilot transcripts, notes, goals and leases remain in their original format and require explicit migration to appear in the new workspace. Preserve existing data and test rollback when changing the active runtime. [Record adapter](src/foundation-records.mjs) · [SQLite and DynamoDB contract tests](test/foundation-records.test.mjs)
+SQLite shares `company.sqlite` between the local directory and the `foundation_records` table. Each hosted installation uses a DynamoDB table with a retention policy. Versioned V2 records have a distinct `V2#` partition-key namespace. Directory, employment and factory records retain their established keys and identity. On an upgrade, earlier transcripts, notes, goals and leases keep their original format and require explicit migration to appear in the new workspace. Preserve existing data and test rollback when changing the active runtime. [Record adapter](src/foundation-records.mjs) · [SQLite and DynamoDB contract tests](test/foundation-records.test.mjs)
 
 The activity feed shows committed work events. Admin records privileged history reads. Traces and metrics connect model decisions, tool actions and employee handoffs to latency and failures. Trusted W3C trace context links asynchronous work across process restarts. Telemetry allowlists identifiers and status fields. Message bodies, prompts, evidence, browser contents and credentials remain outside exported telemetry. Use the hosted guide for sampling, X-Ray, CloudWatch and the local OTLP receiver. [Observability](infra/TELEMETRY.md) · [Telemetry tests](test/telemetry.test.mjs)
 
@@ -72,7 +72,13 @@ The destination supplies its own account, region, VPC, public subnets, permissio
 
 In the destination account, verify HTTPS and owner sign-in, an actual model reply, one employee handling separate messages, and a delegated task progressing while the browser is closed. Compare independent review with its submission and trace the handoff. Inspect a real managed browser read. Replace an active task and verify its history, pending work and employment binding survive. Pause and fire a test employee and confirm delayed events leave it stopped. Record the release revision, CI verdict, cloud readbacks, compute time, token usage, storage requests and owner interventions separately.
 
-The retained `/perottino-co/github/pat` secret slot is reserved for a future trusted Git worker. Use a fine-grained projects-repository token when implementing that integration. Git worktrees, PRs, preview provisioning and destructive production actions each need their own scoped executor and enforcement. [Secret declaration](infra/github-pat.yaml)
+The Git credential template declares a Secrets Manager slot for a future trusted Git worker. Use a fine-grained projects-repository token when implementing that integration. Git worktrees, PRs, preview provisioning and destructive production actions each need their own scoped executor and enforcement. [Secret declaration](infra/github-pat.yaml)
+
+## AWS pilot retirement
+
+On November 27, 2026, the owner retired the AWS pilot after verifying private messaging and delegated work. All four CloudFormation stacks reported `DELETE_COMPLETE`. The API, ECS cluster, dedicated network, ECR repository and seven image digests, log group and monitoring resources were removed. The final check found zero running or pending employee tasks.
+
+At the owner’s direction, the DynamoDB company table was deleted without a data backup. The final inventory found no DynamoDB backups or AWS Backup recovery points. Both pilot secrets became inaccessible and entered their seven-day recovery window. Six ECS task-definition revisions remained registered because the scoped role lacked permission to deregister them. These definitions incur no Fargate compute charges. The source repositories and shared DNS hosted zone were preserved. [Retirement procedure](infra/PORTABILITY.md#remove-a-deployment)
 
 ## Factory continuity
 
