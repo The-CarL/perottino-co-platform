@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createCompanyService } from '../src/company-service.mjs';
+import { employmentWrites } from '../src/company-governance.mjs';
 import { makeSqliteRecords } from '../src/foundation-records.mjs';
 import { companyCommand } from '../src/resident.mjs';
 import { runCompanyPulse,runCompanyResident } from '../src/company-worker.mjs';
@@ -14,11 +15,12 @@ function fixture(t) {
   const staff = new Map([['ceo',{ id:'ceo',handle:'mara',name:'Mara',role:'CEO',desiredState:'active',canHire:true }]]);
   const hires = new Map();
   const service = createCompanyService({ records,store:{ employee:id => staff.get(id),listEmployees:() => [...staff.values()] },
-    async control(actor,op,input) {
+    async control(actor,op,input,permit) {
       assert.equal(actor,'ceo'); assert.equal(op,'employee.hire');
       if (!hires.has(input.requestId)) {
         const id = 'e-' + (hires.size + 1);
         const person = {id,handle:'kai-'+id,name:'Kai',role:input.role,desiredState:'active',managerId:actor,canHire:false};
+        assert.equal(await records.transact(employmentWrites(permit,actor,op,id,input)),true);
         staff.set(id,person); hires.set(input.requestId,person);
       }
       return { employee:hires.get(input.requestId) };
