@@ -144,6 +144,8 @@ async function browserDialog(session) {
   let owned = session.controller === 'owner',
     timer,
     pendingFrame,
+    commands = Promise.resolve(),
+    queuedCommands = 0,
     failedFrames = 0,
     frameWidth = 0,
     frameHeight = 0;
@@ -176,6 +178,7 @@ async function browserDialog(session) {
   async function refresh() {
     clearTimeout(timer);
     if (!active || !frame.isConnected || !dialog.open) return;
+    if (queuedCommands) return;
     if (!live() || pendingFrame) {
       timer = setTimeout(refresh, 3000);
       return;
@@ -208,22 +211,31 @@ async function browserDialog(session) {
     } finally {
       pendingFrame = undefined;
     }
-    if (frame.isConnected && dialog.open && failedFrames <= 3 && session.expiresAt > Date.now())
+    if (!queuedCommands && frame.isConnected && dialog.open && failedFrames <= 3 && session.expiresAt > Date.now())
       timer = setTimeout(refresh, Math.min(10000, 2000 * 2 ** failedFrames));
   }
-  async function action(op, data = {}) {
-    message.hidden = true;
-    try {
-      await change(op, { sessionId, ...data });
-      if (op === 'browser.takeover') owned = true;
-      if (op === 'browser.release') owned = false;
-      enable();
-      draw();
-      await refresh();
-    } catch (err) {
-      message.textContent = err.message;
-      message.hidden = false;
-    }
+  function action(op, data = {}) {
+    clearTimeout(timer);
+    queuedCommands++;
+    commands = commands.then(async () => {
+      await pendingFrame?.catch(() => {});
+      message.hidden = true;
+      try {
+        await change(op, { sessionId, ...data });
+        if (op === 'browser.takeover') owned = true;
+        if (op === 'browser.release') owned = false;
+        enable();
+        draw();
+      } catch (err) {
+        message.textContent = err.message;
+        message.hidden = false;
+      } finally {
+        queuedCommands--;
+        if (!queuedCommands && frame.isConnected && dialog.open)
+          timer = setTimeout(refresh, 2000);
+      }
+    });
+    return commands;
   }
   function draw() {
     controls.replaceChildren(btn('Refresh view', refresh));
@@ -252,6 +264,7 @@ async function browserDialog(session) {
               saveAndClose(async (data) => {
                 // The old view was detached when the confirmation opened. Finish the
                 // one frame it already requested before closing the provider session.
+                await commands;
                 await pendingFrame?.catch(() => {});
                 await change('browser.stop', {
                   sessionId,
