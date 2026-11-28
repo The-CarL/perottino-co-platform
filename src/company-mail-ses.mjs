@@ -2,7 +2,7 @@ import { makeDynamoRecords } from './foundation-records.mjs';
 import { createCloudStore } from './cloud-store.mjs';
 import { dispatchCompanyMail, recordMailReceipt } from './company-mail-outbox.mjs';
 
-export function createSesMailTransport({client,GetEmailIdentityCommand,SendEmailCommand,configurationSet,readOwnerIdentity,domain,now=Date.now}) {
+export function createSesMailTransport({client,GetEmailIdentityCommand,SendEmailCommand,configurationSet,identityArn,readOwnerIdentity,domain,now=Date.now}) {
   if(!configurationSet) throw new Error('Mail configuration set required.');
   let verified=false,checkAfter=0;
   async function isReady() {
@@ -31,7 +31,8 @@ export function createSesMailTransport({client,GetEmailIdentityCommand,SendEmail
       if(identity?.address?.toLowerCase()===m.to && /^[a-z2-7]{52}$/.test(identity.token??''))
         replyTo='owner-'+identity.token+'@'+domain;
     }
-    const response=await client.send(new SendEmailCommand({FromEmailAddress:m.from,Destination:{ToAddresses:[m.to]},
+    const response=await client.send(new SendEmailCommand({FromEmailAddress:m.from,
+      ...(identityArn && {FromEmailAddressIdentityArn:identityArn}),Destination:{ToAddresses:[m.to]},
       ...(replyTo&&{ReplyToAddresses:[replyTo]}),ConfigurationSetName:configurationSet,EmailTags:[{Name:'company-mail-id',Value:m.id}],Content:{Simple:{
         Subject:{Data:m.subject,Charset:'UTF-8'},Body:{Text:{Data:m.text,Charset:'UTF-8'}},Headers:headers}}}),
       {abortSignal:AbortSignal.timeout(10000)});
@@ -72,7 +73,8 @@ export async function handler(event) {
       const client=new SecretsManagerClient({});
       readOwnerIdentity=async()=>JSON.parse((await client.send(new GetSecretValueCommand({SecretId:secret,VersionStage:'AWSCURRENT'}))).SecretString);
     }
-    const transport=createSesMailTransport({domain,readOwnerIdentity,client:new SESv2Client({maxAttempts:1}),GetEmailIdentityCommand,SendEmailCommand,configurationSet});
+    const transport=createSesMailTransport({domain,identityArn:process.env.PEROTTINO_MAIL_IDENTITY_ARN,readOwnerIdentity,
+      client:new SESv2Client({maxAttempts:1}),GetEmailIdentityCommand,SendEmailCommand,configurationSet});
     const scoped=new Map();
     function claimRecordsFor(person) {
       // Guard at the transition immediately preceding the external call.

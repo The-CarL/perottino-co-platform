@@ -262,6 +262,7 @@ Resources:
           PEROTTINO_STATE_TABLE: !Ref StateTableName
           PEROTTINO_MAIL_DOMAIN: !Ref MailDomain
           PEROTTINO_MAIL_CONFIGURATION_SET: !Ref ConfigurationSet
+          PEROTTINO_MAIL_IDENTITY_ARN: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}'
           PEROTTINO_MAIL_EVENTS_TOPIC_ARN: !Ref EventsTopic
           PEROTTINO_MAIL_OWNER_SECRET_ARN: !Ref OwnerMailSecretArn
   SenderFailure:

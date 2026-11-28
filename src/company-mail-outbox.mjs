@@ -9,7 +9,26 @@ const throttleErrors = new Set(['TooManyRequestsException','ThrottlingException'
 const rejectionErrors = new Set(['MessageRejected','BadRequestException','MailFromDomainNotVerifiedException',
   'AccountSuspendedException','SendingPausedException','AccessDeniedException','NotFoundException']);
 
-function deliveryError(error) {
+function denialDetails(detail,message) {
+  const lower=detail.toLowerCase();
+  let target;
+  if (lower.includes(':identity/'+message.to.toLowerCase())) target='recipientIdentity';
+  else if (lower.includes(':identity/'+message.from.toLowerCase())) target='senderAddressIdentity';
+  else if (lower.includes(':identity/'+message.from.split('@').at(-1).toLowerCase())) target='senderDomainIdentity';
+  else if (lower.includes(':configuration-set/')) target='configurationSet';
+  else if (lower.includes(':secret:')) target='secret';
+  else if (lower.includes(':identity/')) target='otherIdentity';
+  let policy;
+  if (lower.includes('permissions boundary')) policy='permissionsBoundary';
+  else if (lower.includes('identity-based policy')) policy='identityPolicy';
+  else if (lower.includes('service control policy')) policy='serviceControlPolicy';
+  else if (lower.includes('resource-based policy')) policy='resourcePolicy';
+  const operation=['ses:SendEmail','ses:SendRawEmail','secretsmanager:GetSecretValue','kms:Decrypt']
+    .find(op=>lower.includes(op.toLowerCase()));
+  return {...(target && {target}),...(policy && {policy}),...(operation && {operation})};
+}
+
+function deliveryError(error,message) {
   const code = throttleErrors.has(error.name) || rejectionErrors.has(error.name) ? error.name : 'UnknownProviderError';
   const detail = String(error.message ?? '');
   let cause;
@@ -18,7 +37,8 @@ function deliveryError(error) {
   else if (/header/i.test(detail)) cause='invalidHeader';
   else if (/email address|mailbox|local part/i.test(detail)) cause='invalidAddress';
   const requestId=error.$metadata?.requestId;
-  return {code,...(cause && {cause}),...(/^[0-9a-f-]{36}$/i.test(requestId ?? '') && {requestId})};
+  return {code,...(cause && {cause}),...(cause==='permissionDenied' && denialDetails(detail,message)),
+    ...(/^[0-9a-f-]{36}$/i.test(requestId ?? '') && {requestId})};
 }
 
 export function createLocalMailTransport({records}) {
@@ -103,7 +123,7 @@ export async function dispatchCompanyMail({records,store,domain,transport,now=Da
   catch(error) {
     // Only explicit provider rejection permits a new transmission. A timeout, crash or 5xx
     // can follow provider acceptance; keep the intent for tagged event reconciliation.
-    const diagnostic=deliveryError(error);
+    const diagnostic=deliveryError(error,claimed);
     const reason=throttleErrors.has(diagnostic.code)?'throttled':rejectionErrors.has(diagnostic.code)?'failed':'uncertain';
     await finishAttempt(records,m.id,reason,now,diagnostic);return true;
   }

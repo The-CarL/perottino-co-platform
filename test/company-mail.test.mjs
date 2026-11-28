@@ -108,6 +108,17 @@ test('explicit throttling permits safe bounded retry; fired employees cannot dis
   persons[0].desiredState='fired';await dispatch(transport);
   assert.equal(calls,2);assert.equal((await records.get('mail-messages',next.messageId)).status,'failed');
 });
+
+test('IAM failures identify the operation and resource class without retaining recipient details',async t=>{
+  const {mail,dispatch}=fixture(t);
+  const {threadId}=await mail.execute('ceo','mail.send',{to:'customer@example.net',subject:'Test',text:'A reply.',requestId:'denied'});
+  await dispatch({async send(){throw Object.assign(new Error('Not authorized to perform ses:SendEmail on resource: '+
+    'arn:aws:ses:us-east-1:111111111111:identity/customer@example.net because no identity-based policy allows the action'),
+    {name:'AccessDeniedException'});}});
+  const {messages:[message]}=await mail.execute('owner','mail.get',{threadId});
+  assert.deepEqual(message.deliveryError,{code:'AccessDeniedException',cause:'permissionDenied',target:'recipientIdentity',
+    policy:'identityPolicy',operation:'ses:SendEmail'});
+});
 test('trusted owner source allows bounded goal handoff to original email; unsigned source cannot attach and private goals do not send',async t=>{
   const {mail,records,store,inbound}=fixture(t,{capture:true});
   const source=await inbound(),trust=await inbound({providerId:'auth',rfcMessageId:'<owner@example.net>',trustedOwner:true});
@@ -135,10 +146,12 @@ test('trusted owner source allows bounded goal handoff to original email; unsign
 test('SES adapter binds sender/recipient/tags, sets RFC reply headers, and adds owner routing only on verified owner replies',async()=>{
   const sent=[];class C{constructor(input){this.input=input;}}
   const transport=createSesMailTransport({client:{send:async c=>{sent.push(c.input);return {MessageId:'id'};}},SendEmailCommand:C,
-    domain,configurationSet:'configured',readOwnerIdentity:async()=>({address:'owner@example.net',token:'a'.repeat(52)})});
+    domain,identityArn:'arn:aws:ses:us-east-1:111111111111:identity/'+domain,
+    configurationSet:'configured',readOwnerIdentity:async()=>({address:'owner@example.net',token:'a'.repeat(52)})});
   const m={id:'a'.repeat(64),from:'ceo@'+domain,to:'owner@example.net',subject:'Re: Work',text:'Done',inReplyTo:'<in@example.net>',references:['<first@example.net>','<in@example.net>']};
   await transport.send(m);await transport.send({...m,ownerReplyRoute:true});
   assert.equal(sent[0].ReplyToAddresses,undefined);assert.ok(sent[1].ReplyToAddresses[0].startsWith('owner-'));
+  assert.equal(sent[1].FromEmailAddressIdentityArn,'arn:aws:ses:us-east-1:111111111111:identity/'+domain);
   assert.deepEqual(sent[0].Destination.ToAddresses,['owner@example.net']);assert.equal(sent[0].EmailTags[0].Value,m.id);
   assert.ok(sent[0].Content.Simple.Headers.some(h=>h.Name==='References'&&h.Value==='<first@example.net> <in@example.net>'));
 });
