@@ -2,6 +2,7 @@ import {browserSessionSeconds} from './company-browser-budget.mjs';
 import {mkdtemp,mkdir,readFile,rename,rm,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {setTimeout as delay} from 'node:timers/promises';
 import {randomUUID} from 'node:crypto';
 import {browserControl} from './agentcore-browser.mjs';
 import {spanAttributes} from './telemetry.mjs';
@@ -17,6 +18,41 @@ const check=(raw,origins,fixtureOrigin,deliveryOrigin)=>validatePublicPage(raw,{
   fixtureOrigin:!origins&&deliveryPage(raw,deliveryOrigin)?deliveryOrigin:fixtureOrigin});
 const configured=async value=>typeof value==='function'?value():value;
 
+
+// Chromium can acknowledge input before it dispatches a form or link navigation.
+// Keep the request guard and this CDP connection until the new document commits.
+async function deliverInput(page, input) {
+  const navigationStarted = Promise.withResolvers();
+  const documentCommitted = Promise.withResolvers();
+  function requestStarted(request) {
+    if (!request.isNavigationRequest()) return;
+    // A popup can issue its first request before Playwright associates it with a frame.
+    let frame;
+    try { frame = request.frame(); } catch { return; }
+    if (frame === page.mainFrame()) navigationStarted.resolve(true);
+  }
+  function frameNavigated(frame) {
+    if (frame === page.mainFrame()) {
+      navigationStarted.resolve(true);
+      documentCommitted.resolve(true);
+    }
+  }
+  page.on('request', requestStarted);
+  page.on('framenavigated', frameNavigated);
+  try {
+    if (input.kind === 'click') await page.mouse.click(input.x, input.y);
+    else if (input.kind === 'key') await page.keyboard.press(input.key);
+    else await page.keyboard.insertText(input.text);
+    if (await Promise.race([navigationStarted.promise, delay(350, false, {ref: false})])) {
+      if (!await Promise.race([documentCommitted.promise, delay(9000, false, {ref: false})]))
+        throw new Error('Browser navigation did not commit in time.');
+      await page.waitForLoadState('domcontentloaded', {timeout: 2000});
+    }
+  } finally {
+    page.off('request', requestStarted);
+    page.off('framenavigated', frameNavigated);
+  }
+}
 
 async function operate(context,op,input,{origins,fixtureOrigin,deliveryOrigin}={}) {
   const signal=AbortSignal.timeout(12_000);
@@ -71,10 +107,7 @@ async function operate(context,op,input,{origins,fixtureOrigin,deliveryOrigin}={
       return {url:page.url().split(/[?#]/)[0],title:(await page.title()).slice(0,250),
         text:(await page.locator('body').innerText({timeout:2000})).slice(0,4000)};
     } else if(op==='browser.input') {
-      if(input.kind==='click')await page.mouse.click(input.x,input.y);
-      else if(input.kind==='key')await page.keyboard.press(input.key);
-      else await page.keyboard.insertText(input.text);
-      await page.waitForLoadState('domcontentloaded',{timeout:2000}).catch(()=>{});
+      await deliverInput(page,input);
     }
     return {ok:true};
   } finally {

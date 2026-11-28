@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chromium } from 'playwright-core';
+import { localInteractiveBrowser } from '../src/interactive-browser.mjs';
 import { once } from 'node:events';
 import { interactiveResource, makeBrowser } from '../src/browser.mjs';
 
@@ -90,8 +90,12 @@ test('authenticated login redirects retain cookies on the same origin and requir
       res.writeHead(authorized ? 200 : 401, { 'content-type': 'text/plain' }).end(authorized ? 'Signed in' : 'Signed out');
       return;
     }
-    res.writeHead(303, { location: req.url === '/external' ? 'https://other.example/continue' : '/protected',
-      'set-cookie': 'session=fixture; Path=/; HttpOnly; Secure; SameSite=Strict' }).end();
+    const redirect = () => res.writeHead(303, {
+      location: req.url === '/external' ? 'https://other.example/continue' : '/protected',
+      'set-cookie': 'session=fixture; Path=/; HttpOnly; Secure; SameSite=Strict',
+    }).end();
+    if (req.method === 'POST') setTimeout(redirect, 250);
+    else redirect();
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -102,19 +106,25 @@ test('authenticated login redirects retain cookies on the same origin and requir
   assert.equal((await request('/external', [origin])).headers['set-cookie'], undefined);
   await assert.rejects(request('/invalid', [origin]), /Invalid URL/);
 
-  const browser = await chromium.launch({ chromiumSandbox: false });
-  t.after(() => browser.close());
-  const page = await browser.newPage();
-  await page.route('**/*', async route => {
-    const req = route.request();
-    await route.fulfill(await interactiveResource({ raw: req.url(), method: req.method(), body: req.postDataBuffer(),
-      headers: await req.allHeaders(), origins: [origin], fixtureOrigin: origin }));
+  const oldSandbox = process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX;
+  process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX = '1';
+  t.after(() => {
+    if (oldSandbox === undefined) delete process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX;
+    else process.env.PEROTTINO_BROWSER_EXTERNAL_SANDBOX = oldSandbox;
   });
-  await page.goto(origin);
-  await page.getByRole('button', { name: 'Sign in' }).click();
-  assert.equal(page.url(), origin + '/login');
+  const browser = localInteractiveBrowser({dataDir: dir, fixtureOrigin: origin});
+  t.after(() => browser.close());
+  const session = 'login-form';
+  await browser.start({id: session, profileId: 'synthetic', expiresAt: Date.now() + 30_000});
+  const action = (name, input = {}) => browser.action(session, 'browser.' + name, input, [origin]);
+  await action('navigate', {url: origin + '/'});
+  await action('input', {kind: 'key', key: 'Tab'});
+  await action('input', {kind: 'key', key: 'Enter'});
+  const interstitial = await action('read');
+  assert.equal(interstitial.url, origin + '/login');
+  assert.equal(interstitial.text, 'Continue to redirected page');
   assert.equal(protectedRequests, 0);
-  await page.getByRole('link', { name: 'Continue to redirected page' }).click();
-  assert.equal(await page.locator('body').innerText(), 'Signed in');
+  await action('input', {kind: 'click', x: 30, y: 15});
+  assert.equal((await action('read')).text, 'Signed in');
   assert.equal(protectedRequests, 1);
 });
