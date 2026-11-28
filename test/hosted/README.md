@@ -1,11 +1,13 @@
 # Hosted browser profile acceptance
 
-The browser profile fixture is an isolated HTTPS site for testing a saved login. It creates a private session table, a Lambda function and an HTTP API. The test account can only read a random marker assigned at sign-in. The site uses no company data.
+This disposable HTTPS sign-in site proves that an AgentCore browser can save and resume an authenticated session. It uses a synthetic principal and makes no AWS data calls. The server verifies the cookie on each protected request and enforces the assessment end time. A clean browser receives HTTP 401.
 
-Deploy `browser-profile-fixture.yaml` in the assessment account with the project's `Scope`, `PermissionsBoundaryArn` and a UTC `ExpiresAt` within the next three hours. After the cutoff, the site returns HTTP 410 and its synthetic session records expire by TTL. CloudFormation still owns the resources until the fixture stack is removed.
+Generate a private one-use assessment passphrase with `secrets.token_urlsafe(28)` in Python. To calculate the public CloudFormation parameter `SessionVerifier`, compute the hexadecimal HMAC-SHA256 of the ASCII text `hosted-profile-session/v1` keyed by that passphrase, then SHA-256 hash the ASCII hexadecimal result and take its hexadecimal digest. Keep the passphrase and session cookie in private memory or an owner-only temporary file. The template accepts only the public verifier.
 
-1. Allow the stack's HTTPS `Origin` on a disposable AgentCore profile and grant that profile to a test employee.
-2. In the first browser session, open `/protected` and verify that the server asks for sign-in. Go to `/` and submit the public fixture username `profile-tester` and password `profile-demo-only`. Open the protected page and record its marker. Stop the session and save the profile.
-3. Start a fresh session with the saved profile and visit `/protected` directly. Verify that the server returns the identical marker. Compare with a clean session, which must be asked to sign in. Stop all test sessions and revoke the test grant.
+Deploy `browser-profile-fixture.yaml` with the project's `Scope`, an existing minimal Lambda `ExecutionRoleArn`, the verifier and a UTC `ExpiresAt` within the next three hours. The site returns HTTP 410 after the cutoff. CloudFormation owns its API and Lambda until the temporary stack is removed.
 
-Store the checks and provider session IDs in private test evidence. Keep cookie values out of test output.
+1. Allow the stack's HTTPS `Origin` on a disposable AgentCore profile and grant the profile to a test employee.
+2. Open `/protected` and verify the sign-in requirement. Go to `/` and submit `profile-tester` and the temporary passphrase. Open the protected page and record the synthetic account's marker. Stop the session and save the profile.
+3. Start a fresh session with the saved profile and visit `/protected` directly. Verify the identical marker without entering credentials. Compare with a clean session. Stop the sessions and revoke the test grant.
+
+Keep session IDs in private test evidence and cookie values out of test output.

@@ -6,57 +6,19 @@ Parameters:
   Scope:
     Type: String
     AllowedPattern: '[a-z0-9][a-z0-9-]{0,43}'
-  PermissionsBoundaryArn:
+  ExecutionRoleArn:
     Type: String
-    AllowedPattern: 'arn:[^:]+:iam::[0-9]{12}:policy/.+'
+    Description: An existing logs-only Lambda execution role. The handler makes no AWS API calls.
+    AllowedPattern: 'arn:[^:]+:iam::[0-9]{12}:role/.+'
+  SessionVerifier:
+    Type: String
+    Description: SHA-256 hex digest of the per-test session proof. A digest cannot sign in.
+    AllowedPattern: '[0-9a-f]{64}'
   ExpiresAt:
     Type: String
     Description: Absolute UTC end time in YYYY-MM-DDTHH:MM:SSZ format.
     AllowedPattern: '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
 Resources:
-  Sessions:
-    Type: AWS::DynamoDB::Table
-    Metadata:
-      com.aws.cloudformation.Context:
-        why: Retain a synthetic marker independently of browser storage and Lambda restarts.
-        must: [Store only a token digest and synthetic session data, Expire records by TTL]
-    Properties:
-      TableName: !Sub 'factory-${Scope}-r-profile'
-      AttributeDefinitions: [{AttributeName: pk, AttributeType: S}]
-      KeySchema: [{AttributeName: pk, KeyType: HASH}]
-      BillingMode: PAY_PER_REQUEST
-      SSESpecification: {SSEEnabled: true}
-      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
-      Tags:
-        - {Key: 'factory:s', Value: !Ref Scope}
-        - {Key: 'perottino:assessment', Value: !Ref Scope}
-  Role:
-    Type: AWS::IAM::Role
-    Metadata:
-      com.aws.cloudformation.Context:
-        why: Confine synthetic session lookups to this fixture.
-        must: [Use the supplied permissions boundary, Grant only exact-table read and insert]
-    Properties:
-      RoleName: !Sub 'factory-${Scope}-r-profile'
-      Path: !Sub '/factory/${Scope}/'
-      PermissionsBoundary: !Ref PermissionsBoundaryArn
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: {Service: lambda.amazonaws.com}
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: FixtureSessions
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem]
-                Resource: !GetAtt Sessions.Arn
-      Tags:
-        - {Key: 'factory:s', Value: !Ref Scope}
-        - {Key: 'perottino:assessment', Value: !Ref Scope}
   Handler:
     Type: AWS::Lambda::Function
     Metadata:
@@ -64,14 +26,14 @@ Resources:
         why: Issue and validate a disposable proof-of-persistence cookie.
         must: [No real identities, Enforce expiry on every request]
     Properties:
-      FunctionName: !Sub 'factory-${Scope}-r-profile'
+      FunctionName: !Sub 'factory-${Scope}-r-pauth'
       Runtime: python3.13
       Handler: index.handler
-      Role: !GetAtt Role.Arn
+      Role: !Ref ExecutionRoleArn
       Timeout: 6
       MemorySize: 128
       Environment:
-        Variables: {TABLE: !Ref Sessions, EXPIRES_AT: !Ref ExpiresAt}
+        Variables: {SESSION_VERIFIER: !Ref SessionVerifier, EXPIRES_AT: !Ref ExpiresAt}
       Tags:
         - {Key: 'factory:s', Value: !Ref Scope}
         - {Key: 'perottino:assessment', Value: !Ref Scope}
@@ -82,17 +44,12 @@ Resources:
           import hashlib
           import os
           import re
-          import secrets
+          import hmac
           import time
           from datetime import datetime, timezone
           from urllib.parse import parse_qs
 
-          import boto3
-          from botocore.config import Config
-
-          table = boto3.resource('dynamodb', config=Config(
-              connect_timeout=1, read_timeout=2, retries={'total_max_attempts': 2}
-          )).Table(os.environ['TABLE'])
+          verifier = os.environ['SESSION_VERIFIER']
           end = int(datetime.strptime(os.environ['EXPIRES_AT'], '%Y-%m-%dT%H:%M:%SZ')
                     .replace(tzinfo=timezone.utc).timestamp())
           form = """<!doctype html><html lang="en"><meta charset="utf-8"><title>Profile fixture</title>
@@ -109,8 +66,12 @@ Resources:
                   **headers
               }, 'body': body}
 
-          def digest(token):
-              return hashlib.sha256(token.encode('ascii')).hexdigest()
+          def session_proof(passphrase):
+              return hmac.new(passphrase.encode('ascii'), b'hosted-profile-session/v1', hashlib.sha256).hexdigest()
+
+          def matches_verifier(proof):
+              computed = hashlib.sha256(proof.encode('ascii')).hexdigest()
+              return hmac.compare_digest(verifier, computed)
 
           def handler(event, context):
               now = int(time.time())
@@ -132,11 +93,13 @@ Resources:
                       fields = parse_qs(body, strict_parsing=True, max_num_fields=2)
                   except (ValueError, UnicodeError, binascii.Error):
                       return response(400, 'Invalid form.')
-                  if fields != {'username': ['profile-tester'], 'password': ['profile-demo-only']}:
+                  passphrases = fields.get('password', [])
+                  if (fields.get('username') != ['profile-tester'] or len(passphrases) != 1
+                          or not re.fullmatch('[a-zA-Z0-9_-]{32,64}', passphrases[0])):
                       return response(401, 'Invalid fixture credentials.')
-                  token = secrets.token_hex(32)
-                  table.put_item(Item={'pk': digest(token), 'marker': 'profile-marker-' + secrets.token_hex(12),
-                                       'expiresAt': end}, ConditionExpression='attribute_not_exists(pk)')
+                  token = session_proof(passphrases[0])
+                  if not matches_verifier(token):
+                      return response(401, 'Invalid fixture credentials.')
                   result = response(200, '<!doctype html><html lang="en"><title>Signed in</title><h1>Signed in</h1>'
                                     '<a id="protected-link" href="/protected">Open protected page</a></html>')
                   result['cookies'] = [f'__Host-profile={token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={end - now}']
@@ -146,15 +109,16 @@ Resources:
               pairs = [part.strip() for line in event.get('cookies', []) for part in line.split(';')]
               candidates = [part.partition('=')[2] for part in pairs if part.startswith('__Host-profile=')]
               if len(candidates) == 1 and re.fullmatch('[a-f0-9]{64}', candidates[0]):
-                  item = table.get_item(Key={'pk': digest(candidates[0])}, ConsistentRead=True).get('Item')
-                  if item and now < item['expiresAt'] and re.fullmatch('profile-marker-[0-9a-f]{24}', item['marker']):
+                  token = candidates[0]
+                  if matches_verifier(token):
+                      marker = hmac.new(bytes.fromhex(token), b'hosted-profile-marker/v1', hashlib.sha256).hexdigest()[:24]
                       return response(200, '<!doctype html><html lang="en"><title>Protected fixture</title>'
-                                      '<h1>Protected fixture</h1><output id="marker">' + item['marker'] + '</output></html>')
+                                      '<h1>Protected fixture</h1><output id="marker">profile-marker-' + marker + '</output></html>')
               return response(401, 'Sign in to see the fixture marker.')
   Api:
     Type: AWS::ApiGatewayV2::Api
     Properties:
-      Name: !Sub 'factory-${Scope}-r-profile'
+      Name: !Sub 'factory-${Scope}-r-pauth'
       ProtocolType: HTTP
       Tags: {'factory:s': !Ref Scope, 'perottino:assessment': !Ref Scope}
   Integration:
