@@ -1,20 +1,30 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { mkdtemp,rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import test from 'node:test';
 import { createCompanyService } from '../src/company-service.mjs';
+import { createLocalProjectGit } from '../src/project-git-local.mjs';
+import { createDeployments } from '../src/company-deployments.mjs';
+import { handler as executeBuild } from '../src/delivery-executor.mjs';
 import { employmentWrites } from '../src/company-governance.mjs';
 import { makeSqliteRecords } from '../src/foundation-records.mjs';
 import { companyCommand } from '../src/resident.mjs';
 import { runCompanyPulse,runCompanyResident } from '../src/company-worker.mjs';
+import { capabilitiesFor, useCapability } from '../src/company-capabilities.mjs';
+import { checkCompanyDecision } from '../src/company-decisions.mjs';
 import { createDecisionServer, requestCompanyDecision } from '../src/agent.mjs';
 import { once } from 'node:events';
 
-function fixture(t) {
+function fixture(t,adapters = {}) {
   const records = makeSqliteRecords({ filename:':memory:' });
   t.after(() => records.close());
   const staff = new Map([['ceo',{ id:'ceo',handle:'mara',name:'Mara',role:'CEO',desiredState:'active',canHire:true }]]);
   const hires = new Map();
-  const service = createCompanyService({ records,store:{ employee:id => staff.get(id),listEmployees:() => [...staff.values()] },
+  const service = createCompanyService({ records,adapters,store:{ employee:id => staff.get(id),listEmployees:() => [...staff.values()] },
     async control(actor,op,input,permit) {
       assert.equal(actor,'ceo'); assert.equal(op,'employee.hire');
       if (!hires.has(input.requestId)) {
@@ -234,4 +244,98 @@ test('an engineer recovers the existing DM receipt after changes and the reviewe
   assert.equal((await exec('owner','task.get',{taskId:task.id})).task.status,'done');
   await assert.rejects(exec('owner','messages.receipts',original),{status:404});
   assert.equal((await exec('ada','messages.list',{conversationId:original.conversationId})).messages.length,1);
+});
+
+test('project review tools bind the peer assignment and the submitted work to their respective task IDs',async () => {
+  const agent = {id:'peer',managerId:'ceo'};
+  const target = {projectId:'p-'+'1'.repeat(32),taskId:'implementation',commitSha:'a'.repeat(40)};
+  const note = {decision:'approve',note:'Verified the filter tests against the shipped module.'};
+  const actions = [
+    choice('project.review',{...target,...note}),
+    choice('project.merge',target),
+  ];
+  for (const action of actions) {
+    assert.deepEqual(checkCompanyDecision(action),action);
+    assert.throws(() => checkCompanyDecision(choice(action.op,{...action.input,reviewTaskId:'forged'})));
+
+    for (const kind of ['plan','close','mail','message']) {
+      assert.ok(!capabilitiesFor({kind,agent,trustedOwner:true,message:{senderId:'owner'}}).includes(action.op));
+    }
+    const calls = [];
+    const call = async (op,input) => { calls.push({op,input}); return {}; };
+    const assigned = {ctx:{kind:'task',agent},unit:{task:{id:'peer-review'}},call};
+    assert.ok(capabilitiesFor(assigned.ctx).includes(action.op));
+    await useCapability(action.op,action.input,assigned);
+    assert.deepEqual(calls.pop(),choice(action.op,{...action.input,reviewTaskId:'peer-review'}));
+
+    const designated = {ctx:{kind:'review',agent},unit:{task:{id:target.taskId}},call};
+    assert.ok(capabilitiesFor(designated.ctx).includes(action.op));
+    const wrongTask = await useCapability(action.op,{...action.input,taskId:'other'},designated);
+    assert.ok(wrongTask.error);
+    assert.equal(calls.length,0);
+    await useCapability(action.op,action.input,designated);
+    assert.deepEqual(calls.pop(),action);
+  }
+  assert.throws(() => checkCompanyDecision(choice('project.review',{...target,...note,decision:'accept'})));
+});
+
+test('a peer resident reviews the shipped source and merges a passing project revision through its assigned task',async t=>{
+  const directory=await mkdtemp(join(tmpdir(),'resident-peer-review-'));
+  t.after(()=>rm(directory,{recursive:true,force:true}));
+  const repo=join(directory,'projects.git');
+  const {pulse,exec,staff}=fixture(t,{git:createLocalProjectGit({directory:repo}),
+    deployments:args=>createDeployments({...args,origin:'http://localhost',execute:executeBuild})});
+  for (const [id,role] of [['author','Engineer'],['peer','Reviewer']]) {
+    staff.set(id,{id,handle:id,name:id,role,managerId:'ceo',desiredState:'active'});
+  }
+  await exec('owner','policy.set',{totalBudgetCents:10,maxAllocationCents:10,maxDirectReports:4,allowCeoPromotions:true,requestId:'policy'});
+  await exec('owner','budget.allocate',{employeeId:'author',amountCents:2,requestId:'allocate'});
+  const {goal}=await exec('owner','goal.create',{accountableId:'ceo',outcome:'Greeting app',successCriteria:'Independently reviewed app on main',requestId:'goal'});
+  const assign=async (id,title)=> (await exec('ceo','task.create',{goalId:goal.id,assigneeId:id,title,acceptance:title,requestId:'assign-'+id})).task;
+  const authorTask=await assign('author','Publish the tested app');
+  const reviewTask=await assign('peer','Inspect and merge the passing revision');
+  const files=[
+    {path:'public/index.html',content:'<p>Hello</p>'},
+    {path:'public/app.mjs',content:'export const greeting="Hello";'},
+    {path:'test/app.test.mjs',content:"import test from 'node:test'; import assert from 'node:assert/strict'; import {greeting} from '../public/app.mjs'; test('greeting',()=>assert.strictEqual(greeting,'Hello'));"},
+  ];
+  let target;
+  await pulse('author',({steps})=>{
+    if (!steps.length) return choice('project.create',{name:'Greeting'});
+    const projectId=steps[0].result.project.id;
+    if (steps.length===1) return choice('project.commit',{projectId,files});
+    target={projectId,taskId:authorTask.id,commitSha:steps[1].result.handoff.sha};
+    if (steps.length===2) return choice('delivery.build',{projectId,commitSha:target.commitSha});
+    assert.equal(steps[2].result.status,'passed');
+    return choice('task.submit',{note:'One test passed',evidence:[target.commitSha]});
+  });
+  let merged;
+  await pulse('peer',({task,steps})=>{
+    assert.equal(task.id,reviewTask.id);
+    if (!steps.length) return choice('project.snapshot',{...target,path:'public/app.mjs'});
+    if (steps.length===1) {
+      assert.equal(steps[0].result.content,files[1].content);
+      return choice('delivery.status',target);
+    }
+    if (steps.length===2) {
+      assert.equal(steps[1].result.build.testsPassed,1);
+      return choice('project.review',{...target,decision:'approve',note:'Verified the implementation and passing build.'});
+    }
+    if (steps.length===3) {
+      const {review} = steps[2].result;
+      assert.equal(review.reviewerId,'peer');
+      assert.equal(review.publicationStatus,'published');
+      assert.equal(review.publication.sha,target.commitSha);
+      return choice('project.merge',target);
+    }
+    merged=steps[3].result.merge;
+    assert.equal(merged.status,'merged');
+    if (steps.length===4) return choice('project.review.status',target);
+    assert.equal(steps[4].result.merge.mergeSha,merged.mergeSha);
+    return choice('task.submit',{note:'Merged the approved revision',evidence:[merged.mergeSha]});
+  });
+  const git=(...args)=>promisify(execFile)('git',['--git-dir',repo,...args]).then(r=>r.stdout.trim());
+  assert.equal(await git('rev-parse','main'),merged.mergeSha);
+  assert.equal(await git('show','main:apps/'+target.projectId+'/public/app.mjs'),files[1].content);
+  assert.equal((await exec('owner','task.get',{taskId:reviewTask.id})).task.status,'submitted');
 });

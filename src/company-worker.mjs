@@ -291,6 +291,8 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
           const r=s.result;
           return {op:s.decision.op,...(r.project?.id&&{project:r.project.id}),
             ...(r.handoff?.sha&&{sha:r.handoff.sha,branch:r.handoff.branch,pr:r.handoff.pr?.url??r.handoff.pr?.number}),
+            ...(r.review?.commitSha && {review:pick(r.review,['reviewerId','decision','commitSha','taskId'])}),
+            ...(r.merge?.mergeSha && {merge:pick(r.merge,['mergedBy','sha','mergeSha','prNumber'])}),
             ...pick(r,['projectId','commitSha','taskId','buildId','url','testsPassed','status']),
             ...(r.session?.id&&{session:r.session.id}),...(r.file?.path&&{file:r.file.path,version:r.file.version})};
         });

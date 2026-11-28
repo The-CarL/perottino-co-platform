@@ -1,5 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Retained credential slot for the Perottino & Co. projects Git worker.
+Description: Retained writer and reviewer credential slots for the Perottino & Co. projects Git worker.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
 Resources:
   ProjectsGitToken:
     Type: AWS::SecretsManager::Secret
@@ -8,7 +11,22 @@ Resources:
     Properties:
       Name: /perottino-co/github/pat
       Description: Fine-grained GitHub token for The-CarL/perottino-co-projects. Owner supplies the value separately.
+  ProjectsGitReviewer:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Independent GitHub identity for formal reviews of projects pull requests.
+        must:
+          - The owner supplies the credential value separately.
+    Properties:
+      Name: /perottino-co/github/reviewer
+      Description: Independent GitHub reviewer for project PRs. The owner supplies GitHub App credentials or a fine-grained reviewer token.
 Outputs:
   ProjectsGitTokenArn:
     Description: Secret reference for a future Git worker IAM policy.
     Value: !Ref ProjectsGitToken
+  ProjectsGitReviewerSecretArn:
+    Description: Reviewer secret reference for the trusted Git worker.
+    Value: !Ref ProjectsGitReviewer

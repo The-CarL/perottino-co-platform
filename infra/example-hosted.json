@@ -3,6 +3,8 @@
   "region": "us-east-1",
   "vpcId": "vpc-abcdef01234567890",
   "ownerSecretArn": "arn:aws:secretsmanager:us-east-1:111111111111:secret:example/owner-aBc123",
+  "projectsGitSecretArn": "arn:aws:secretsmanager:us-east-1:111111111111:secret:/perottino-co/github/pat-aBc123",
+  "projectsGitReviewerSecretArn": "arn:aws:secretsmanager:us-east-1:111111111111:secret:/perottino-co/github/reviewer-dEf456",
   "permissionsBoundaryArn": "arn:aws:iam::111111111111:policy/ExampleBoundary",
   "bedrockModel": "us.openai.gpt-6-sol",
   "bedrockResourceArns": [

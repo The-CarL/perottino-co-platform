@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { eventRows } from './company-events.mjs';
 import { createWork } from './company-work.mjs';
+import { createProjectReviews } from './company-project-reviews.mjs';
 import { branchFor, fault, insist, pathFor, projectFormat, shaFormat, sourceFiles, stableId } from './project-source.mjs';
 
 const projects='projects:catalog';
@@ -25,7 +26,7 @@ function ident(value) {
 const mutation=(pk,sk,expect,value)=>({pk,sk,expect,value});
 const next=page=>page.next?{next:page.next}:{};
 
-export function createProjects({records,store,git,work=createWork({records,employee:id=>store.employee(id)}),now=Date.now}) {
+export function createProjects({records,store,git,getBuild,work=createWork({records,employee:id=>store.employee(id)}),now=Date.now}) {
   async function active(actor) {
     if (actor==='owner') return;
     const employee=await store.employee(ident(actor));
@@ -132,6 +133,7 @@ export function createProjects({records,store,git,work=createWork({records,emplo
       insist(job.signature===signature,409,'Project commit request already used.');
       if (job.handoff) return {project:fieldValues(p),handoff:job.handoff};
     }
+    insist(!p.pendingMerge,409,'The current handoff is being merged. Retry the commit afterward.');
     const task=await claimed(actor,taskId);
     insist(p.goalIds.includes(task.goalId),403,'Task does not belong to this project.');
     if (!job) {
@@ -152,6 +154,7 @@ export function createProjects({records,store,git,work=createWork({records,emplo
     for (let attempt=0;attempt<5;attempt++) {
       [p,job]=await Promise.all([project(actor,p.id),records.get(jobs,jobId)]);
       if (job.handoff) return {project:fieldValues(p),handoff:job.handoff};
+      insist(!p.pendingMerge,409,'The current handoff is being merged. Retry the commit afterward.');
       const current=p.latestSha===job.expected;
       const handoff={...result,status:current?'current':'diverged'};
       const summary=current?{...fieldValues(p),latestSha:handoff.sha,latestTaskId:taskId,latestHandoff:handoff}:fieldValues(p);
@@ -172,9 +175,13 @@ export function createProjects({records,store,git,work=createWork({records,emplo
     insist(row && row.handoff.taskId===taskId,404,'Committed project snapshot not found.');
     return {projectId:p.id,taskId,commitSha:row.handoff.sha,ownerId:p.ownerId,files:row.files,testCommand:['node','--test']};
   }
+  const peers=createProjectReviews({records,work,git,getBuild,project,claimed,request,now});
   async function execute(actor,op,input={}) {
     await active(actor);
     switch (op) {
+      case 'project.review': return peers.review(actor,input);
+      case 'project.merge': return peers.merge(actor,input);
+      case 'project.review.status': return peers.status(actor,input);
       case 'project.create': return create(actor,input);
       case 'project.attach': return attach(actor,input);
       case 'project.list': return list(actor,input);

@@ -23,6 +23,9 @@ export const capabilityFields = {
   'project.create':{name:'string'}, 'project.list':{goalId:'?string'}, 'project.get':{projectId:'string'},
   'project.history':{projectId:'string',after:'?string'}, 'project.attach':{projectId:'string',goalId:'string'},
   'project.snapshot':{projectId:'string',taskId:'string',commitSha:'string',path:'?string',offset:'?integer'},
+  'project.review.status':{projectId:'string',taskId:'string',commitSha:'string'},
+  'project.review':{projectId:'string',taskId:'string',commitSha:'string',decision:'codeReview',note:'string'},
+  'project.merge':{projectId:'string',taskId:'string',commitSha:'string'},
   'project.commit':{projectId:'string',baseSha:'?string',files:'files',remove:'?array'},
   'delivery.build':{projectId:'string',commitSha:'string'},
   'delivery.preview':{projectId:'string',buildId:'string',ttlHours:'?integer'},
@@ -31,7 +34,7 @@ export const capabilityFields = {
   'delivery.status':{projectId:'string',taskId:'string',commitSha:'string'},
 };
 const read = ['files.list','files.read','files.versions','soul.get','settings.effective','knowledge.list','search',
-  'governance.get','promotion.list','project.list','project.get','project.history','project.snapshot','delivery.status','infra.status'];
+  'governance.get','promotion.list','project.list','project.get','project.history','project.snapshot','project.review.status','delivery.status','infra.status'];
 const browser = ['browser.list','browser.start','browser.navigate','browser.read','browser.input','browser.stop','browser.download','browser.screenshot'];
 const write = ['files.write','knowledge.save','knowledge.forget','promotion.propose','mail.list','mail.get','mail.send','mail.reply', ...browser];
 
@@ -39,7 +42,7 @@ export function capabilitiesFor(ctx) {
   if (ctx.kind === 'mail' && !ctx.trustedOwner || ctx.kind === 'message' && ctx.message.senderId !== 'owner' &&
       (!ctx.agent.managerId || ctx.message.senderId !== ctx.agent.managerId)) return [];
   const ops = [...read];
-  if (ctx.kind === 'task' || ctx.kind === 'review') ops.push('messages.receipts');
+  if (ctx.kind === 'task' || ctx.kind === 'review') ops.push('messages.receipts','project.review','project.merge');
   if (!['review','close'].includes(ctx.kind)) ops.push(...write);
   if (ctx.kind === 'task') ops.push('project.create','project.commit','delivery.build','delivery.preview','delivery.release','delivery.rollback','infra.provision');
   if (['message','plan','mail','task'].includes(ctx.kind)) ops.push('project.attach','budget.allocate','task.resume');
@@ -86,6 +89,13 @@ export async function useCapability(op,input,{ctx,unit,execute,call,browse,signa
   }
   if (op === 'project.list') return small(await execute(op,{...input,goalId:input.goalId??ctx.goal?.id,limit:12}));
   if (op === 'project.create') return small(await call(op,{name:input.name,goalId:ctx.goal.id,taskId:unit.task.id}));
+  if (op === 'project.review' || op === 'project.merge') {
+    if (ctx.kind === 'review') {
+      if (input.taskId !== unit.task.id) return {error:'Use the producing task currently under review.'};
+      return small(await call(op,input));
+    }
+    return small(await call(op,{...input,reviewTaskId:unit.task.id}));
+  }
   if (op === 'project.snapshot') {
     if (!shaFormat.test(input.commitSha)) {
       const {project} = await execute('project.get',{projectId:input.projectId});

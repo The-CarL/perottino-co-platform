@@ -47,7 +47,8 @@ export function createCompanyService({ records, store, control, heartbeat, adapt
   const settings = createSettings({records,employee,modelIds:adapters.modelIds ?? [process.env.PEROTTINO_BEDROCK_MODEL || 'us.openai.gpt-6-sol']});
   const mail = createCompanyMail({records,store,...adapters.mail,transport:adapters.mailTransport?.(records)});
   const work = createWork({ records, employee, canReadSource, canUseMailSource:mail.canUseSource });
-  const projects = createProjects({records,store,work,git:adapters.git});
+  const projects = createProjects({records,store,work,git:adapters.git,
+    getBuild:async (actor,input)=>(await deployments()?.status(actor,input))?.build});
   const infrastructure=createInfrastructure({records,projects,provider:adapters.infrastructure});
   const knowledge = createKnowledge({records,employee,files,conversations,projects});
   const browser = adapters.browser?.({records,employee,files});

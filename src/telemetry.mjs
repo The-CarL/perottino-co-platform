@@ -39,7 +39,7 @@ const commandNames = new Set([
   'browser.document','browser.usage','browser.read','browser.frame','browser.screenshot','browser.download','governance.get','policy.get','policy.set',
   'promotion.list','promotion.propose','promotion.approve','grant.revoke','budget.get','budget.allocate','budget.reclaim',
   'budget.model.begin','budget.model.finish','project.create','project.list','project.get','project.history',
-  'project.attach','project.commit','project.snapshot','delivery.build','delivery.preview','delivery.status',
+  'project.attach','project.commit','project.snapshot','project.review','project.merge','project.review.status','delivery.build','delivery.preview','delivery.status',
   'delivery.release','delivery.rollback','delivery.withdraw','delivery.expire','infra.list','infra.provision','infra.status','infra.remove',
   'mail.list','mail.get','mail.claim','mail.finish','mail.release','mail.send','mail.reply','memory.save',
   'deliveries.claim','deliveries.ack','deliveries.stage','deliveries.release','activity.list','admin.activity',

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { traceCarrier } from './telemetry.mjs';
 
-const fields = ['actor','threadId','browserSessionId','browserProfileId','resourceId','managerId','proposalId','reservationId','purpose','amountKind','amountCents', 'projectId', 'jobId', 'buildId', 'grantId', 'fundingGrantId', 'policyVersion', 'conversationId', 'messageId', 'goalId', 'taskId', 'employeeId', 'assigneeId', 'reviewerId', 'accountableId', 'status', 'reasonCode'];
+const fields = ['actor','threadId','browserSessionId','browserProfileId','resourceId','managerId','proposalId','reservationId','purpose','amountKind','amountCents', 'projectId', 'commitSha', 'mergeSha', 'prNumber', 'jobId', 'buildId', 'grantId', 'fundingGrantId', 'policyVersion', 'conversationId', 'messageId', 'goalId', 'taskId', 'employeeId', 'assigneeId', 'reviewerId', 'accountableId', 'status', 'reasonCode'];
 
 // This allowlist is the public audit schema. Business content belongs in its
 // access-controlled record, never inside a company activity row.
@@ -12,7 +12,7 @@ export function eventRows(kind, attributes, eventId) {
   const value = { id, kind, at: new Date(timestamp).toISOString() };
   for (const key of fields) {
     const item = attributes[key];
-    if (['amountCents','policyVersion'].includes(key) && Number.isSafeInteger(item) && item>=0) value[key]=item;
+    if (['amountCents','policyVersion','prNumber'].includes(key) && Number.isSafeInteger(item) && item>=0) value[key]=item;
     else if (typeof item === 'string' && /^[A-Za-z0-9_.:/#-]{1,180}$/.test(item)) value[key] = item;
   }
   const traceId = traceCarrier()?.traceparent?.split('-')[1];

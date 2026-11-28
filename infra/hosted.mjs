@@ -172,11 +172,24 @@ export function synthHosted(config, provenance, outdir) {
   const sameCluster = { ArnEquals: { 'ecs:cluster': arn(cluster) } };
   const delivery = addProjectDelivery({stack,resource,role,fn,arn,allow,logWrite,state,prefix,account,region});
   const gitSecret = config.projectsGitSecretArn;
-  if(gitSecret) requireField(gitSecret!==config.ownerSecretArn && new RegExp('^arn:aws:secretsmanager:'+region+':'+account+':secret:[A-Za-z0-9/_.+=@-]+$').test(gitSecret),'projectsGitSecretArn');
+  const reviewerSecret = config.projectsGitReviewerSecretArn;
+  const localSecretArn = new RegExp('^arn:aws:secretsmanager:'+region+':'+account+':secret:[A-Za-z0-9/_.+=@-]+$');
+  if (gitSecret) requireField(gitSecret !== config.ownerSecretArn && localSecretArn.test(gitSecret),'projectsGitSecretArn');
+  if (reviewerSecret !== undefined) {
+    requireField(gitSecret && typeof reviewerSecret === 'string' && localSecretArn.test(reviewerSecret) &&
+      reviewerSecret !== gitSecret && reviewerSecret !== config.ownerSecretArn,'projectsGitReviewerSecretArn');
+  }
   const projectsRepo=config.projectsRepository ?? 'The-CarL/perottino-co-projects';
   requireField(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(projectsRepo),'projectsRepository');
-  const gitRole=role('GitRole',lambda,[logWrite,...(gitSecret?[allow('secretsmanager:GetSecretValue',gitSecret)]:[])]);
-  const gitWorker=fn('GitFn','g','src/project-git.handler',gitRole,{PEROTTINO_PROJECTS_REPOSITORY:projectsRepo,...(gitSecret&&{PEROTTINO_PROJECTS_GIT_SECRET_ARN:gitSecret})},55);
+  const gitRole = role('GitRole',lambda,[logWrite,
+    ...(gitSecret ? [allow('secretsmanager:GetSecretValue',gitSecret)] : []),
+    ...(reviewerSecret ? [allow('secretsmanager:GetSecretValue',reviewerSecret)] : []),
+  ]);
+  const gitWorker = fn('GitFn','g','src/project-git.handler',gitRole,{
+    PEROTTINO_PROJECTS_REPOSITORY:projectsRepo,
+    ...(gitSecret && {PEROTTINO_PROJECTS_GIT_SECRET_ARN:gitSecret}),
+    ...(reviewerSecret && {PEROTTINO_PROJECTS_GIT_REVIEWER_SECRET_ARN:reviewerSecret}),
+  },55);
   const browserActions=['bedrock-agentcore:StartBrowserSession','bedrock-agentcore:StopBrowserSession',
     'bedrock-agentcore:GetBrowserSession','bedrock-agentcore:ConnectBrowserAutomationStream'];
   const sandbox=config.sandboxProvisioner;

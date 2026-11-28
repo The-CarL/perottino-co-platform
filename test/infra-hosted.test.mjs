@@ -164,6 +164,29 @@ test('the resident task runs at the configured size with no incoming network con
   assert.deepEqual(props(r, 'WorkerSecurityGroup').SecurityGroupEgress.map(e => e.ToPort), [80, 443]);
 });
 
+test('only the trusted Git worker can read the configured writer and reviewer secrets', t => {
+  const config = sample();
+  const { projectsGitSecretArn:writer, projectsGitReviewerSecretArn:reviewer, ...withoutGit } = config;
+  for (const [options, expected] of [[withoutGit,[]],[{...withoutGit,projectsGitSecretArn:writer},[writer]],[config,[writer,reviewer]]]) {
+    const r = render(t, options).template.Resources;
+    const vars = props(r,'GitFn').Environment.Variables;
+    assert.equal(vars.PEROTTINO_PROJECTS_GIT_SECRET_ARN, options.projectsGitSecretArn);
+    assert.equal(vars.PEROTTINO_PROJECTS_GIT_REVIEWER_SECRET_ARN, options.projectsGitReviewerSecretArn);
+    assert.deepEqual(grants(r,'GitRole').filter(s=>s.Action==='secretsmanager:GetSecretValue').map(s=>s.Resource),expected);
+    for (const [id,resource] of Object.entries(r)) {
+      if (id !== 'GitRole' && id !== 'GitFn') {
+        assert.ok(!JSON.stringify(resource).includes(reviewer),id);
+        assert.ok(!JSON.stringify(resource).includes(writer),id);
+      }
+    }
+  }
+  for (const arn of [writer,config.ownerSecretArn,reviewer.replace(config.account,'222222222222'),
+    reviewer.replace(config.region,'us-west-2'),reviewer+'*']) {
+    assert.throws(()=>render(t,{...config,projectsGitReviewerSecretArn:arn}),/projectsGitReviewerSecretArn/);
+  }
+  assert.throws(()=>render(t,{...withoutGit,projectsGitReviewerSecretArn:reviewer}),/projectsGitReviewerSecretArn/);
+});
+
 test('the owner, employees and trusted control code have disjoint entry points and permissions', t => {
   const config = sample(), r = render(t, config).template.Resources;
   const asserted = [['WebFn', 'a', 'src/cloud-api.handler'], ['FactoryFn', 'f', 'src/factory.handler'],

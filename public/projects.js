@@ -170,7 +170,10 @@ async function handoffDialog(p, h) {
 }
 async function deliveryPanel(p, taskId, commitSha, body) {
   const args = { projectId: p.id, taskId, commitSha };
-  const result = await api('delivery.status', args);
+  const [result, { review, merge }] = await Promise.all([
+    api('delivery.status', args),
+    api('project.review.status', args),
+  ]);
   const build = result.build;
   function operation(title, fields, button, op, params) {
     form(title, [sectionNote(p.name + ' · ' + commitSha.slice(0, 12)), ...fields], button, async (data) => {
@@ -253,7 +256,19 @@ async function deliveryPanel(p, taskId, commitSha, body) {
     ['Expires', result.preview?.expiresAt && date(result.preview.expiresAt)],
     ['Production', result.production && webLink(result.production.url, 'Open release', true)],
   ];
-  body.replaceChildren(el('h3', {}, 'Builds and deployment'), facts(details), commands);
+  const reviewDetails = [
+    ['Decision', review ? (review.decision === 'approve' ? 'Approved' : 'Changes requested') : 'Awaiting review'],
+    ['Reviewer', review && nameOf(review.reviewerId)],
+    ['Reviewed', review && date(review.at)],
+    ['Review note', review?.note],
+    ['GitHub decision', review?.publication?.url && label(review.publication.state.toLowerCase())],
+    ['GitHub review', review?.publication?.url && webLink(review.publication.url, 'View review on GitHub')],
+    ['Merge', merge && label(merge.status)],
+    ['Merged by', merge?.mergedAt && nameOf(merge.mergedBy)],
+    ['Merge commit', merge?.mergeSha],
+  ];
+  body.replaceChildren(el('h3', {}, 'Pull request review'), facts(reviewDetails),
+    el('h3', {}, 'Builds and deployment'), facts(details), commands);
 }
 
 async function projectResources(project) {

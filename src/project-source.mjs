@@ -52,5 +52,30 @@ export function jobSpec(value) {
 }
 export const branchFor = job => 'jobs/' + job.projectId + '/' + job.jobId;
 export const pathFor = projectId => 'apps/' + projectId;
+export function mergeSpec(value, repo) {
+  insist(typeof value?.projectId === 'string' && projectFormat.test(value.projectId) &&
+    typeof value.jobId === 'string' && jobFormat.test(value.jobId) &&
+    typeof value.sha === 'string' && shaFormat.test(value.sha) &&
+    Number.isSafeInteger(value.pr?.number) && value.pr.number > 0,400,'Invalid reviewed project handoff.');
+  const {projectId,jobId,branch,sha,path,pr} = value;
+  insist(value.repo === repo && branch === branchFor(value) && path === pathFor(projectId),
+    409, 'The handoff does not belong to this project branch and repository.');
+  return {projectId,jobId,branch,sha,pr:{number:pr.number},repo,path};
+}
+export function mergeAttribution(value) {
+  if (value === undefined) return undefined;
+  const id = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+  insist(typeof value?.reviewerId === 'string' && id.test(value.reviewerId) &&
+    typeof value?.mergedBy === 'string' && id.test(value.mergedBy),400,'Invalid merge attribution.');
+  return {reviewerId:value.reviewerId,mergedBy:value.mergedBy};
+}
+export const mergeTrailers = actors => 'Project-Reviewer: ' + actors.reviewerId + '\nProject-Merger: ' + actors.mergedBy;
+export function reviewSpec(input) {
+  insist(typeof input?.reviewerId === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(input.reviewerId) &&
+    typeof input.reviewId === 'string' && /^r-[a-f0-9]{32}$/.test(input.reviewId) &&
+    ['approve','changes'].includes(input.decision),400,'Invalid peer review publication.');
+  const {reviewerId,decision,reviewId} = input;
+  return {reviewerId,decision,reviewId};
+}
 export const commitMessage = job => `Update ${job.projectId}\n\nAgent: ${job.agentId}\nTask: ${job.taskId}\nJob: ${job.jobId}`;
 export const author = {name:'Perottino Projects',email:'projects@users.noreply.github.com'};

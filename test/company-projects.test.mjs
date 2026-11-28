@@ -20,17 +20,17 @@ async function fixture(t) {
   const store={employee:async id=>people[id]};
   let count=0,clock=Date.now();
   const time=()=>clock;
-  function open(git=createLocalProjectGit({directory:repo})) {
+  function open(git=createLocalProjectGit({directory:repo}),getBuild) {
     const records=makeSqliteRecords({filename:db});t.after(()=>records.close());
     const work=createWork({records,employee:store.employee,now:time});
-    return {...createProjects({records,work,store,git,now:time}),work};
+    return {...createProjects({records,work,store,git,getBuild,now:time}),work};
   }
   const service=open();
   async function assign() {
     const {goal}=await service.work.execute('owner','goal.create',{accountableId:'ceo',outcome:'An app',successCriteria:'It works',requestId:'g'+(++count)});
     const {task}=await service.work.execute('ceo','task.create',{goalId:goal.id,assigneeId:'engineer',title:'Implement',acceptance:'Code and tests',requestId:'t'+count});
-    await service.work.execute('engineer','task.claim',{taskId:task.id,requestId:'c'+count});
-    return {goalId:goal.id,taskId:task.id};
+    const {claimToken}=await service.work.execute('engineer','task.claim',{taskId:task.id,requestId:'c'+count});
+    return {goalId:goal.id,taskId:task.id,claimToken};
   }
   const first=await assign();
   const {project}=await service.execute('engineer','project.create',{...first,name:'Tides',requestId:'create-tides'});
@@ -111,4 +111,208 @@ test('only a live, assigned task can create a work branch and path inputs cannot
     assert.throws(()=>sourceFiles([{path,content:'x'}]),e=>e.status===400);
   assert.throws(()=>sourceFiles([{path:'dir',content:'a'},{path:'dir/file',content:'b'}]),e=>e.status===400);
   assert.throws(()=>sourceFiles([{path:'big',content:'a'.repeat(65536)}]),e=>e.status===400);
+});
+
+async function reviewFixture(t) {
+  const f=await fixture(t);
+  const write={projectId:f.projectId,taskId:f.taskId,files,requestId:'write'};
+  const {handoff}=await f.service.execute('engineer','project.commit',write);
+  const target={projectId:f.projectId,taskId:f.taskId,commitSha:handoff.sha};
+  const approve={...target,decision:'approve',note:'I checked the source and the tests.',requestId:'approved'};
+  const merge={...target,requestId:'merge'};
+  const getBuild=async()=>({...target,status:'passed',testsPassed:1,buildId:'b-'+'1'.repeat(32)});
+  const result={sha:handoff.sha,mergeSha:'e'.repeat(40),prNumber:handoff.pr.number};
+  const git={...createLocalProjectGit({directory:f.repo}),merge:async()=>result};
+  const service=f.open(git,getBuild);
+  async function submit() {
+    await f.service.work.execute('engineer','task.submit',{taskId:f.taskId,claimToken:f.claimToken,
+      evidence:['Project handoff '+handoff.sha],requestId:'submit'});
+  }
+  return {...f,write,handoff,target,approve,merge,getBuild,git,service,result,submit};
+}
+
+test('only an independent, assigned peer or designated reviewer can review and merge a project change',async t=>{
+  const f=await reviewFixture(t);
+  await f.submit();
+  const {service,target,approve,merge}=f;
+  await rejects(service.execute('engineer','project.review',approve),403);
+  await assert.rejects(service.execute('unrelated','project.review',approve),e=>e.status===403||e.status===404);
+  await rejects(service.execute('ceo','project.merge',merge),409);
+
+  const {task:qa}=await service.work.execute('ceo','task.create',{goalId:f.goalId,assigneeId:'unrelated',
+    title:'Review app code',acceptance:'Inspect the implementation and test results.',requestId:'qa'});
+  const peerApproval={...approve,reviewTaskId:qa.id};
+  await assert.rejects(service.execute('unrelated','project.review',peerApproval),e=>e.status===403||e.status===409);
+  await service.work.execute('unrelated','task.claim',{taskId:qa.id,requestId:'claim-qa'});
+  const other=await f.assign();
+  const {task:otherTask}=await service.work.execute('ceo','task.create',{goalId:other.goalId,assigneeId:'unrelated',
+    title:'Review another project',acceptance:'Review its changes.',requestId:'other-qa'});
+  await service.work.execute('unrelated','task.claim',{taskId:otherTask.id,requestId:'claim-other'});
+  await rejects(service.execute('unrelated','project.review',{...peerApproval,reviewTaskId:otherTask.id}),403);
+  await rejects(service.work.execute('unrelated','task.get',{taskId:f.taskId}),403);
+  const {review}=await service.execute('unrelated','project.review',peerApproval);
+  assert.equal(review.decision,'approve');
+  assert.equal(review.reviewerId,'unrelated');
+  assert.deepEqual((await service.execute('unrelated','project.review',peerApproval)).review,review);
+  await rejects(service.execute('engineer','project.merge',{...merge,reviewTaskId:qa.id}),403);
+
+  const change={...target,decision:'changes',note:'Improve the empty state.',requestId:'request-changes'};
+  const requested=(await service.execute('ceo','project.review',change)).review;
+  await rejects(service.execute('unrelated','project.merge',{...merge,reviewTaskId:qa.id}),409);
+  await service.execute('unrelated','project.review',peerApproval);
+  assert.deepEqual((await service.execute('ceo','project.review.status',target)).review,requested);
+  await service.execute('ceo','project.review',{...approve,requestId:'approved-after-fix'});
+  f.people.unrelated.desiredState='paused';
+  await rejects(service.execute('unrelated','project.merge',{...merge,reviewTaskId:qa.id}),403);
+  f.people.unrelated.desiredState='active';
+  f.advance(24*3600_000);
+  await rejects(service.execute('unrelated','project.merge',{...merge,reviewTaskId:qa.id}),409);
+  await service.work.execute('unrelated','task.claim',{taskId:qa.id,requestId:'reclaim-qa'});
+  const {merge:receipt}=await service.execute('unrelated','project.merge',{...merge,reviewTaskId:qa.id});
+  assert.equal(receipt.status,'merged');
+  assert.equal(receipt.mergedBy,'unrelated');
+  assert.equal(receipt.sha,f.handoff.sha);
+  assert.equal(receipt.mergeSha,f.result.mergeSha);
+  assert.equal(receipt.prNumber,f.handoff.pr.number);
+  assert.deepEqual((await f.open(f.git,f.getBuild).execute('owner','project.review.status',target)).merge,receipt);
+});
+
+test('a failed or mismatched build cannot authorize merge and approval does not carry forward to another SHA',async t=>{
+  const f=await reviewFixture(t);
+  const pass=await f.getBuild();
+  let build=pass,dispatches=0;
+  const service=f.open({...f.git,merge:async()=>{dispatches++;return f.result;}},async()=>build);
+  await service.execute('ceo','project.review',f.approve);
+  for(const denied of [null,{...pass,status:'failed'},{...pass,commitSha:'f'.repeat(40)},{...pass,taskId:'other'},{...pass,projectId:'p-'+'0'.repeat(32)}]) {
+    build=denied;
+    await rejects(service.execute('ceo','project.merge',f.merge),409);
+  }
+  build=pass;
+  const {handoff:updated}=await service.execute('engineer','project.commit',{...f.write,baseSha:f.handoff.sha,
+    files:[{path:'public/index.html',content:'New tide forecast.'}],requestId:'update'});
+  await rejects(service.execute('ceo','project.merge',f.merge),409);
+  build={...pass,commitSha:updated.sha};
+  await rejects(service.execute('ceo','project.merge',{...f.merge,commitSha:updated.sha,requestId:'merge-updated'}),409);
+  assert.equal(dispatches,0);
+});
+
+test('a definite branch-rule refusal releases the pending merge for a fresh review',async t=>{
+  const f=await reviewFixture(t);
+  const service=f.open({...f.git,merge:async()=>{throw Object.assign(new Error('Branch protection requires additional checks.'),{status:409});}},f.getBuild);
+  await service.execute('ceo','project.review',f.approve);
+  await rejects(service.execute('ceo','project.merge',f.merge),409);
+  const {review}=await service.execute('ceo','project.review',{...f.approve,decision:'changes',note:'Fix the required check.',requestId:'review-rejection'});
+  assert.equal(review.decision,'changes');
+  await rejects(service.execute('ceo','project.merge',{...f.merge,requestId:'retry-merge'}),409);
+});
+
+test('a pending external merge fences changes; a fresh broker reconciles an ambiguous response',async t=>{
+  const f=await reviewFixture(t);
+  const {task:peer}=await f.service.work.execute('ceo','task.create',{goalId:f.goalId,assigneeId:'unrelated',
+    title:'Review app code',acceptance:'Inspect the proposed change.',requestId:'peer-merge'});
+  await f.service.work.execute('unrelated','task.claim',{taskId:peer.id,requestId:'claim-peer'});
+  const entered=Promise.withResolvers(),release=Promise.withResolvers();
+  const attempts=[];
+  const service=f.open({...f.git,merge:async(handoff,actors)=>{
+    attempts.push({sha:handoff.sha,...actors});
+    entered.resolve();await release.promise;
+    throw new Error('Response lost after provider applied the merge.');
+  }},f.getBuild);
+  await service.execute('ceo','project.review',f.approve);
+  const pending=service.execute('ceo','project.merge',f.merge);
+  await Promise.race([entered.promise,pending]);
+  try {
+    await rejects(service.execute('unrelated','project.merge',{...f.merge,reviewTaskId:peer.id,requestId:'concurrent'}),409);
+    await rejects(service.execute('ceo','project.review',{...f.approve,decision:'changes',requestId:'too-late'}),409);
+    await rejects(service.execute('engineer','project.commit',{...f.write,baseSha:f.handoff.sha,requestId:'during-merge'}),409);
+  } finally {
+    release.resolve();
+  }
+  await assert.rejects(pending);
+  await rejects(service.execute('ceo','project.review',{...f.approve,decision:'changes',requestId:'after-lost'}),409);
+  const recovered=f.open({...f.git,merge:async(handoff,actors)=>{
+    attempts.push({sha:handoff.sha,...actors});
+    return f.result;
+  }},f.getBuild);
+  const first=await recovered.execute('unrelated','project.merge',{...f.merge,reviewTaskId:peer.id,requestId:'recover'});
+  assert.equal(first.merge.mergedBy,'ceo');
+  assert.equal(first.merge.mergeSha,f.result.mergeSha);
+  assert.deepEqual(await recovered.execute('ceo','project.merge',f.merge),first);
+  const originalAttribution={sha:f.handoff.sha,reviewerId:'ceo',mergedBy:'ceo'};
+  assert.deepEqual(attempts,[originalAttribution,originalAttribution]);
+});
+
+test('a review is bound to its provider receipt before it can authorize a merge',async t=>{
+  const f=await reviewFixture(t);
+  const entered=Promise.withResolvers(),release=Promise.withResolvers(),attempts=[];
+  const unreliable=f.open({...f.git,publishReview:async(h,metadata)=>{
+    attempts.push(metadata);
+    await f.git.publishReview(h,metadata);
+    entered.resolve();
+    await release.promise;
+    throw new Error('Lost provider review response');
+  }},f.getBuild);
+  const first=unreliable.execute('ceo','project.review',f.approve);
+  await Promise.race([entered.promise,first]);
+  try {
+    const {review}=await unreliable.execute('owner','project.review.status',f.target);
+    assert.equal(review.decision,'approve');
+    assert.equal(review.publicationStatus,'pending');
+    assert.equal(review.publication,null);
+    await rejects(unreliable.execute('ceo','project.merge',f.merge),409);
+    await rejects(unreliable.execute('ceo','project.review',{...f.approve,requestId:'concurrent'}),409);
+  } finally { release.resolve(); }
+  await assert.rejects(first,/Lost provider review response/);
+  const recovered=f.open({...f.git,publishReview:async(h,metadata)=>{
+    attempts.push(metadata);
+    return f.git.publishReview(h,metadata);
+  }},f.getBuild);
+  const {review}=await recovered.execute('ceo','project.review',f.approve);
+  assert.equal(review.publicationStatus,'published');
+  assert.deepEqual(review.publication,{id:review.reviewId,url:null,sha:f.target.commitSha,prNumber:f.handoff.pr.number,state:'COMMENTED'});
+  const publicMetadata={reviewId:review.reviewId,reviewerId:'ceo',decision:'approve'};
+  assert.deepEqual(attempts,[publicMetadata,publicMetadata]);
+  assert.equal((await recovered.execute('ceo','project.merge',f.merge)).merge.sha,f.target.commitSha);
+});
+
+test('a public review refusal keeps a change request effective and a later decision can replace it',async t=>{
+  const f=await reviewFixture(t);
+  await f.service.execute('ceo','project.review',f.approve);
+  const denied=f.open({...f.git,publishReview:async()=>{throw Object.assign(new Error('Protected review.'),{status:403});}},f.getBuild);
+  const change={...f.approve,decision:'changes',requestId:'changes-rejected'};
+  await rejects(denied.execute('ceo','project.review',change),403);
+  const rejected=(await denied.execute('owner','project.review.status',f.target)).review;
+  assert.equal(rejected.publicationStatus,'refused');
+  assert.equal(rejected.decision,'changes');
+  await rejects(denied.execute('ceo','project.merge',f.merge),409);
+  const fresh=await f.service.execute('ceo','project.review',{...f.approve,requestId:'updated-approval'});
+  assert.equal(fresh.review.publicationStatus,'published');
+  await rejects(f.service.execute('ceo','project.review',change),409);
+});
+
+test('enrolling a separate reviewer allows a fresh native review and preserves the original comment receipt',async t=>{
+  const f=await fixture(t), local=createLocalProjectGit({directory:f.repo});
+  const repo='company/products';
+  let providerState='COMMENTED',reviewNumber=0;
+  const git={...local,repo,deliver:async job=>{
+    const result=await local.deliver(job);
+    return {...result,repo,pr:{number:result.pr.number,url:'https://github.com/'+repo+'/pull/'+result.pr.number}};
+  },publishReview:async h=>{
+    const id=++reviewNumber;
+    return {id,url:h.pr.url+'#pullrequestreview-'+id,sha:h.sha,prNumber:h.pr.number,state:providerState};
+  }};
+  const service=f.open(git);
+  const {project}=await service.execute('engineer','project.create',{goalId:f.goalId,taskId:f.taskId,name:'Native review',requestId:'new'});
+  const {handoff}=await service.execute('engineer','project.commit',{projectId:project.id,taskId:f.taskId,files,requestId:'native-commit'});
+  const input={projectId:project.id,taskId:f.taskId,commitSha:handoff.sha,decision:'approve',note:'Tested.',requestId:'comment'};
+  const original=(await service.execute('ceo','project.review',input)).review;
+  assert.equal(original.publication.state,'COMMENTED');
+  providerState='APPROVED';
+  const native=(await service.execute('ceo','project.review',{...input,requestId:'native'})).review;
+  assert.equal(native.publication.state,'APPROVED');
+  assert.notEqual(native.publication.id,original.publication.id);
+  assert.deepEqual((await service.execute('ceo','project.review',input)).review,original);
+  assert.deepEqual((await service.execute('engineer','project.review.status',input)).review,native);
+  providerState='CHANGES_REQUESTED';
+  await rejects(service.execute('ceo','project.review',{...input,requestId:'wrong-provider-state'}),502);
 });
