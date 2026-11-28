@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!Dockerfile.lambda
+!package.json
+!package-lock.json
+!src/
+src/**
+!src/*.mjs
+!public/
+public/**
+!public/index.html
+!public/chat.css
+!public/*.js

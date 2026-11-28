@@ -1,0 +1,11 @@
+node_modules/
+.local/
+cdk.out/
+.local-*/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+test-results/
+cdk.hosted.out/

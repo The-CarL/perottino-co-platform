@@ -1,0 +1,262 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Bounded temporary SQS infrastructure in the designated sandbox account
+Parameters:
+  ProjectScope:
+    Type: String
+    AllowedPattern: '[0-9a-f-]{36}-[a-z0-9][a-z0-9-]{0,15}'
+  EnableAssessmentTag:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Apply the company scope as the cost allocation tag on new assessment queues.
+  BrokerRoleArn:
+    Type: String
+    AllowedPattern: arn:aws:iam::[0-9]{12}:role/factory/[a-z0-9-]+/[A-Za-z0-9_+=,.@-]+
+    Description: Exact deployed company broker role
+  SandboxPermissionsBoundaryArn:
+    Type: String
+    AllowedPattern: arn:aws:iam::[0-9]{12}:policy/[A-Za-z0-9/_+=,.@-]+
+  LambdaImageUri:
+    Type: String
+    AllowedPattern: '[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9/._-]+@sha256:[a-f0-9]{64}'
+    Description: Mirrored and verified platform Lambda digest in the target account and region
+  QueueProvenance:
+    Type: String
+    MaxLength: 3000
+    Description: Reviewed factory provenance tags as a JSON map. Applied to each queue at creation.
+Conditions:
+  AssessmentTagged:
+    Fn::Equals: [{Ref: EnableAssessmentTag}, 'true']
+Resources:
+  SandboxLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /factory/${ProjectScope}/sandbox-queues
+      RetentionInDays: 7
+  SandboxRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path:
+        Fn::Sub: /factory/${ProjectScope}/
+      PermissionsBoundary:
+        Ref: SandboxPermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: EightQueueSlots
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::GetAtt:
+              - SandboxLogs
+              - Arn
+          - Effect: Allow
+            Action:
+            - sqs:GetQueueUrl
+            - sqs:GetQueueAttributes
+            - sqs:ListQueueTags
+            Resource:
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-0
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-1
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-2
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-3
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-4
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-5
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-6
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-7
+          - Effect: Allow
+            Action:
+            - sqs:CreateQueue
+            - sqs:TagQueue
+            Resource:
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-0
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-1
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-2
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-3
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-4
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-5
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-6
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-7
+            Condition:
+              StringEquals:
+                aws:RequestTag/factory:s:
+                  Ref: ProjectScope
+                aws:RequestTag/perottino:purpose: temporary-queue-v1
+                aws:RequestTag/perottino:assessment:
+                  Fn::If: [AssessmentTagged, {Ref: ProjectScope}, {Ref: 'AWS::NoValue'}]
+          - Effect: Allow
+            Action: sqs:DeleteQueue
+            Resource:
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-0
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-1
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-2
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-3
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-4
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-5
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-6
+            - Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:factory-${ProjectScope}-r-q-7
+            Condition:
+              StringEquals:
+                aws:ResourceTag/factory:s:
+                  Ref: ProjectScope
+                aws:ResourceTag/perottino:purpose: temporary-queue-v1
+  SandboxFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: factory-${ProjectScope}-r-z
+      PackageType: Image
+      Architectures:
+      - x86_64
+      Code:
+        ImageUri:
+          Ref: LambdaImageUri
+      ImageConfig:
+        Command:
+        - src/sandbox-provisioner.handler
+      Role:
+        Fn::GetAtt:
+        - SandboxRole
+        - Arn
+      MemorySize: 256
+      Timeout: 25
+      LoggingConfig:
+        LogGroup:
+          Ref: SandboxLogs
+        LogFormat: JSON
+      Environment:
+        Variables:
+          PEROTTINO_SCOPE:
+            Ref: ProjectScope
+          PEROTTINO_ASSESSMENT_SCOPE:
+            Fn::If: [AssessmentTagged, {Ref: ProjectScope}, {Ref: 'AWS::NoValue'}]
+          SANDBOX_ACCOUNT:
+            Ref: AWS::AccountId
+          QUEUE_PROVENANCE:
+            Ref: QueueProvenance
+  SandboxApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name:
+        Fn::Sub: factory-${ProjectScope}-r-queue-control
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action: execute-api:Invoke
+          Resource: execute-api:/sandbox/POST/resources
+          Principal:
+            AWS:
+              Ref: BrokerRoleArn
+        - Effect: Deny
+          Principal: '*'
+          Action: execute-api:Invoke
+          Resource: execute-api:/*
+          Condition:
+            ArnNotEquals:
+              aws:PrincipalArn:
+                Ref: BrokerRoleArn
+  QueueResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId:
+        Ref: SandboxApi
+      ParentId:
+        Fn::GetAtt:
+        - SandboxApi
+        - RootResourceId
+      PathPart: resources
+  SandboxMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SandboxApi
+      ResourceId:
+        Ref: QueueResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SandboxFunction.Arn}/invocations
+  SandboxDeploymentV1:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId:
+        Ref: SandboxApi
+    DependsOn: SandboxMethod
+  SandboxStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: sandbox
+      RestApiId:
+        Ref: SandboxApi
+      DeploymentId:
+        Ref: SandboxDeploymentV1
+      MethodSettings:
+      - HttpMethod: '*'
+        ResourcePath: /*
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+  AllowSandboxApi:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: SandboxFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount:
+        Ref: AWS::AccountId
+      SourceArn:
+        Fn::Sub: arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${SandboxApi}/sandbox/POST/resources
+  SandboxExpiry:
+    Type: AWS::Events::Rule
+    Properties:
+      Name:
+        Fn::Sub: factory-${ProjectScope}-r-q-expire
+      ScheduleExpression: rate(15 minutes)
+      Targets:
+      - Id: ExpireQueues
+        Arn:
+          Fn::GetAtt:
+          - SandboxFunction
+          - Arn
+        Input: '{"trigger":"sandbox-expiry"}'
+  AllowSandboxExpiry:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: SandboxFunction
+      Principal: events.amazonaws.com
+      SourceAccount:
+        Ref: AWS::AccountId
+      SourceArn:
+        Fn::GetAtt:
+        - SandboxExpiry
+        - Arn
+Outputs:
+  ApiId:
+    Value:
+      Ref: SandboxApi
+  ApiRegion:
+    Value:
+      Ref: AWS::Region
+  ApiAccount:
+    Value:
+      Ref: AWS::AccountId

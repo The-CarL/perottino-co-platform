@@ -1,0 +1,73 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Dedicated company mail subdomain, regional SES identity and optional public DNS records.
+Parameters:
+  ParentDomain:
+    Type: String
+    AllowedPattern: '([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}'
+  MailLabel:
+    Type: String
+    AllowedPattern: '[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+  HostedZoneId:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$|Z[A-Z0-9]{1,31})'
+    Description: Public parent zone ID. Leave empty for separately managed DNS.
+  NewRuleSetName:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$|[a-zA-Z0-9_-]{1,64})'
+    Description: Create this inactive rule set only in a region that has no existing receiving set.
+  PublishMx:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Enable only after the inbound stack is ready and its receipt rule is active.
+Conditions:
+  ManageDns: !Not [!Equals [!Ref HostedZoneId, '']]
+  NewRuleSet: !Not [!Equals [!Ref NewRuleSetName, '']]
+  EnableMx: !And [!Condition ManageDns, !Equals [!Ref PublishMx, 'true']]
+Resources:
+  Identity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Sub '${MailLabel}.${ParentDomain}'
+      DkimAttributes: {SigningEnabled: true}
+      DkimSigningAttributes: {NextSigningKeyLength: RSA_2048_BIT}
+  RuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Condition: NewRuleSet
+    Properties:
+      RuleSetName: !Ref NewRuleSetName
+  DkimRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: ManageDns
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Name: !GetAtt Identity.DkimDNSTokenName1
+          Type: CNAME
+          TTL: '300'
+          ResourceRecords: [!GetAtt Identity.DkimDNSTokenValue1]
+        - Name: !GetAtt Identity.DkimDNSTokenName2
+          Type: CNAME
+          TTL: '300'
+          ResourceRecords: [!GetAtt Identity.DkimDNSTokenValue2]
+        - Name: !GetAtt Identity.DkimDNSTokenName3
+          Type: CNAME
+          TTL: '300'
+          ResourceRecords: [!GetAtt Identity.DkimDNSTokenValue3]
+  InboundMx:
+    Type: AWS::Route53::RecordSet
+    Condition: EnableMx
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${MailLabel}.${ParentDomain}.'
+      Type: MX
+      TTL: '300'
+      ResourceRecords: [!Sub '10 inbound-smtp.${AWS::Region}.${AWS::URLSuffix}.']
+Outputs:
+  MailDomain:
+    Value: !Ref Identity
+  CreatedRuleSetName:
+    Condition: NewRuleSet
+    Value: !Ref RuleSet

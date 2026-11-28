@@ -1,0 +1,24 @@
+{
+  "tags": {
+    "factory:managed-by": "engineering-factory",
+    "factory:project-id": "11111111-1111-4111-8111-111111111111",
+    "factory:environment": "example",
+    "factory:owner": "example-owner",
+    "factory:source-repo": "example-owner/example-platform",
+    "factory:source-commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "factory:created-by": "example-deployer",
+    "factory:created-at": "2026-01-01T00:00:00Z",
+    "factory:creation-run-id": "example-run",
+    "factory:last-run-id": "example-run",
+    "factory:last-source-commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "factory:provenance-version": "1",
+    "factory:expires-at": "none",
+    "factory:project-name": "Example Company",
+    "factory:repo-name": "example-platform",
+    "factory:source-branch": "main",
+    "factory:source-author": "Example Author",
+    "factory:last-source-branch": "main",
+    "factory:last-source-author": "Example Author"
+  },
+  "overrides": {}
+}

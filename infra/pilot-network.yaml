@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A project-owned IPv4 VPC with two public subnets for standalone Fargate employees.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.230.0.0/22
+    Description: An unused private /22 IPv4 network with an aligned base address.
+    AllowedPattern: '(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.0/22'
+  AvailabilityZoneA:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First standard Availability Zone supporting Fargate in the target region.
+  AvailabilityZoneB:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second standard Availability Zone supporting Fargate in the target region.
+Rules:
+  DistinctZones:
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals: [!Ref AvailabilityZoneA, !Ref AvailabilityZoneB]
+        AssertDescription: Select two different Availability Zones.
+Resources:
+  Network:
+    Type: AWS::EC2::VPC
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Each project owns its network and can recover it independently.
+        must: [Keep the original CIDR while employees use these subnets.]
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  Gateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Network
+      InternetGatewayId: !Ref Gateway
+  Routes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Network
+  InternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Fargate tasks with an explicitly assigned public address reach AWS APIs directly.
+        must: [Attach the gateway before installing the route.]
+    Properties:
+      RouteTableId: !Ref Routes
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Gateway
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Network
+      AvailabilityZone: !Ref AvailabilityZoneA
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 2, 9]]
+      MapPublicIpOnLaunch: false
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Network
+      AvailabilityZone: !Ref AvailabilityZoneB
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 2, 9]]
+      MapPublicIpOnLaunch: false
+  RouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref Routes
+  RouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref Routes
+Outputs:
+  VpcId:
+    Value: !Ref Network
+  PublicSubnetA:
+    Value: !Ref SubnetA
+  PublicSubnetB:
+    Value: !Ref SubnetB

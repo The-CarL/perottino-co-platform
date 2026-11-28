@@ -1,0 +1,19 @@
+FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df AS dependencies
+WORKDIR /build
+COPY package.json package-lock.json ./
+# An optional public CA is available to npm only during this build step.
+RUN --mount=type=secret,id=build_ca \
+    if [ -f /run/secrets/build_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/build_ca; fi; \
+    npm ci --omit=dev --include=optional --ignore-scripts --no-audit --no-fund
+RUN rm -rf node_modules/@openai node_modules/.bin
+
+# Official x86_64 AWS Lambda Node.js 24 image with the Runtime Interface Client.
+FROM public.ecr.aws/lambda/nodejs:24@sha256:d20c164c7208f5d3af9adf77c455e36784198495638053710d99be2394d5dbfc
+WORKDIR ${LAMBDA_TASK_ROOT}
+COPY --from=dependencies /build/node_modules ./node_modules
+COPY package.json ./
+COPY src/ ./src/
+COPY public/ ./public/
+# AWS Lambda chooses its own least-privileged UID. Source checkouts may use 0600.
+RUN chmod -R a+rX,go-w src public package.json
+CMD ["src/cloud-api.handler"]

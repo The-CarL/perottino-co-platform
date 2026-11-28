@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Company email, threaded employee inboxes and an isolated SES outbound sender.
+Parameters:
+  ProjectScope:
+    Type: String
+    MinLength: 38
+    MaxLength: 52
+    AllowedPattern: '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}-[a-z][a-z0-9-]*'
+  MailDomain:
+    Type: String
+    Description: A dedicated, SES-verified receiving domain in this region.
+    AllowedPattern: '([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}'
+  ActiveReceiptRuleSet:
+    Type: String
+    Description: Name of the existing active SES receipt rule set in this region.
+    AllowedPattern: '[a-zA-Z0-9_-]{1,64}'
+  StateTableName:
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9_.-]{3,255}'
+  LambdaImage:
+    Type: String
+    AllowedPattern: '[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9._/-]+@sha256:[a-f0-9]{64}'
+  PermissionsBoundaryArn:
+    Type: String
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:policy/.+'
+  OwnerMailSecretArn:
+    Type: String
+    Default: ''
+    Description: Optional private JSON secret with owner address and a 256-bit lowercase base32 routing token.
+    AllowedPattern: '(^$|arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[a-zA-Z0-9/_+=.@-]+)'
+  EnableFounderSandboxDelivery:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Authorize the verified founder recipient identity for SES sandbox delivery.
+Rules:
+  FounderEnrollmentRequired:
+    RuleCondition: !Equals [!Ref EnableFounderSandboxDelivery, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OwnerMailSecretArn, '']]
+        AssertDescription: Sandbox founder delivery requires the enrolled founder secret ARN.
+Conditions:
+  HasOwnerMail: !Not [!Equals [!Ref OwnerMailSecretArn, '']]
+  FounderSandboxDelivery: !Equals [!Ref EnableFounderSandboxDelivery, 'true']
+Resources:
+  Topic:
+    Type: AWS::SNS::Topic
+  TopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref Topic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ses.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref Topic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${ActiveReceiptRuleSet}:receipt-rule/co-${ProjectScope}-mail'
+  Failures:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  FailurePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref Failures]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: sns.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt Failures.Arn
+            Condition: {ArnEquals: {'aws:SourceArn': [!Ref Topic, !Ref EventsTopic]}}
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/factory-${ProjectScope}-r-e'
+      RetentionInDays: 14
+  MailRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub '/factory/${ProjectScope}/'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReceiveEmployeeMail
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt Logs.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:ConditionCheckItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}'
+                Condition:
+                  'Null': {'dynamodb:LeadingKeys': 'false'}
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: [DIRECTORY, 'V2#mail-routing', 'V2#mail-threads', 'V2#mail-messages', 'V2#mail-references', 'V2#mail-provider', 'V2#mail-folder#*']
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}'
+                Condition:
+                  'Null': {'dynamodb:LeadingKeys': 'false'}
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: ['V2#mail-routing', 'V2#mail-threads', 'V2#mail-messages', 'V2#mail-references', 'V2#mail-thread#*', 'V2#mail-folder#*', 'V2#mail-inbox#*', 'V2#event-id', 'V2#company-events']
+              - !If
+                - HasOwnerMail
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref OwnerMailSecretArn}
+                - !Ref AWS::NoValue
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Failures.Arn
+  MailFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'factory-${ProjectScope}-r-e'
+      Architectures: [x86_64]
+      PackageType: Image
+      Code: {ImageUri: !Ref LambdaImage}
+      ImageConfig: {Command: [src/email-ingress.handler]}
+      Role: !GetAtt MailRole.Arn
+      Timeout: 45
+      MemorySize: 512
+      Environment:
+        Variables:
+          PEROTTINO_STATE_TABLE: !Ref StateTableName
+          PEROTTINO_MAIL_DOMAIN: !Ref MailDomain
+          PEROTTINO_MAIL_TOPIC_ARN: !Ref Topic
+          PEROTTINO_RESIDENT: '1'
+          PEROTTINO_MAIL_OWNER_SECRET_ARN: !Ref OwnerMailSecretArn
+  DeliveryFailure:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref MailFunction
+      Qualifier: '$LATEST'
+      MaximumRetryAttempts: 2
+      DestinationConfig:
+        OnFailure: {Destination: !GetAtt Failures.Arn}
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MailFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref Topic
+  Subscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: [InvokePermission, FailurePolicy, DeliveryFailure]
+    Properties:
+      TopicArn: !Ref Topic
+      Protocol: lambda
+      Endpoint: !GetAtt MailFunction.Arn
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt Failures.Arn}
+  Receipt:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: [TopicPolicy, Subscription]
+    Properties:
+      RuleSetName: !Ref ActiveReceiptRuleSet
+      Rule:
+        Name: !Sub 'co-${ProjectScope}-mail'
+        Enabled: true
+        ScanEnabled: true
+        Recipients: [!Ref MailDomain]
+        Actions:
+          - SNSAction: {TopicArn: !Ref Topic, Encoding: Base64}
+  ConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub 'co-${ProjectScope}-mail'
+      ReputationOptions: {ReputationMetricsEnabled: true}
+  EventsTopic:
+    Type: AWS::SNS::Topic
+  EventsPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref EventsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ses.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref EventsTopic
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref AWS::AccountId}
+              ArnEquals: {'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${ConfigurationSet}'}
+  MailEvents:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    DependsOn: EventsPolicy
+    Properties:
+      ConfigurationSetName: !Ref ConfigurationSet
+      EventDestination:
+        Name: mail-status
+        Enabled: true
+        MatchingEventTypes: [send, delivery, bounce, complaint, reject, renderingFailure]
+        SnsDestination: {TopicARN: !Ref EventsTopic}
+  SenderLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/factory-${ProjectScope}-r-s'
+      RetentionInDays: 14
+  SenderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub '/factory/${ProjectScope}/'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}
+      Policies:
+        - PolicyName: DispatchCompanyMail
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt SenderLogs.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:ConditionCheckItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}'
+                Condition:
+                  'Null': {'dynamodb:LeadingKeys': 'false'}
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: [DIRECTORY, 'COMPANY#GATE', 'V2#mail-outbox', 'V2#mail-attempts', 'V2#mail-provider', 'V2#mail-messages']
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}'
+                Condition:
+                  'Null': {'dynamodb:LeadingKeys': 'false'}
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: ['V2#mail-outbox', 'V2#mail-attempts', 'V2#mail-provider', 'V2#mail-messages', 'V2#event-id', 'V2#company-events']
+              - Effect: Allow
+                Action: 'ses:GetEmailIdentity'
+                Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}'
+              - Effect: Allow
+                Action: 'ses:SendEmail'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}'
+                  - !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${ConfigurationSet}'
+                Condition:
+                  StringLike: {'ses:FromAddress': !Sub '*@${MailDomain}'}
+              - !If
+                - FounderSandboxDelivery
+                - Effect: Allow
+                  Action: 'ses:SendEmail'
+                  Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/{{resolve:secretsmanager:${OwnerMailSecretArn}:SecretString:address}}'
+                  Condition:
+                    StringLike: {'ses:FromAddress': !Sub '*@${MailDomain}'}
+                    'Null': {'ses:Recipients': 'false'}
+                    ForAllValues:StringEquals:
+                      'ses:Recipients': !Sub '{{resolve:secretsmanager:${OwnerMailSecretArn}:SecretString:address}}'
+                - !Ref AWS::NoValue
+              - !If
+                - HasOwnerMail
+                - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref OwnerMailSecretArn}
+                - !Ref AWS::NoValue
+              - {Effect: Allow, Action: 'sqs:SendMessage', Resource: !GetAtt Failures.Arn}
+  Sender:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'factory-${ProjectScope}-r-s'
+      Architectures: [x86_64]
+      PackageType: Image
+      Code: {ImageUri: !Ref LambdaImage}
+      ImageConfig: {Command: [src/company-mail-ses.handler]}
+      Role: !GetAtt SenderRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          PEROTTINO_STATE_TABLE: !Ref StateTableName
+          PEROTTINO_MAIL_DOMAIN: !Ref MailDomain
+          PEROTTINO_MAIL_CONFIGURATION_SET: !Ref ConfigurationSet
+          PEROTTINO_MAIL_IDENTITY_ARN: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}'
+          PEROTTINO_MAIL_EVENTS_TOPIC_ARN: !Ref EventsTopic
+          PEROTTINO_MAIL_OWNER_SECRET_ARN: !Ref OwnerMailSecretArn
+  SenderFailure:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref Sender
+      Qualifier: '$LATEST'
+      MaximumRetryAttempts: 2
+      DestinationConfig:
+        OnFailure: {Destination: !GetAtt Failures.Arn}
+  EventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Sender
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref EventsTopic
+  EventSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: [EventPermission, SenderFailure, FailurePolicy]
+    Properties:
+      TopicArn: !Ref EventsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt Sender.Arn
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt Failures.Arn}
+  OutboxClock:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Id: mail-outbox
+          Arn: !GetAtt Sender.Arn
+          Input: '{"operation":"dispatch"}'
+  ClockPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Sender
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OutboxClock.Arn
+Outputs:
+  FailureQueueUrl:
+    Value: !Ref Failures

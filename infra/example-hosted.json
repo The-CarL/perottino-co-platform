@@ -1,0 +1,21 @@
+{
+  "account": "111111111111",
+  "region": "us-east-1",
+  "vpcId": "vpc-abcdef01234567890",
+  "ownerSecretArn": "arn:aws:secretsmanager:us-east-1:111111111111:secret:example/owner-aBc123",
+  "projectsGitSecretArn": "arn:aws:secretsmanager:us-east-1:111111111111:secret:/perottino-co/github/pat-aBc123",
+  "projectsGitReviewerSecretArn": "arn:aws:secretsmanager:us-east-1:111111111111:secret:/perottino-co/github/reviewer-dEf456",
+  "permissionsBoundaryArn": "arn:aws:iam::111111111111:policy/ExampleBoundary",
+  "bedrockModel": "us.openai.gpt-6-sol",
+  "bedrockResourceArns": [
+    "arn:aws:bedrock:us-east-1:111111111111:inference-profile/us.openai.gpt-6-sol",
+    "arn:aws:bedrock:us-west-2::foundation-model/openai.gpt-6-sol",
+    "arn:aws:bedrock:us-east-1::foundation-model/openai.gpt-6-sol"
+  ],
+  "lambdaImage": "111111111111.dkr.ecr.us-east-1.amazonaws.com/example-company@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "workerImage": "111111111111.dkr.ecr.us-east-1.amazonaws.com/example-company@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "publicSubnetIds": [
+    "subnet-abcdef01234567890"
+  ],
+  "employeeLimit": 100
+}

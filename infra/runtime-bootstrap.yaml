@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private release templates, image registry for Lambda and Fargate, and an owner verifier slot.
+Parameters:
+  ProjectScope:
+    Type: String
+    MinLength: 38
+    MaxLength: 52
+    AllowedPattern: '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}-[a-z][a-z0-9-]*'
+    Description: Value of factory:s in the target deployment provenance.
+Resources:
+  Images:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      Tags:
+        - Key: perottino:purpose
+          Value: runtime-images
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaImageRetrieval
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-a'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-e'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-f'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-m'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-o'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-s'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-g'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-u'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-b'
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:factory-${ProjectScope}-r-z'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  ReleaseTemplates:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireReleaseTemplates
+            Prefix: releases/
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: RemoveExpiredReleaseMarkers
+            Prefix: releases/
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      Tags:
+        - Key: 'factory:s'
+          Value: !Ref ProjectScope
+        - Key: perottino:purpose
+          Value: release-templates
+  ReleaseTemplateTransport:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReleaseTemplates
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RequireTLS
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ReleaseTemplates.Arn
+              - !Sub '${ReleaseTemplates.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+  ConsoleOwner:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Tags:
+        - Key: perottino:purpose
+          Value: owner-verifier
+      Description: Separately populated owner verifier JSON containing username and passwordHash.
+Outputs:
+  ReleaseTemplateBucketName:
+    Value: !Ref ReleaseTemplates
+  ImageRepositoryUri:
+    Value: !GetAtt [Images, RepositoryUri]
+  ImageRepositoryName:
+    Value: !Ref Images
+  OwnerSecretArn:
+    Value: !Ref ConsoleOwner
