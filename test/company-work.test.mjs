@@ -231,14 +231,16 @@ test('goal closure queues one private source notification atomically; both creat
   assert.equal(await records.get(notification.pk,notification.sk),null);
   await execute('ceo','task.review',request({taskId:task.id,decision:'accept',note:'Reviewed'}));
   const ready=(await execute('ceo','goal.list',{closable:true})).goals[0];
-  const close=request({goalId:goal.id});
+  const requesterReply='The reviewed report is ready at https://preview.example.org/report.';
+  const close=request({goalId:goal.id,requesterReply});
   const [result,replay]=await Promise.all([execute('ceo','goal.close',close),execute('ceo','goal.close',close)]);
   assert.deepEqual(result,replay);
   for(const view of [goal,task,ready,result,await execute('owner','goal.get',{goalId:goal.id}),await execute('engineer','goal.get',{goalId:goal.id})]) {
     assert.ok(!JSON.stringify(view).includes(source.messageId));
   }
   const queued=await records.get(notification.pk,notification.sk);
-  assert.ok(queued);
+  assert.equal(queued.requesterReply,requesterReply);
+  assert.ok(!JSON.stringify(result).includes(requesterReply));
   assert.ok(!JSON.stringify(queued).includes('Sensitive individual data'));
   assert.ok(!JSON.stringify((await records.list('work-events')).items).includes(source.messageId));
 });

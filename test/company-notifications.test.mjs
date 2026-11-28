@@ -4,21 +4,23 @@ import { makeSqliteRecords } from '../src/foundation-records.mjs';
 import { createConversations } from '../src/conversations.mjs';
 import { deliverNextGoalNotice, notificationRow } from '../src/company-notifications.mjs';
 
-async function setup(t) {
+async function setup(t, { requesterReply, sender = 'owner', group = false, peer = 'owner' } = {}) {
   const records = makeSqliteRecords({ filename: ':memory:' });
   t.after(() => records.close());
   const people = new Map([['lead', { id: 'lead', desiredState: 'active' }], ['engineer', { id: 'engineer', desiredState: 'active' }]]);
   const conversations = createConversations({ records, employee: id => people.get(id) });
-  const { conversation } = await conversations.execute('owner', 'conversations.dm', { peerId: 'lead' });
+  const { conversation } = group
+    ? await conversations.execute('owner', 'conversations.group', {members:['engineer','lead'],title:'Project team',requestId:'group'})
+    : await conversations.execute(peer, 'conversations.dm', { peerId: 'lead' });
   const conversationId = conversation.id;
-  const { message } = await conversations.execute('owner', 'messages.post', { conversationId,
+  const { message } = await conversations.execute(sender, 'messages.post', { conversationId,
     text: 'Owner private request', responders: [], requestId: 'start' });
   const source = { conversationId, messageId: message.id };
   const goal = { id: 'a'.repeat(64), accountableId: 'lead', status: 'done', source,
     outcome: 'private customer name', evidence: ['private contract'], closedBy: 'owner' };
-  const row = notificationRow(goal);
+  const row = notificationRow(goal,requesterReply);
   await records.transact([row]);
-  const messages = async () => (await conversations.execute('owner', 'messages.list', { conversationId })).messages;
+  const messages = async () => (await conversations.execute(peer, 'messages.list', { conversationId })).messages;
   const deliver = (args = {}) => deliverNextGoalNotice({ actor: 'lead', records, conversations, ...args });
   return { records, conversations, people, goal, row, source, deliver, messages };
 }
@@ -45,6 +47,29 @@ test('a lost acknowledgement and simultaneous retries publish one private-contex
   assert.deepEqual(reply.responders, []);
   assert.deepEqual((await conversations.execute('owner', 'messages.status', { conversationId: source.conversationId,
     messageId: reply.id })).deliveries, []);
+});
+
+test('an explicit handoff returns once to the original owner DM; other requesters and audiences receive a status notice', async t => {
+  const requesterReply = 'Three tests passed. Review https://github.com/example/project/pull/1 and preview https://example.org/app/.';
+  for (const [label,options,deliverReply] of [
+    ['owner DM',{},true],
+    ['owner group',{group:true},false],
+    ['employee message in owner DM',{sender:'lead'},false],
+    ['employee DM',{peer:'engineer',sender:'engineer'},false],
+  ]) {
+    await t.test(label, async sub => {
+      const { records, row, source, goal, deliver, messages } = await setup(sub,{requesterReply,...options});
+      const interrupted = { ...records, transact: async () => { throw new Error('Lost acknowledgement'); } };
+      await assert.rejects(deliver({records:interrupted}),/Lost acknowledgement/);
+      await deliver();
+      const history = await messages();
+      assert.equal(history.length,2);
+      assert.equal(history[1].replyTo,source.messageId);
+      assert.equal(history[1].text,deliverReply ? requesterReply : 'The goal is complete. Goal ID '+goal.id+'.');
+      assert.deepEqual(history[1].responders,[]);
+      assert.equal(await records.get(row.pk,row.sk),null);
+    });
+  }
 });
 
 test('current membership gates posting and temporary inactivity retains the notice until resume', async t => {

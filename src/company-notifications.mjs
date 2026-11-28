@@ -6,6 +6,7 @@ export function notificationRow(goal,requesterReply) {
   if (goal.status !== 'done' || !goal.source?.conversationId || !goal.source.messageId) return null;
   return { pk: queue(goal.accountableId), sk: goal.id, expect: null, value: {
     conversationId: goal.source.conversationId, messageId: goal.source.messageId,
+    ...(requesterReply && {requesterReply}),
   } };
 }
 
@@ -20,19 +21,25 @@ export async function deliverNextGoalNotice({ actor, records, conversations, mai
   const { items: [notice] } = await records.list(queue(actor), { limit: 1 });
   if (!notice) return false;
   const { pk, sk: goalId, version, conversationId, messageId } = notice;
+  const statusText = 'The goal is complete. Goal ID ' + goalId + '.';
   try {
     if(notice.sourceMail) {
       if(!mail) throw Object.assign(new Error('Mail delivery is unavailable.'),{status:503});
       if(await mail.canUseSource(actor,notice.sourceMail)) await mail.execute(actor,'mail.reply',{
-        ...notice.sourceMail,requestId:'goal-complete-'+goalId,text:notice.requesterReply??'The goal is complete. Goal ID '+goalId+'.'
+        ...notice.sourceMail,requestId:'goal-complete-'+goalId,text:notice.requesterReply ?? statusText
       });
     } else {
       const { conversation } = await conversations.execute(actor, 'conversations.get', { conversationId });
       if (conversation.members.includes(actor) && !conversation.archivedAt && conversation.status !== 'archived') {
+        let text = statusText;
+        if (notice.requesterReply && conversation.type === 'dm' && conversation.members.length === 2 && conversation.members.includes('owner')) {
+          const { message } = await conversations.execute(actor, 'messages.get', {conversationId, messageId});
+          if (message.senderId === 'owner') text = notice.requesterReply;
+        }
         // The conversation service checks membership again and verifies the original message
         // before committing. Replaying this request after a crash recovers the same reply.
         await conversations.execute(actor, 'messages.post', { conversationId, replyTo: messageId,
-          text: 'The goal is complete. Goal ID ' + goalId + '.', responders: [], requestId: 'goal-complete-' + goalId });
+          text, responders: [], requestId: 'goal-complete-' + goalId });
       }
     }
   } catch (error) {

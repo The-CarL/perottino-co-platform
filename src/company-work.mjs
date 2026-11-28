@@ -219,7 +219,7 @@ export function createWork({records,employee,event = eventRows,currentTrace = tr
       requireThat(old.status === 'active' && old.taskCount > 0 && old.openTaskCount === 0,409,'All tasks must pass review before closing the goal.');
       const goal = {...fields(old),status:'done',updatedAt:at,closedBy:actor};
       await save(changes,goals,old,goal,goalIndexes);
-      const notification = notificationRow(goal,goal.sourceMail && input.requesterReply ? string(input.requesterReply,'requester reply',8000) : undefined);
+      const notification = notificationRow(goal,(goal.sourceMail || goal.source) && input.requesterReply ? string(input.requesterReply,'requester reply',8000) : undefined);
       if (notification) changes.push(notification);
       return {kind:'goal.closed',result:{goal:publicWork(goal)}};
     }
