@@ -10,7 +10,7 @@ const maxSteps = 6;
 const pick = (row, keys) => Object.fromEntries(keys.filter(key => row?.[key] != null).map(key => [key, row[key]]));
 const employee = row => pick(row, ['id','handle','name','role','managerId','canHire']);
 const goal = row => pick(row, ['id','outcome','successCriteria','accountableId','taskCount','openTaskCount','status']);
-const task = row => pick(row, ['id','goalId','assigneeId','reviewerId','title','acceptance','dependencies','status','progress','evidence','review','workStep']);
+const task = row => pick(row, ['id','goalId','assigneeId','reviewerId','title','acceptance','dependencies','status','progress','clarification','evidence','review','workStep']);
 const message = row => pick(row, ['id','senderId','text','seq','replyTo']);
 const shared = ['dm.send','group.create','group.send','conversations.list','browse'];
 const workActions = {

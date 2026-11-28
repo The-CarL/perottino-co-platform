@@ -617,12 +617,16 @@ async function showWork(kind, id) {
       controls,
     );
   } else {
+    let resumeField;
     if (row.status === 'submitted') {
       controls.append(btn('Review submission', () => reviewForm(row), { class: 'primary' }));
     } else if (['blocked', 'waiting'].includes(row.status)) {
+      const note = textControl('clarification', '', { multiline: true, required: false, max: 4000 });
+      resumeField = field('Clarification for the assignee (optional)', note);
       controls.append(
         btn('Resume task', async () => {
-          await change('task.resume', { taskId: id });
+          const clarification = note.value.trim();
+          await change('task.resume', { taskId: id, ...(clarification && { clarification }) });
           await render();
         }),
       );
@@ -645,12 +649,15 @@ async function showWork(kind, id) {
         ['Dependencies', depRows.length ? depRows.map((d) => d.title).join(', ') : null],
         ['Attempt', row.attempt],
         ['Progress', row.progress],
+        ['Latest clarification', row.clarification?.text],
+        ['Clarified by', row.clarification && nameOf(row.clarification.by) + ' · ' + date(row.clarification.at)],
         [
           'Review',
           row.review ? [label(row.review.decision), row.review.note].filter(Boolean).join(' · ') : null,
         ],
       ]),
       ...(row.evidence?.length ? [el('h3', {}, 'Evidence'), evidence(row.evidence)] : []),
+      resumeField,
       controls,
       btn('Task history', () => taskHistory(row), { class: 'link' }),
     );

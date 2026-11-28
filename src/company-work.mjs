@@ -271,6 +271,10 @@ export function createWork({records,employee,event = eventRows,currentTrace = tr
     } else if (op === 'task.resume') {
       requireThat(actor === task.assigneeId || await manages(actor,task.assigneeId),403,'Task is outside your scope.');
       requireThat(['waiting','blocked'].includes(task.status),409,'Task is not waiting or blocked.');
+      if (input.clarification != null) {
+        requireThat(actor !== task.assigneeId,403,'Only an owner or manager can clarify the assignment.');
+        task.clarification = {text:string(input.clarification,'clarification'),by:actor,at};
+      }
       delete task.wakeAt; task.status = 'ready'; task.workStep++; kind = 'task.resumed';
     } else {
       requireThat(actor === task.assigneeId,403,'Only the assignee can update its claimed work.');
@@ -355,6 +359,7 @@ export function createWork({records,employee,event = eventRows,currentTrace = tr
       if (result.task) {
         const entry = {revision:resource.revision,kind,actor,at:resource.updatedAt,status:resource.status,attempt:resource.attempt};
         if (['task.progress','task.block','task.wait','task.submit','task.review'].includes(op) && input.note) entry.note = input.note.trim();
+        if (op === 'task.resume' && input.clarification != null) entry.note = resource.clarification.text;
         if (op === 'task.submit') entry.evidence = resource.evidence;
         if (op === 'task.review') entry.decision = resource.review.decision;
         changes.push({pk:history(resource.id),sk:String(resource.revision).padStart(16,'0'),expect:null,value:entry});

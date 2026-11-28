@@ -184,6 +184,26 @@ test('a held planning page and a task claimed by another worker do not hide the 
   assert.equal(state,'worked'); assert.equal(pages.length,2); assert.deepEqual(pages[1].after,{plan:'page-2'});
 });
 
+test('a manager resumes a blocked task and its assignee sees the authenticated clarification on the next pulse',async t=>{
+  const {exec,pulse,send,staff}=fixture(t);
+  staff.set('ada',{id:'ada',name:'Ada',role:'Engineer',managerId:'ceo',desiredState:'active'});
+  const {goal}=await exec('owner','goal.create',{requestId:randomUUID(),accountableId:'ceo',outcome:'Demo',successCriteria:'Working app'});
+  const {task}=await exec('ceo','task.create',{requestId:randomUUID(),goalId:goal.id,assigneeId:'ada',title:'Implement',acceptance:'Inspect existing files'});
+  await pulse('ada',()=>choice('task.block',{note:'No prior handoff.'}));
+  await send('Clarify the original task and resume it.');
+  await pulse('ceo',ctx=>ctx.steps.length ? choice('reply',{text:'Resumed the task.'}) :
+    choice('task.resume',{taskId:task.id,clarification:'The project is new. Submit the first files.'}));
+  await pulse('ada',ctx=>{
+    assert.equal(ctx.task.id,task.id);
+    assert.equal(ctx.task.acceptance,'Inspect existing files');
+    assert.equal(ctx.task.progress,'No prior handoff.');
+    assert.equal(ctx.task.clarification.by,'ceo');
+    assert.equal(ctx.task.clarification.text,'The project is new. Submit the first files.');
+    return choice('task.submit',{note:'Completed the first tree.',evidence:['Example delivery']});
+  });
+  assert.equal((await exec('owner','task.get',{taskId:task.id})).task.status,'submitted');
+});
+
 test('an engineer recovers the existing DM receipt after changes and the reviewer verifies it without resending',async t=>{
   const {pulse,exec,staff}=fixture(t);
   staff.set('ada',{id:'ada',handle:'ada',name:'Ada',role:'Engineer',managerId:'ceo',desiredState:'active'});

@@ -37,7 +37,7 @@ A goal records an outcome, success criteria and one accountable employee. For a 
 | Transition | Durable condition |
 | --- | --- |
 | Ready → Running | The assignee claims due work after every dependency passes review. The claim carries an expiring token and increments the attempt. A replacement claim fences the earlier worker. |
-| Running → Ready, Waiting or Blocked | The assignee records its progress or reason. A released task returns to the queue, a scheduled wait becomes eligible at its wake time, and a blocked task needs an explicit resume. |
+| Running → Ready, Waiting or Blocked | The assignee records its progress or reason. A released task returns to the queue, a scheduled wait becomes eligible at its wake time, and a blocked task needs an explicit resume. On resume, the owner or a manager in the assignee’s reporting line can clarify the assignment. The latest clarification and its author accompany the task on subsequent pulses and the original progress stays in its history. |
 | Running → Submitted | The assignee supplies evidence for the deliverable. The task enters the designated review queue. |
 | Submitted → Ready or Done | An independent manager in scope or the owner inspects the submission, records a decision and explains it. Requesting changes reopens the task for the assignee. |
 | Active goal → Done | The goal has at least one task and every task has an accepted review. The accountable employee or an authorized leader can close it. |

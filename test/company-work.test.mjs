@@ -95,6 +95,37 @@ test('concurrent planners and workers are fenced; expired workers cannot publish
   assert.equal((await own('claim',{})).task.status,'running');
 });
 
+test('resuming preserves progress and records clarifications from authenticated leaders on the original task',async t=>{
+  const {execute,goal,task}=fixture(t);
+  const {id:taskId}=await task((await goal()).id,'engineer');
+  const block=async note=>{
+    const {claimToken}=await execute('engineer','task.claim',request({taskId}));
+    await execute('engineer','task.block',request({taskId,claimToken,note}));
+  };
+  await block('No existing files.');
+  const resume=request({taskId,clarification:' Start with an empty tree. '});
+  await rejects(execute('sales','task.resume',resume),403);
+  await rejects(execute('engineer','task.resume',{...resume,by:'owner'}),403);
+  const [first,retry]=await Promise.all([execute('lead','task.resume',resume),execute('lead','task.resume',resume)]);
+  assert.deepEqual(retry,first);
+  assert.equal(first.task.status,'ready');
+  assert.equal(first.task.progress,'No existing files.');
+  assert.deepEqual(first.task.clarification,{text:'Start with an empty tree.',by:'lead',at:first.task.updatedAt});
+  await rejects(execute('lead','task.resume',{...resume,clarification:'New assignment'}),409);
+
+  await block('Waiting for test input.');
+  const own=await execute('engineer','task.resume',request({taskId}));
+  assert.deepEqual(own.task.clarification,first.task.clarification);
+  assert.equal(own.task.progress,'Waiting for test input.');
+  await block('Waiting for source.');
+  const latest=await execute('owner','task.resume',request({taskId,clarification:'Use public data.'}));
+  assert.equal(latest.task.clarification.by,'owner');
+  assert.equal(latest.task.clarification.text,'Use public data.');
+  const {entries}=await execute('engineer','task.history',{taskId});
+  assert.deepEqual(entries.filter(row=>row.kind==='task.resumed').map(row=>[row.actor,row.note]),
+    [['lead','Start with an empty tree.'],['engineer',undefined],['owner','Use public data.']]);
+});
+
 test('evidence and independent review gate completion, dependencies, and atomic goal closure',async t=>{
   const {execute,goal,task,records} = fixture(t), g=await goal();
   const a=await task(g.id,'engineer'), b=await task(g.id,'designer',{dependencies:[a.id]});

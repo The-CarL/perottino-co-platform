@@ -279,6 +279,8 @@ export async function runCompanySmoke() {
     // The browser then exercises the owner's review against the same durable record.
     const reviewTitle = 'Verify the public release record';
     const reviewEvidence = 'https://example.org/releases/test';
+    const blockedTitle = 'Resolve the missing release field';
+    const clarification = 'Use the release date from the published notes.';
     const storedEmployees = createStore(dataDir);
     const workRecords = makeSqliteRecords({ filename: join(dataDir, 'company.sqlite') });
     try {
@@ -311,6 +313,12 @@ export async function runCompanySmoke() {
         note: 'Release record checked.',
         evidence: [reviewEvidence, 'javascript:alert(1)'],
       });
+      const { task: blocked } = await command('owner', 'task.create', {
+        goalId: evidenceGoal.id, title: blockedTitle, assigneeId: 'ceo',
+        acceptance: 'Identify the release date.',
+      });
+      const claim = await command('ceo', 'task.claim', { taskId: blocked.id });
+      await command('ceo', 'task.block', { taskId: blocked.id, claimToken: claim.claimToken, note: 'Which date should I use?' });
     } finally {
       workRecords.close();
       storedEmployees.close();
@@ -337,6 +345,17 @@ export async function runCompanySmoke() {
     );
     await snapshot(mobile, 'mobile-chat');
     await nav(mobile, 'tasks');
+    const blockedRow = mobile.getByRole('button', { name: 'Task ' + blockedTitle, exact: true });
+    await blockedRow.click();
+    await mobile.getByText('Which date should I use?', { exact: true }).waitFor();
+    await mobile.getByLabel('Clarification for the assignee (optional)').fill(clarification);
+    await mobile.getByRole('button', { name: 'Resume task', exact: true }).click();
+    await mobile.locator('#dialog').waitFor({ state: 'hidden' });
+    await blockedRow.click();
+    await mobile.locator('#dialog').getByText(clarification, { exact: true }).waitFor();
+    const clarificationAuthor = mobile.locator('#dialog dt').filter({ hasText: /^Clarified by$/ }).locator('+ dd');
+    assert.match(await clarificationAuthor.innerText(), /^Owner · /);
+    await mobile.locator('#dialog-close').click();
     await mobile.getByRole('button', { name: 'Task ' + reviewTitle, exact: true }).click();
     assert.equal(
       await mobile.locator('#dialog').getByRole('link', { name: reviewEvidence }).getAttribute('href'),

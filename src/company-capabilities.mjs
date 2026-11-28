@@ -3,6 +3,7 @@ import {shaFormat} from './project-source.mjs';
 // Trusted runtime supplies actor, work IDs, lease and idempotency keys. Decisions
 // describe business inputs only; no decision can call a generic broker command.
 export const capabilityFields = {
+  'task.resume':{taskId:'string',clarification:'?string'},
   'messages.receipts':{peerId:'?string',conversationId:'?string',messageId:'?string',expectedText:'?string',beforeSeq:'?integer'},
   'files.list':{prefix:'?string',after:'?string'}, 'files.read':{path:'string',version:'?integer'},
   'files.write':{path:'string',text:'string',expectedVersion:'?integer'}, 'files.versions':{path:'string'},
@@ -41,7 +42,7 @@ export function capabilitiesFor(ctx) {
   if (ctx.kind === 'task' || ctx.kind === 'review') ops.push('messages.receipts');
   if (!['review','close'].includes(ctx.kind)) ops.push(...write);
   if (ctx.kind === 'task') ops.push('project.create','project.commit','delivery.build','delivery.preview','delivery.release','delivery.rollback','infra.provision');
-  if (['message','plan','mail','task'].includes(ctx.kind)) ops.push('project.attach','budget.allocate');
+  if (['message','plan','mail','task'].includes(ctx.kind)) ops.push('project.attach','budget.allocate','task.resume');
   if (ctx.agent.id === 'ceo' && ['message','plan','mail','task'].includes(ctx.kind)) ops.push('promotion.approve','grant.revoke');
   return ops;
 }
