@@ -79,6 +79,25 @@ test('uncertain send is not transmitted again; tagged provider events reconcile 
   assert.deepEqual(events.map(e=>e.status).sort(),['delivered','uncertain']);
   assert.equal(await recordMailReceipt({records,id:m.messageId,provider:'forged',status:'bounced',from:'mara@'+domain,to:'wrong@example.org',at:now()}),false);
 });
+test('a rejected send records an actionable provider code without publishing addresses or error text',async t=>{
+  const {mail,dispatch,records}=fixture(t);
+  const {threadId,messageId}=await mail.execute('ceo','mail.send',{to:'customer@example.net',subject:'Test',text:'A reply.',requestId:'rejected'});
+  const requestId='7994375a-43bf-4ba3-9309-3c4d0876fa4d';
+  let sends=0;
+  const transport={async send(){sends++;throw Object.assign(new Error('Email address is not verified: private@example.net'),{
+    name:'MessageRejected',$metadata:{requestId}});}};
+  await dispatch(transport);
+  await dispatch(transport);
+  assert.equal(sends,1);
+  const {messages:[message]}=await mail.execute('owner','mail.get',{threadId});
+  assert.equal(message.id,messageId);
+  assert.equal(message.status,'failed');
+  assert.deepEqual(message.deliveryError,{code:'MessageRejected',cause:'unverifiedIdentity',requestId});
+  const event=(await records.list('company-events')).items.find(e=>e.kind==='mail.status');
+  assert.equal(event.reasonCode,'unverifiedIdentity');
+  assert.doesNotMatch(JSON.stringify([event,message.deliveryError]),/private@example.net/);
+});
+
 test('explicit throttling permits safe bounded retry; fired employees cannot dispatch queued mail',async t=>{
   const {mail,dispatch,store,persons,advance,records}=fixture(t);
   const msg=await mail.execute('ceo','mail.send',{to:'customer@example.net',subject:'Hello',text:'Hi',requestId:'one'});

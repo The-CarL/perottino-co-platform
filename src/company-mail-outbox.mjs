@@ -5,6 +5,21 @@ const confirmed={sent:1,delivered:2,failed:3,bounced:4,complained:5};
 const rowFor=(m,value)=>writeMail(m.pk,m.sk,{...mailValue(m),...value},m.version);
 const drop=r=>writeMail(r.pk,r.sk,null,r.version);
 const providerId = s => typeof s==='string' && /^[a-zA-Z0-9_-]{1,200}$/.test(s);
+const throttleErrors = new Set(['TooManyRequestsException','ThrottlingException']);
+const rejectionErrors = new Set(['MessageRejected','BadRequestException','MailFromDomainNotVerifiedException',
+  'AccountSuspendedException','SendingPausedException','AccessDeniedException','NotFoundException']);
+
+function deliveryError(error) {
+  const code = throttleErrors.has(error.name) || rejectionErrors.has(error.name) ? error.name : 'UnknownProviderError';
+  const detail = String(error.message ?? '');
+  let cause;
+  if (/not verified|not been verified/i.test(detail)) cause='unverifiedIdentity';
+  else if (/not authorized|explicit deny|access denied/i.test(detail)) cause='permissionDenied';
+  else if (/header/i.test(detail)) cause='invalidHeader';
+  else if (/email address|mailbox|local part/i.test(detail)) cause='invalidAddress';
+  const requestId=error.$metadata?.requestId;
+  return {code,...(cause && {cause}),...(/^[0-9a-f-]{36}$/i.test(requestId ?? '') && {requestId})};
+}
 
 export function createLocalMailTransport({records}) {
   return {localCapture:true,async send(message) {
@@ -25,7 +40,7 @@ export async function recordMailReceipt({records,id,provider,status,from,to,at=D
     if((confirmed[m.status]??0)>=confirmed[status] && m.providerId===provider) return true;
     const mapping=await records.get('mail-provider',provider);
     if(mapping && mapping.messageId!==id) return false;
-    const changes=[rowFor(m,{status,providerId:provider,providerAt:new Date(at).toISOString()})];
+    const changes=[rowFor(m,{status,deliveryError:null,providerId:provider,providerAt:new Date(at).toISOString()})];
     if(m.status!==status) changes.push(...mailActivity('mail.status',m,'mail-sender',m.sender,status));
     if(!mapping) changes.push(writeMail('mail-provider',provider,{threadId:m.threadId,messageId:id}));
     if(m.attemptKey) {
@@ -36,7 +51,7 @@ export async function recordMailReceipt({records,id,provider,status,from,to,at=D
   });
 }
 
-async function finishAttempt(records,id,kind,now) {
+async function finishAttempt(records,id,kind,now,diagnostic) {
   return mailRetry(async()=>{
     const m=await records.get('mail-messages',id);
     if(m?.status!=='sending') return true;
@@ -44,7 +59,8 @@ async function finishAttempt(records,id,kind,now) {
     if(!attempt) return false;
     const retry=kind==='throttled' && m.attempts<4;
     const status=retry?'queued':kind==='uncertain'?'uncertain':'failed';
-    const changes=[drop(attempt),rowFor(m,{status}),...mailActivity('mail.status',m,'mail-sender',m.sender,status)];
+    const changes=[drop(attempt),rowFor(m,{status,deliveryError:diagnostic??null}),
+      ...mailActivity('mail.status',m,'mail-sender',m.sender,status,diagnostic?.cause??diagnostic?.code)];
     if(retry) {
       const due=now()+60_000*(2**(m.attempts-1));
       changes.push(writeMail('mail-outbox',key(due,id),{id,attempts:m.attempts,at:due}));
@@ -87,10 +103,9 @@ export async function dispatchCompanyMail({records,store,domain,transport,now=Da
   catch(error) {
     // Only explicit provider rejection permits a new transmission. A timeout, crash or 5xx
     // can follow provider acceptance; keep the intent for tagged event reconciliation.
-    const reason=['TooManyRequestsException','ThrottlingException'].includes(error.name)?'throttled':
-      ['MessageRejected','BadRequestException','MailFromDomainNotVerifiedException','AccountSuspendedException',
-       'SendingPausedException','AccessDeniedException','NotFoundException'].includes(error.name)?'failed':'uncertain';
-    await finishAttempt(records,m.id,reason,now);return true;
+    const diagnostic=deliveryError(error);
+    const reason=throttleErrors.has(diagnostic.code)?'throttled':rejectionErrors.has(diagnostic.code)?'failed':'uncertain';
+    await finishAttempt(records,m.id,reason,now,diagnostic);return true;
   }
   if(!providerId(result?.providerId)) {await finishAttempt(records,m.id,'uncertain',now);return true;}
   await recordMailReceipt({records,id:m.id,from,to:m.to,provider:result.providerId,status:'sent',at:now()});

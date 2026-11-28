@@ -5,8 +5,8 @@ export const mailHash = (...values) => createHash('sha256').update(JSON.stringif
 export const failMail = (status, message) => Object.assign(new Error(message), { status });
 export const mailValue = row => { const { pk, sk, version, ...data } = row; return data; };
 export const writeMail = (pk, sk, value, expect = null) => ({ pk, sk, value, expect });
-export function mailActivity(kind,message,actor,employeeId,status) {
-  return eventRows(kind,{actor,employeeId,threadId:message.threadId,messageId:message.id,status},
+export function mailActivity(kind,message,actor,employeeId,status,reasonCode) {
+  return eventRows(kind,{actor,employeeId,threadId:message.threadId,messageId:message.id,status,reasonCode},
     [message.id,message.attempts??0,status].join('/'));
 }
 const keyPattern = /^[a-f0-9]{64}$/;
@@ -42,7 +42,8 @@ export function rfcId(value) {
 const publicThread = t => ({ id:t.id, subject:t.subject, members:t.members, contact:t.contact, createdAt:t.createdAt, updatedAt:t.updatedAt });
 function publicMessage(m) {
   const {id,subject,from,to,text,createdAt,direction,status,inReplyTo,trustedOwner}=m;
-  return {id,subject,from,to,text,createdAt,direction,status,inReplyTo,trustedOwner:Boolean(trustedOwner)};
+  return {id,subject,from,to,text,createdAt,direction,status,inReplyTo,trustedOwner:Boolean(trustedOwner),
+    ...(m.deliveryError && {deliveryError:m.deliveryError})};
 }
 function options(input) {
   const {limit=35,after}=input;
