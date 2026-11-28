@@ -8,6 +8,6 @@ Deploy `browser-profile-fixture.yaml` with the project's `Scope`, an existing mi
 
 1. Allow the stack's HTTPS `Origin` on a disposable AgentCore profile and grant the profile to a test employee.
 2. Open `/protected` and verify the sign-in requirement. Go to `/` and submit `profile-tester` and the temporary passphrase. Open the protected page and record the synthetic account's marker. Stop the session and save the profile.
-3. Start a fresh session with the saved profile and visit `/protected` directly. Verify the identical marker without entering credentials. Compare with a clean session. Stop the sessions and revoke the test grant.
+3. Start a fresh session with the saved profile and visit `/protected` directly. Verify the identical marker without entering credentials. Compare with a clean session. Use `/?redirect=1` to exercise a server that sets its cookie on a 303 response, then follow the browser's Continue link. Stop the sessions and revoke the test grant.
 
 Keep session IDs in private test evidence and cookie values out of test output.
