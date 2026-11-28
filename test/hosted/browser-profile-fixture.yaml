@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Disposable HTTPS browser profile fixture with expiring synthetic sessions and a three-hour maximum acceptance window.
+Metadata:
+  AWSToolsMetrics: {AWSAgentToolkit: aws-cloudformation@3}
+Parameters:
+  Scope:
+    Type: String
+    AllowedPattern: '[a-z0-9][a-z0-9-]{0,43}'
+  PermissionsBoundaryArn:
+    Type: String
+    AllowedPattern: 'arn:[^:]+:iam::[0-9]{12}:policy/.+'
+  ExpiresAt:
+    Type: String
+    Description: Absolute UTC end time in YYYY-MM-DDTHH:MM:SSZ format.
+    AllowedPattern: '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+Resources:
+  Sessions:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Retain a synthetic marker independently of browser storage and Lambda restarts.
+        must: [Store only a token digest and synthetic session data, Expire records by TTL]
+    Properties:
+      TableName: !Sub 'factory-${Scope}-r-profile'
+      AttributeDefinitions: [{AttributeName: pk, AttributeType: S}]
+      KeySchema: [{AttributeName: pk, KeyType: HASH}]
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: {SSEEnabled: true}
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      Tags:
+        - {Key: 'factory:s', Value: !Ref Scope}
+        - {Key: 'perottino:assessment', Value: !Ref Scope}
+  Role:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Confine synthetic session lookups to this fixture.
+        must: [Use the supplied permissions boundary, Grant only exact-table read and insert]
+    Properties:
+      RoleName: !Sub 'factory-${Scope}-r-profile'
+      Path: !Sub '/factory/${Scope}/'
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FixtureSessions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !GetAtt Sessions.Arn
+      Tags:
+        - {Key: 'factory:s', Value: !Ref Scope}
+        - {Key: 'perottino:assessment', Value: !Ref Scope}
+  Handler:
+    Type: AWS::Lambda::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Issue and validate a disposable proof-of-persistence cookie.
+        must: [No real identities, Enforce expiry on every request]
+    Properties:
+      FunctionName: !Sub 'factory-${Scope}-r-profile'
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt Role.Arn
+      Timeout: 6
+      MemorySize: 128
+      Environment:
+        Variables: {TABLE: !Ref Sessions, EXPIRES_AT: !Ref ExpiresAt}
+      Tags:
+        - {Key: 'factory:s', Value: !Ref Scope}
+        - {Key: 'perottino:assessment', Value: !Ref Scope}
+      Code:
+        ZipFile: |
+          import base64
+          import binascii
+          import hashlib
+          import os
+          import re
+          import secrets
+          import time
+          from datetime import datetime, timezone
+          from urllib.parse import parse_qs
+
+          import boto3
+          from botocore.config import Config
+
+          table = boto3.resource('dynamodb', config=Config(
+              connect_timeout=1, read_timeout=2, retries={'total_max_attempts': 2}
+          )).Table(os.environ['TABLE'])
+          end = int(datetime.strptime(os.environ['EXPIRES_AT'], '%Y-%m-%dT%H:%M:%SZ')
+                    .replace(tzinfo=timezone.utc).timestamp())
+          form = """<!doctype html><html lang="en"><meta charset="utf-8"><title>Profile fixture</title>
+          <h1>Profile fixture</h1><form method="post" action="/login">
+          <p><label>Username <input id="username" name="username" autocomplete="username" required></label></p>
+          <p><label>Password <input id="password" name="password" type="password" autocomplete="current-password" required></label></p>
+          <button type="submit">Sign in</button></form></html>"""
+
+          def response(status, body, **headers):
+              return {'statusCode': status, 'headers': {
+                  'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
+                  'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff',
+                  'content-security-policy': "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+                  **headers
+              }, 'body': body}
+
+          def digest(token):
+              return hashlib.sha256(token.encode('ascii')).hexdigest()
+
+          def handler(event, context):
+              now = int(time.time())
+              if now < end - 3 * 3600 or now >= end:
+                  return response(410, 'Fixture outside its assessment window.')
+              route = event.get('routeKey')
+              if route == 'GET /':
+                  return response(200, form)
+              if route == 'POST /login':
+                  content_type = (event.get('headers') or {}).get('content-type', '').split(';', 1)[0]
+                  if content_type != 'application/x-www-form-urlencoded':
+                      return response(415, 'Use the sign-in form.')
+                  body = event.get('body') or ''
+                  if not isinstance(body, str) or len(body) > 1024:
+                      return response(400, 'Invalid form.')
+                  try:
+                      if event.get('isBase64Encoded'):
+                          body = base64.b64decode(body, validate=True).decode('ascii')
+                      fields = parse_qs(body, strict_parsing=True, max_num_fields=2)
+                  except (ValueError, UnicodeError, binascii.Error):
+                      return response(400, 'Invalid form.')
+                  if fields != {'username': ['profile-tester'], 'password': ['profile-demo-only']}:
+                      return response(401, 'Invalid fixture credentials.')
+                  token = secrets.token_hex(32)
+                  table.put_item(Item={'pk': digest(token), 'marker': 'profile-marker-' + secrets.token_hex(12),
+                                       'expiresAt': end}, ConditionExpression='attribute_not_exists(pk)')
+                  result = response(200, '<!doctype html><html lang="en"><title>Signed in</title><h1>Signed in</h1>'
+                                    '<a id="protected-link" href="/protected">Open protected page</a></html>')
+                  result['cookies'] = [f'__Host-profile={token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={end - now}']
+                  return result
+              if route != 'GET /protected':
+                  return response(404, 'Page not found.')
+              pairs = [part.strip() for line in event.get('cookies', []) for part in line.split(';')]
+              candidates = [part.partition('=')[2] for part in pairs if part.startswith('__Host-profile=')]
+              if len(candidates) == 1 and re.fullmatch('[a-f0-9]{64}', candidates[0]):
+                  item = table.get_item(Key={'pk': digest(candidates[0])}, ConsistentRead=True).get('Item')
+                  if item and now < item['expiresAt'] and re.fullmatch('profile-marker-[0-9a-f]{24}', item['marker']):
+                      return response(200, '<!doctype html><html lang="en"><title>Protected fixture</title>'
+                                      '<h1>Protected fixture</h1><output id="marker">' + item['marker'] + '</output></html>')
+              return response(401, 'Sign in to see the fixture marker.')
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub 'factory-${Scope}-r-profile'
+      ProtocolType: HTTP
+      Tags: {'factory:s': !Ref Scope, 'perottino:assessment': !Ref Scope}
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt Handler.Arn
+      PayloadFormatVersion: '2.0'
+  FormRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: 'GET /', Target: !Sub 'integrations/${Integration}'}
+  LoginRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: 'POST /login', Target: !Sub 'integrations/${Integration}'}
+  ProtectedRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref Api, RouteKey: 'GET /protected', Target: !Sub 'integrations/${Integration}'}
+  Invoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Handler
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/$default/*/*'
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: [FormRoute, LoginRoute, ProtectedRoute, Invoke]
+    Properties:
+      ApiId: !Ref Api
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 6
+        ThrottlingRateLimit: 4
+      Tags: {'factory:s': !Ref Scope, 'perottino:assessment': !Ref Scope}
+Outputs:
+  Origin: {Value: !GetAtt Api.ApiEndpoint}
+  Expiry: {Value: !Ref ExpiresAt}
