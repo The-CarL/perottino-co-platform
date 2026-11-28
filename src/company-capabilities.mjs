@@ -1,4 +1,5 @@
 import {interactiveResource} from './browser.mjs';
+import {shaFormat} from './project-source.mjs';
 // Trusted runtime supplies actor, work IDs, lease and idempotency keys. Decisions
 // describe business inputs only; no decision can call a generic broker command.
 export const capabilityFields = {
@@ -64,6 +65,8 @@ function small(value,budget=10000) {
   return visit(value);
 }
 
+const firstCommitHelp = 'This project has no committed handoff. Submit the initial files with project.commit and omit baseSha. The Git worker resolves the repository default branch.';
+
 export async function useCapability(op,input,{ctx,unit,execute,call,browse,signal}) {
   if (!Object.hasOwn(capabilityFields,op)) throw new Error('Unknown employee capability.');
   if (op === 'search') {
@@ -83,6 +86,12 @@ export async function useCapability(op,input,{ctx,unit,execute,call,browse,signa
   if (op === 'project.list') return small(await execute(op,{...input,goalId:input.goalId??ctx.goal?.id,limit:12}));
   if (op === 'project.create') return small(await call(op,{name:input.name,goalId:ctx.goal.id,taskId:unit.task.id}));
   if (op === 'project.snapshot') {
+    if (!shaFormat.test(input.commitSha)) {
+      const {project} = await execute('project.get',{projectId:input.projectId});
+      if (!project.latestHandoff) return {error:firstCommitHelp};
+      const {taskId,sha} = project.latestHandoff;
+      return {error:'Use the producing task ID and exact commit SHA from a project handoff.',latest:{taskId,commitSha:sha}};
+    }
     const snapshot=await execute(op,{projectId:input.projectId,taskId:input.taskId,commitSha:input.commitSha});
     if (!input.path) return {commitSha:snapshot.commitSha,files:snapshot.files.map(f=>({path:f.path,size:f.content.length}))};
     const file=snapshot.files.find(f=>f.path===input.path);
@@ -98,6 +107,7 @@ export async function useCapability(op,input,{ctx,unit,execute,call,browse,signa
     // Always use the recorded, exact base that the employee actually read, then
     // preserve untouched files. The Git broker rejects an obsolete base.
     if(baseSha) {
+      if (!project.latestHandoff) return {error:firstCommitHelp};
       const history=await execute('project.history',{projectId:project.id,limit:100});
       const handoff=history.handoffs.find(h=>h.sha===baseSha);
       if (!handoff) return {error:'The base revision is outside the recent project history. Refresh the project.'};

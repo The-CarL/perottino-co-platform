@@ -4,8 +4,8 @@ A project belongs to an accountable employee and starts under a work goal. Its r
 
 ## Publish a change
 
-1. Create the project using `project.create`, or recover its metadata with `project.list` and `project.get`. For a new change goal, use `project.attach`.
-2. Read `project.snapshot` with the prior handoff’s project ID, producing task ID and commit SHA. The snapshot is a durable copy of the exact UTF-8 files submitted in the acknowledged Git commit.
+1. Create a project for a new application using `project.create`. All applications share the configured Git repository. To change an existing application, find its project with `project.list` and `project.get` and attach the change goal with `project.attach`.
+2. When `latestHandoff` is null, submit the initial application files with `project.commit` and omit `baseSha`. The Git worker resolves the repository default branch. When a prior handoff exists, read `project.snapshot` with its project ID, producing task ID and exact commit SHA. The snapshot is a durable copy of the exact UTF-8 files submitted in the acknowledged Git commit.
 3. Submit the full project tree with `project.commit` from the current assigned task. For an update, supply the prior SHA as `baseSha`. The tree accepts at most 64 regular text files and 64 KiB of paths and content. Omitting an old file removes it from the new tree. A stale base returns a conflict. Concurrent submissions that both reach Git retain their separate PRs, and the handoff that loses the project update is marked `diverged`.
 4. Inspect the returned branch, SHA and PR along with the accountable goal, authoring employee and task. Use `delivery.build` and `delivery.preview` against that SHA. The delivery service records its test result and preview URL. `project.history` retains prior handoffs and `delivery.status` retrieves the corresponding deployment record.
 

@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { makeSqliteRecords } from '../src/foundation-records.mjs';
 import { createWork } from '../src/company-work.mjs';
 import { createProjects } from '../src/company-projects.mjs';
+import { useCapability } from '../src/company-capabilities.mjs';
 import { createLocalProjectGit } from '../src/project-git-local.mjs';
 import { sourceFiles } from '../src/project-source.mjs';
 
@@ -67,6 +68,26 @@ test('immutable code, task ownership, repeat PR delivery and a future goal recov
   assert.deepEqual(history.handoffs.map(x=>x.sha),[h.sha,follow.sha]);
   assert.equal((await second.execute('ceo','project.list',{goalId:next.goalId})).projects[0].latestSha,follow.sha);
 });
+test('an employee can recover from asking for HEAD on a new project and inspect the exact first handoff',async t=>{
+  const f=await fixture(t);
+  const execute=(op,input)=>f.service.execute('engineer',op,input);
+  const worker={unit:{task:{id:f.taskId}}, execute, call:(op,input)=>execute(op,{...input,requestId:'first-commit'})};
+  const snapshot={projectId:f.projectId,taskId:f.taskId,commitSha:'HEAD'};
+  const newProject=await useCapability('project.snapshot',snapshot,worker);
+  assert.match(newProject.error,/initial files.*omit baseSha/);
+  const guessedBase={projectId:f.projectId,baseSha:'HEAD',files};
+  assert.deepEqual(await useCapability('project.commit',guessedBase,worker),newProject);
+  await rejects(useCapability('project.snapshot',snapshot,{...worker,execute:(op,input)=>f.service.execute('unrelated',op,input)}),404);
+
+  const {handoff}=await useCapability('project.commit',{projectId:f.projectId,files},worker);
+  assert.equal(await inspect(f.repo,'rev-parse','main'),handoff.baseSha);
+  const {latest}=await useCapability('project.snapshot',snapshot,worker);
+  assert.deepEqual(latest,{taskId:f.taskId,commitSha:handoff.sha});
+  const actual=await useCapability('project.snapshot',{...snapshot,...latest,path:'public/index.html'},worker);
+  assert.equal(actual.content,'Tide table');
+  await rejects(useCapability('project.snapshot',{...snapshot,commitSha:handoff.sha,taskId:'wrong-task'},worker),404);
+});
+
 test('a lost Git response can be reconciled across processes without duplicating the commit or PR',async t=>{
   const f=await fixture(t),git=createLocalProjectGit({directory:f.repo});
   let landed;
