@@ -339,3 +339,103 @@ test('a peer resident reviews the shipped source and merges a passing project re
   assert.equal(await git('show','main:apps/'+target.projectId+'/public/app.mjs'),files[1].content);
   assert.equal((await exec('owner','task.get',{taskId:reviewTask.id})).task.status,'submitted');
 });
+
+for (const legacy of [false,true]) test(`a submitted review resumes six confirmed decisions after ${legacy?'a legacy retry limit':'a normal pulse'}`,async t=>{
+  const {pulse,exec,staff}=fixture(t);
+  staff.set('ada',{id:'ada',name:'Ada',role:'Engineer',managerId:'ceo',desiredState:'active'});
+  const {goal}=await exec('owner','goal.create',{requestId:'goal',accountableId:'ceo',outcome:'Deliver an app',successCriteria:'Inspect the submission'});
+  const {task}=await exec('ceo','task.create',{requestId:'task',goalId:goal.id,assigneeId:'ada',title:'Build the app',acceptance:'Source and tests'});
+  const sha='1'.repeat(40), target={projectId:'example',taskId:task.id,commitSha:sha};
+  await pulse('ada',()=>choice('task.submit',{note:'Submitted',evidence:[sha]}));
+  const codeDecision=legacy?'changes':'approve', taskDecision=legacy?'changes':'accept';
+  const ops=[], files=['index.html','app.js','app.test.js','README.md'];
+  let journalId;
+  const issuedMerges=new Set();
+  const execute=async (op,input)=>{
+    if (op==='journal.get' && !journalId) journalId=input.id;
+    if (op==='project.snapshot') {
+      ops.push(op); return {commitSha:sha,files:files.map(path=>({path,content:'source body '+path}))};
+    }
+    if (op==='delivery.status') {ops.push(op);return {build:{...target,status:'passed',testsPassed:2}};}
+    if (op==='project.merge') {
+      ops.push(op);
+      if (!issuedMerges.has(input.requestId)) {
+        issuedMerges.add(input.requestId);throw new Error('Response lost after merge');
+      }
+      return {merge:{...target,sha,status:'merged',mergeSha:'2'.repeat(40)}};
+    }
+    if (op==='project.review') {
+      ops.push(op);
+      return {review:{...target,reviewerId:'ceo',decision:codeDecision,note:'Reviewed the exact head.',publicationStatus:'published',
+        publication:{id:42,sha,prNumber:5,state:'COMMENTED',url:null}}};
+    }
+    return exec('ceo',op,input);
+  };
+  const prepare=({steps})=>{
+    if(steps.length<4)return choice('project.snapshot',{...target,path:files[steps.length]});
+    if(steps.length===4)return choice('delivery.status',target);
+    assert.equal(steps.length,5);
+    return choice('project.review',{...target,decision:codeDecision,note:'Reviewed the exact head.'});
+  };
+  assert.equal(await pulse('ceo',prepare,{execute}),'worked');
+  if(legacy) {
+    for(let n=0;n<3;n++)await exec('ceo','journal.fail',{id:journalId,attemptId:'legacy-'+n,kind:'review',workId:task.id});
+    assert.equal((await exec('ceo','journal.get',{id:journalId})).entry.failures,3);
+  }
+  const finish=({task:submitted,steps})=>{
+    assert.equal(submitted.id,task.id);
+    assert.deepEqual(steps.slice(0,6).map(s=>s.op),[...files.map(()=>'project.snapshot'),'delivery.status','project.review']);
+    assert.equal(steps[0].input.path,files[0]);
+    assert.equal(JSON.stringify(steps).includes('source body'),false);
+    assert.equal(steps[4].result.build.testsPassed,2);
+    assert.equal(steps[5].result.review.decision,codeDecision);
+    assert.equal(steps[5].result.review.commitSha,sha);
+    assert.equal(steps[5].result.review.publication.state,'COMMENTED');
+    if (!legacy) {
+      if(steps.length===6)return choice('project.merge',target);
+      assert.equal(steps[6].result.merge.sha,sha);
+    }
+    return choice('task.review',{decision:taskDecision,note:'Evaluated the recorded result'});
+  };
+  if (!legacy) await assert.rejects(pulse('ceo',finish,{execute}),/Response lost after merge/);
+  assert.equal(await pulse('ceo',finish,{execute,now:()=>Date.now()+300_000}),'worked');
+  assert.equal(issuedMerges.size,legacy?0:1);
+  assert.equal((await exec('owner','task.get',{taskId:task.id})).task.status,legacy?'ready':'done');
+  assert.equal(ops.filter(op=>op==='project.review').length,1);
+});
+
+test('review decisions stay bounded across pulses and later changes require the current submission',async t=>{
+  const {pulse,exec,staff}=fixture(t);
+  staff.set('ada',{id:'ada',name:'Ada',role:'Engineer',managerId:'ceo',desiredState:'active'});
+  const {goal}=await exec('owner','goal.create',{requestId:'goal',accountableId:'ceo',outcome:'A reviewed report',successCriteria:'Independent evidence'});
+  const {task}=await exec('ceo','task.create',{requestId:'task',goalId:goal.id,assigneeId:'ada',title:'Submit a report',acceptance:'A source'});
+  const submit=()=>pulse('ada',()=>choice('task.submit',{note:'Report',evidence:['A source']}));
+  await submit();
+  const options={now:()=>Date.now()+300_000,browse:async url=>({url,title:'Evidence',text:'Source body'}),execute:async(op,input)=>{
+    const data=await exec('ceo',op,input);
+    if (op==='worker.poll') data.runtimeSettings={version:1,settings:{maxSteps:2}};
+    return data;
+  }};
+  let count=0;
+  const decide=ctx=>{
+    assert.equal(ctx.reviewDecisionsRemaining,18-count);
+    assert.equal(ctx.remainingDecisions,2-count%2);
+    count++;
+    return choice('browse',{url:'https://example.test/evidence'});
+  };
+  for (let pulseNo=1;pulseNo<9;pulseNo++) {
+    assert.equal(await pulse('ceo',decide,options),'worked');assert.equal(count,pulseNo*2);
+  }
+  for(let n=0;n<3;n++) await assert.rejects(pulse('ceo',decide,options),/step limit/);
+  assert.equal(await pulse('ceo',()=>assert.fail('spent review must be idle'),options),'idle');
+  assert.equal(count,18);
+  const {task:submitted}=await exec('owner','task.get',{taskId:task.id});
+  assert.equal(submitted.status,'submitted');
+  await exec('owner','task.review',{taskId:task.id,decision:'changes',note:'Revise the report',requestId:'changes'});
+  await submit();
+  await assert.rejects(exec('ceo','task.review',{taskId:task.id,decision:'accept',note:'Old report',ifWorkStep:submitted.workStep,requestId:'stale'}),{status:409});
+  assert.equal(await pulse('ceo',ctx=>{
+    assert.deepEqual(ctx.steps,[]);assert.equal(ctx.task.workStep,submitted.workStep+2);
+    return choice('task.review',{decision:'accept',note:'Revised report passes'});
+  }),'worked');
+});

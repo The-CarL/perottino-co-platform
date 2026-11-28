@@ -6,7 +6,8 @@ import { withSpan } from './telemetry.mjs';
 
 const digest = (...parts) => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 const leaseMs = 150_000;
-const maxSteps = 6;
+const maxSteps = 6; // journal slots per record
+const maxReviewPages = 3;
 const pick = (row, keys) => Object.fromEntries(keys.filter(key => row?.[key] != null).map(key => [key, row[key]]));
 const employee = row => pick(row, ['id','handle','name','role','managerId','canHire']);
 const goal = row => pick(row, ['id','outcome','successCriteria','accountableId','taskCount','openTaskCount','status']);
@@ -44,6 +45,36 @@ function unitId(actorId, unit) {
   return digest('company-pulse-v1', actorId, unit.kind, unit.message?.id ?? unit.mail?.messageId ?? unit.task?.id ?? unit.goal.id,
     unit.task?.workStep ?? unit.goal?.taskCount ?? 0);
 }
+// Carry verified identifiers and outcomes into a fresh journal page. Source,
+// private messages and browser content stay in the original worker journal.
+function priorReviewStep({decision:{op,input},result}) {
+  const summary = pick(result,['error','path','offset','nextOffset','commitSha','projectId','taskId','status','testsPassed','url']);
+  if (result.review) {
+    summary.review = pick(result.review,['reviewerId','decision','commitSha','taskId','prNumber','publicationStatus']);
+    if (result.review.note) summary.review.note = result.review.note.slice(0,500);
+    if (result.review.publication) summary.review.publication = pick(result.review.publication,['id','state','sha','prNumber','url']);
+  }
+  if (result.build) summary.build = pick(result.build,['buildId','commitSha','taskId','status','testsPassed','reason']);
+  if (result.preview) summary.preview = pick(result.preview,['projectId','taskId','commitSha','buildId','url','expiresAt']);
+  if (result.merge) summary.merge = pick(result.merge,['mergedBy','sha','mergeSha','prNumber','status']);
+  return {op,input:pick(input,['projectId','taskId','commitSha','path','offset','decision']),result:summary};
+}
+
+// Page zero uses the original work key so deployed reviews can recover their
+// receipts. Page names depend only on the submitted revision, even if the
+// operator changes the decision allowance between consecutive pulses.
+async function reviewJournal(id, entry, execute) {
+  const priorSteps = [];
+  let journalId = id;
+  let page = 0;
+  while (page + 1 < maxReviewPages && entry.steps.length === maxSteps &&
+    entry.steps.every(s => s.result && !s.result.finished)) {
+    priorSteps.push(...entry.steps.map(priorReviewStep));
+    journalId = digest(id,'review-page',++page);
+    entry = (await execute('journal.get',{id:journalId})).entry;
+  }
+  return {entry,journalId,priorSteps,page};
+}
 async function choose(actor, execute, workerId, now,onSettings) {
   let queues = await execute('worker.poll', { workerId, leaseMs });
   onSettings(queues.runtimeSettings);
@@ -66,7 +97,11 @@ async function chooseFromPage(actor, execute, queues, now) {
     for (const row of rows ?? []) {
       const unit = { kind, [field]: row };
       const id = unitId(actor.id, unit);
-      const { entry } = await execute('journal.get', { id });
+      let { entry } = await execute('journal.get', { id });
+      if (kind === 'review') {
+        Object.assign(unit,await reviewJournal(id,entry,execute));
+        entry = unit.entry;
+      }
       if (entry.retryAt > now() || entry.failures >= 3 || entry.steps.at(-1)?.result?.finished) continue;
       if (kind === 'task') {
         try {
@@ -212,7 +247,7 @@ function applyDecision({ unit, ctx, execute, browse, signal, requestId }, { op, 
     }
     if (op === 'task.review') {
       if (input.decision === 'accept' && !ctx.task.evidence?.length) return { error:'The task has no submitted evidence to accept.' };
-      const reviewed = await call(op, { ...input,taskId:unit.task.id });
+      const reviewed = await call(op, { ...input,taskId:unit.task.id,ifWorkStep:unit.task.workStep });
       return receipt({ taskId:reviewed.task.id, status:reviewed.task.status },true);
     }
     if (op === 'goal.close') {
@@ -237,9 +272,10 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
   decide ??= mode === 'local' ? localCompanyDecision : companySdkDecision;
   const unit = await choose(actor,execute,workerId,now,onSettings);
   if (!unit) return 'idle';
-  const id = unitId(actor.id,unit);
+  const workId = unitId(actor.id,unit);
+  const id = unit.journalId ?? workId;
   const kind = ['plan','close'].includes(unit.kind) ? 'goal' : unit.kind;
-  return withSpan('work.process', { work_id:id, agent_id:actor.id, work_kind:kind,
+  return withSpan('work.process', { work_id:workId, agent_id:actor.id, work_kind:kind,
     attempt:unit.delivery?.attempts ?? unit.task?.attempt }, async () => {
     const attemptId = randomUUID();
     try {
@@ -247,12 +283,16 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
       const ctx = await contextFor(actor,unit,execute);
       let entry = unit.entry ?? (await execute('journal.get', { id })).entry;
       const limit=unit.runtime?.settings?.maxSteps??maxSteps;
-      for (let index = 0; index < limit; index++) {
+      const review = unit.kind === 'review';
+      const start = review ? entry.steps.filter(step => step.result).length : 0;
+      const end = review ? Math.min(start + limit,maxSteps) : limit;
+      for (let index = start; index < end; index++) {
         const prior = entry.steps[index];
         if (prior?.result) { if (prior.result.finished) return 'worked'; continue; }
         if (!prior) {
           const steps = entry.steps.map(step => ({ op:step.decision.op, input:step.decision.input, result:step.result }));
-          const modelContext={...ctx,steps,remainingDecisions:limit-index};
+          const modelContext={...ctx,steps:review ? [...unit.priorSteps,...steps] : steps,remainingDecisions:end-index,
+            ...(review && {reviewDecisionsRemaining:(maxReviewPages-unit.page)*maxSteps-index})};
           let choice;
           if(mode==='bedrock') {
             const key=digest(id,index,entry.failures);
@@ -284,6 +324,7 @@ export async function runCompanyPulse({ actor, execute:command, decide, browse, 
         entry = (await execute('journal.confirm',{id,index,result})).entry;
         if (entry.steps[index].result.finished) return 'worked';
       }
+      if (review && (end < maxSteps || unit.page + 1 < maxReviewPages)) return 'worked';
       if(unit.kind==='task' && ctx.task.workStep<12) {
         // A task can exceed a per-pulse decision budget. Persist only bounded
         // receipts; never copy file contents, email text or browser bodies.

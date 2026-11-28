@@ -258,6 +258,7 @@ export function createWork({records,employee,event = eventRows,currentTrace = tr
     } else if (op === 'task.review') {
       requireThat(actor !== task.assigneeId && (actor === 'owner' || await manages(actor,task.assigneeId)),403,'An independent leader must review this task.');
       requireThat(task.status === 'submitted',409,'Task needs a submission before review.');
+      requireThat(input.ifWorkStep === undefined || input.ifWorkStep === task.workStep,409,'The submitted work has changed.');
       requireThat(['accept','changes'].includes(input.decision),400,'Invalid review decision.');
       task.review = {decision:input.decision,note:string(input.note,'review'),by:actor,at};
       if (input.decision === 'accept') {
