@@ -1,0 +1,30 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A dedicated managed browser profile for time-limited authenticated browser acceptance.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+Parameters:
+  ProfileName:
+    Type: String
+    AllowedPattern: '[A-Za-z][A-Za-z0-9_]{0,47}'
+  ProjectScope:
+    Type: String
+    AllowedPattern: '[a-f0-9-]{36}-[a-z][a-z0-9-]*'
+Resources:
+  Profile:
+    Type: AWS::BedrockAgentCore::BrowserProfile
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Isolate the synthetic test account from employee and owner browser state.
+        must: [Use exclusively for the designated synthetic login and delete when testing completes.]
+    Properties:
+      Name: !Ref ProfileName
+      Description: Disposable synthetic session persistence assessment
+      Tags:
+        'factory:s': !Ref ProjectScope
+        'perottino:purpose': browser-profile-assessment
+Outputs:
+  BrowserProfileId:
+    Value: !GetAtt Profile.ProfileId
+  BrowserProfileArn:
+    Value: !GetAtt Profile.ProfileArn
