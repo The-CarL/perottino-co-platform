@@ -79,6 +79,8 @@ Resources:
                   return response(410, 'Fixture outside its assessment window.')
               route = event.get('routeKey')
               if route == 'GET /':
+                  if (event.get('queryStringParameters') or {}).get('redirect') == '1':
+                      return response(200, form.replace('action="/login"', 'action="/login?redirect=1"'))
                   return response(200, form)
               if route == 'POST /login':
                   content_type = (event.get('headers') or {}).get('content-type', '').split(';', 1)[0]
@@ -102,6 +104,8 @@ Resources:
                       return response(401, 'Invalid fixture credentials.')
                   result = response(200, '<!doctype html><html lang="en"><title>Signed in</title><h1>Signed in</h1>'
                                     '<a id="protected-link" href="/protected">Open protected page</a></html>')
+                  if (event.get('queryStringParameters') or {}).get('redirect') == '1':
+                      result = response(303, '', location='/protected')
                   result['cookies'] = [f'__Host-profile={token}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={end - now}']
                   return result
               if route != 'GET /protected':
