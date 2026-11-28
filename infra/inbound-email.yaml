@@ -28,8 +28,20 @@ Parameters:
     Default: ''
     Description: Optional private JSON secret with owner address and a 256-bit lowercase base32 routing token.
     AllowedPattern: '(^$|arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[a-zA-Z0-9/_+=.@-]+)'
+  EnableFounderSandboxDelivery:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Authorize the verified founder recipient identity for SES sandbox delivery.
+Rules:
+  FounderEnrollmentRequired:
+    RuleCondition: !Equals [!Ref EnableFounderSandboxDelivery, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OwnerMailSecretArn, '']]
+        AssertDescription: Sandbox founder delivery requires the enrolled founder secret ARN.
 Conditions:
   HasOwnerMail: !Not [!Equals [!Ref OwnerMailSecretArn, '']]
+  FounderSandboxDelivery: !Equals [!Ref EnableFounderSandboxDelivery, 'true']
 Resources:
   Topic:
     Type: AWS::SNS::Topic
@@ -241,6 +253,17 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${ConfigurationSet}'
                 Condition:
                   StringLike: {'ses:FromAddress': !Sub '*@${MailDomain}'}
+              - !If
+                - FounderSandboxDelivery
+                - Effect: Allow
+                  Action: 'ses:SendEmail'
+                  Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/{{resolve:secretsmanager:${OwnerMailSecretArn}:SecretString:address}}'
+                  Condition:
+                    StringLike: {'ses:FromAddress': !Sub '*@${MailDomain}'}
+                    'Null': {'ses:Recipients': 'false'}
+                    ForAllValues:StringEquals:
+                      'ses:Recipients': !Sub '{{resolve:secretsmanager:${OwnerMailSecretArn}:SecretString:address}}'
+                - !Ref AWS::NoValue
               - !If
                 - HasOwnerMail
                 - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref OwnerMailSecretArn}

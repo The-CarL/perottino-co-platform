@@ -76,7 +76,7 @@ test('each employee delivery retains its SES receipt through partial retries',as
 });
 test('optional receiving and sending roles isolate SES, event origins and foundation writes',()=>{
   const stack=new Stack(new App(),'Mail');new CfnInclude(stack,'Records',{templateFile:fileURLToPath(new URL('../infra/inbound-email.yaml',import.meta.url))});
-  const {Resources:r}=Template.fromStack(stack).toJSON();
+  const {Resources:r,Parameters,Conditions,Rules}=Template.fromStack(stack).toJSON();
   assert.deepEqual(r.Receipt.Properties.Rule.Recipients,[{Ref:'MailDomain'}]);
   assert.equal(r.Receipt.Properties.Rule.Actions[0].SNSAction.Encoding,'Base64');assert.equal(r.Receipt.Properties.Rule.ScanEnabled,true);
   assert.deepEqual(r.InvokePermission.Properties.SourceArn,{Ref:'Topic'});assert.deepEqual(r.EventPermission.Properties.SourceArn,{Ref:'EventsTopic'});
@@ -89,6 +89,17 @@ test('optional receiving and sending roles isolate SES, event origins and founda
     .filter(s=>[s.Action].flat().includes('ses:GetEmailIdentity'));
   assert.deepEqual(identityGrants,[{Effect:'Allow',Action:'ses:GetEmailIdentity',
     Resource:{'Fn::Sub':'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}'}}]);
+  assert.equal(Parameters.EnableFounderSandboxDelivery.Default,'false');
+  assert.deepEqual(Conditions.FounderSandboxDelivery,{'Fn::Equals':[{Ref:'EnableFounderSandboxDelivery'},'true']});
+  assert.ok(Rules.FounderEnrollmentRequired);
+  const founderAddress='{{resolve:secretsmanager:${OwnerMailSecretArn}:SecretString:address}}';
+  const conditional=r.SenderRole.Properties.Policies[0].PolicyDocument.Statement
+    .find(s=>s['Fn::If']?.[0]==='FounderSandboxDelivery')['Fn::If'];
+  assert.deepEqual(conditional[1],{Effect:'Allow',Action:'ses:SendEmail',
+    Resource:{'Fn::Sub':'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/'+founderAddress},
+    Condition:{StringLike:{'ses:FromAddress':{'Fn::Sub':'*@${MailDomain}'}},Null:{'ses:Recipients':'false'},
+      'ForAllValues:StringEquals':{'ses:Recipients':{'Fn::Sub':founderAddress}}}});
+  assert.deepEqual(conditional[2],{Ref:'AWS::NoValue'});
   for(const role of [r.MailRole,r.SenderRole]) {
     const statements=role.Properties.Policies[0].PolicyDocument.Statement;
     const writes=statements.find(s=>s.Action.includes('dynamodb:UpdateItem'));
