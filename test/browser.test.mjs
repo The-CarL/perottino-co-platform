@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { chromium } from 'playwright-core';
 import { once } from 'node:events';
-import { makeBrowser } from '../src/browser.mjs';
+import { interactiveResource, makeBrowser } from '../src/browser.mjs';
 
 test('browser enforces URL and private-address boundaries before a request', async () => {
   const browse = makeBrowser();
@@ -54,4 +61,60 @@ test('real Chromium reads the approved document, blocks subresources, and handle
   assert.match(page.text, /Published figures/);
   assert.doesNotMatch(page.text, /ran script/);
   assert.equal(secondaryRequests, 0);
+});
+
+test('authenticated login redirects retain cookies on the same origin and require an explicit click', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'interactive-login-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const certPath = join(dir, 'cert.pem'), keyPath = join(dir, 'key.pem');
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+    '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
+    '-keyout', keyPath, '-out', certPath], { stdio: 'ignore' });
+  const cert = await readFile(certPath, 'utf8');
+  const trusted = tls.getCACertificates();
+  tls.setDefaultCACertificates([...trusted, cert]);
+  t.after(() => tls.setDefaultCACertificates(trusted));
+  let protectedRequests = 0;
+  const server = https.createServer({ cert, key: await readFile(keyPath) }, (req, res) => {
+    if (req.url === '/') {
+      res.writeHead(200, { 'content-type': 'text/html' }).end('<form method=post action=/login><button>Sign in</button></form>');
+      return;
+    }
+    if (req.url === '/invalid') {
+      res.writeHead(302, { location: 'https://' }).end();
+      return;
+    }
+    if (req.url === '/protected') {
+      protectedRequests++;
+      const authorized = req.headers.cookie === 'session=fixture';
+      res.writeHead(authorized ? 200 : 401, { 'content-type': 'text/plain' }).end(authorized ? 'Signed in' : 'Signed out');
+      return;
+    }
+    res.writeHead(303, { location: req.url === '/external' ? 'https://other.example/continue' : '/protected',
+      'set-cookie': 'session=fixture; Path=/; HttpOnly; Secure; SameSite=Strict' }).end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const origin = 'https://127.0.0.1:' + server.address().port;
+  const request = (path, origins) => interactiveResource({ raw: origin + path, method: 'GET', origins, fixtureOrigin: origin });
+  assert.equal((await request('/login')).headers['set-cookie'], undefined);
+  assert.equal((await request('/external', [origin])).headers['set-cookie'], undefined);
+  await assert.rejects(request('/invalid', [origin]), /Invalid URL/);
+
+  const browser = await chromium.launch({ chromiumSandbox: false });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.route('**/*', async route => {
+    const req = route.request();
+    await route.fulfill(await interactiveResource({ raw: req.url(), method: req.method(), body: req.postDataBuffer(),
+      headers: await req.allHeaders(), origins: [origin], fixtureOrigin: origin }));
+  });
+  await page.goto(origin);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  assert.equal(page.url(), origin + '/login');
+  assert.equal(protectedRequests, 0);
+  await page.getByRole('link', { name: 'Continue to redirected page' }).click();
+  assert.equal(await page.locator('body').innerText(), 'Signed in');
+  assert.equal(protectedRequests, 1);
 });

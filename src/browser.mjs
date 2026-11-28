@@ -247,15 +247,19 @@ export async function interactiveResource({raw,origins,method,headers={},body,fi
           filtered['content-security-policy']="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; sandbox allow-scripts";
           filtered['access-control-allow-origin']='*';
         }
+        const cookies=origins && secure && res.headers['set-cookie']?.join('\n');
         const location=res.headers.location;
         if([301,302,303,307,308].includes(res.statusCode)&&location){
-          const target=validatedUrl(new URL(location,url).href).href;
+          let target;
+          try { target=validatedUrl(new URL(location,url).href); }
+          catch(error) { reject(error);return; }
+          if(cookies && target.origin===url.origin)filtered['set-cookie']=cookies;
           // Chromium can bypass Playwright routing after an HTTP redirect. Keep
           // the redirect explicit; clicking must go through the pinned fetcher.
-          const escaped=target.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;');
+          const escaped=target.href.replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;');
           resolve({status:200,headers:{...filtered,'content-type':'text/html'},body:Buffer.from('<a href="'+escaped+'">Continue to redirected page</a>')});return;
         }
-        if(origins&&secure&&res.headers['set-cookie'])filtered['set-cookie']=res.headers['set-cookie'].join('\n');
+        if(cookies)filtered['set-cookie']=cookies;
         resolve({status:res.statusCode,headers:filtered,body:Buffer.concat(chunks)});
       });
     });
